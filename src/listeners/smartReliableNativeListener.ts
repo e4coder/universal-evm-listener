@@ -103,23 +103,24 @@ export class SmartReliableNativeListener {
             this.monitor.recordMissedBlocks(this.networkConfig.chainId, missedBlocks);
             this.lastProcessedBlock = blockNumber - 50;
           } else if (!this.isBackfilling) {
-            // Only backfill if not already backfilling (prevent concurrent operations)
-            this.isBackfilling = true;
-            try {
-              console.warn(
-                `[${this.networkConfig.name}] Detected ${missedBlocks} missed native blocks. Backfilling...`
-              );
-              this.monitor.recordMissedBlocks(this.networkConfig.chainId, missedBlocks);
-              await this.backfillBlocks(this.lastProcessedBlock + 1, blockNumber - 1);
-              // Update lastProcessedBlock to prevent re-processing
-              this.lastProcessedBlock = blockNumber - 1;
-              await this.checkpoint.saveCheckpoint(parseInt(`${this.networkConfig.chainId}_native`), blockNumber - 1);
-            } finally {
-              this.isBackfilling = false;
-            }
+            // Queue backfill asynchronously - don't block new block processing
+            console.warn(
+              `[${this.networkConfig.name}] Detected ${missedBlocks} missed native blocks. Queueing backfill...`
+            );
+            this.monitor.recordMissedBlocks(this.networkConfig.chainId, missedBlocks);
+
+            const fromBlock = this.lastProcessedBlock + 1;
+            const toBlock = blockNumber - 1;
+
+            // Fire and forget - don't await
+            this.queueBackfill(fromBlock, toBlock).catch((error: any) => {
+              console.error(`[${this.networkConfig.name}] Background native backfill failed:`, error);
+              this.monitor.recordError(this.networkConfig.chainId);
+            });
           }
         }
 
+        // Always update to current block immediately (don't wait for backfill)
         this.lastProcessedBlock = blockNumber;
         this.monitor.recordBlockProcessed(this.networkConfig.chainId);
         await this.checkpoint.saveCheckpointBatched(parseInt(checkpointKey), blockNumber);
@@ -254,6 +255,27 @@ export class SmartReliableNativeListener {
     } catch (error: any) {
       console.error(`[${this.networkConfig.name}] Error handling native transfer:`, error);
       this.monitor.recordError(this.networkConfig.chainId);
+    }
+  }
+
+  private async queueBackfill(fromBlock: number, toBlock: number): Promise<void> {
+    // Acquire lock
+    if (this.isBackfilling) {
+      console.log(
+        `[${this.networkConfig.name}] Native backfill already in progress, skipping blocks ${fromBlock}-${toBlock}`
+      );
+      return;
+    }
+
+    this.isBackfilling = true;
+
+    try {
+      await this.backfillBlocks(fromBlock, toBlock);
+      // Update checkpoint after successful backfill
+      const checkpointKey = parseInt(`${this.networkConfig.chainId}_native`);
+      await this.checkpoint.saveCheckpoint(checkpointKey, toBlock);
+    } finally {
+      this.isBackfilling = false;
     }
   }
 

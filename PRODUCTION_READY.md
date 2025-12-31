@@ -22,7 +22,7 @@ All services have been tested and are ready for production deployment.
 
 ### Testing Results
 
-✅ **API Server**: Verified on port 3000
+✅ **API Server**: Verified on port 5459
 ✅ **All 13 Networks**: Successfully initialized and processing
 ✅ **Live Transfer Detection**: Confirmed with Arbitrum LINK transfer
 ✅ **No Rate Limit Errors**: Tested with paid Alchemy tier
@@ -43,11 +43,11 @@ npm install
 npm run build
 
 # 4. Start services (use PM2 or systemd in production)
-npm run api &      # API server on port 3000
+npm run api &      # API server on port 5459
 npm start          # Blockchain listener
 
 # 5. Verify
-curl http://localhost:3000/networks
+curl http://localhost:5459/networks
 ```
 
 ### Production Recommendations
@@ -84,7 +84,7 @@ GET /all/:chainId/:address
 
 ```bash
 # Query all transfers to address on Arbitrum (chainId: 42161)
-curl http://localhost:3000/all/42161/0x6E76502cf3a5CAF3e7A2E3774c8B2B5cCCe4aE99
+curl http://localhost:5459/all/42161/0x6E76502cf3a5CAF3e7A2E3774c8B2B5cCCe4aE99
 
 # Response:
 {

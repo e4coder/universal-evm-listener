@@ -92,7 +92,7 @@ npm run build
 node dist/api/server.js
 ```
 
-The API server will start on port 3000 (configurable via `API_PORT` environment variable).
+The API server will start on port 5459 (configurable via `API_PORT` environment variable).
 
 ## API Endpoints
 
@@ -158,17 +158,17 @@ GET /all/:chainId/:address
 
 Get all transfers for an address on Ethereum (chainId: 1):
 ```bash
-curl http://localhost:3000/all/1/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
+curl http://localhost:5459/all/1/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 ```
 
 Get ERC20 transfers sent from an address on Polygon (chainId: 137):
 ```bash
-curl http://localhost:3000/erc20/from/137/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
+curl http://localhost:5459/erc20/from/137/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 ```
 
 Get native transfers received by an address on Base (chainId: 8453):
 ```bash
-curl http://localhost:3000/native/to/8453/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
+curl http://localhost:5459/native/to/8453/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 ```
 
 ## Supported Networks

@@ -184,7 +184,7 @@ pm2 restart ecosystem.config.js
 
 ```bash
 # Check API is responding
-curl http://localhost:3000/networks
+curl http://localhost:5459/networks
 
 # Expected response:
 # {"success":true,"data":[...]}

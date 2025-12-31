@@ -284,13 +284,13 @@ Backfilling from 19234580 to 19234595
 
 ```bash
 # Health check
-curl http://localhost:3000/health
+curl http://localhost:5459/health
 
 # Metrics for chain 1 (Ethereum)
-curl http://localhost:3000/metrics/1
+curl http://localhost:5459/metrics/1
 
 # DLQ status
-curl http://localhost:3000/dlq
+curl http://localhost:5459/dlq
 ```
 
 ### 5. Verify in Redis
@@ -381,10 +381,10 @@ redis-cli CONFIG GET save
 
 ```bash
 # View DLQ items
-curl http://localhost:3000/dlq
+curl http://localhost:5459/dlq
 
 # Manual processing
-curl -X POST http://localhost:3000/dlq/process
+curl -X POST http://localhost:5459/dlq/process
 ```
 
 ---

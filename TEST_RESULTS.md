@@ -50,7 +50,7 @@ redis-cli TTL "transfer:erc20:1:0xtest1:..."
 
 **Startup:**
 ```
-🚀 API Server running on http://localhost:3000
+🚀 API Server running on http://localhost:5459
 ✅ Redis connected
 ⏱️  Cache TTL: 1 hour(s)
 ```

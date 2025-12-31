@@ -94,10 +94,10 @@ Once deployed, access your API at:
 
 ```bash
 # Check all networks
-curl http://localhost:3000/networks
+curl http://localhost:5459/networks
 
 # Query transfers (example: Arbitrum)
-curl http://localhost:3000/all/42161/YOUR_ADDRESS
+curl http://localhost:5459/all/42161/YOUR_ADDRESS
 ```
 
 ## PM2 Dashboard (Optional)
@@ -115,7 +115,7 @@ pm2 install pm2-server-monit
 
 ```bash
 # Quick health check
-curl http://localhost:3000/networks && echo "✅ API OK" || echo "❌ API Down"
+curl http://localhost:5459/networks && echo "✅ API OK" || echo "❌ API Down"
 
 # Check Redis
 docker exec universal-listener-redis redis-cli ping

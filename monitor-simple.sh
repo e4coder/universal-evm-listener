@@ -9,7 +9,7 @@ while true; do
   echo "[$TIMESTAMP] Checking..."
   
   # Check Arbitrum
-  RESULT=$(curl -s "http://localhost:3000/all/42161/0x6e76502cf3a5caf3e7a2e3774c8b2b5ccce4ae99")
+  RESULT=$(curl -s "http://localhost:5459/all/42161/0x6e76502cf3a5caf3e7a2e3774c8b2b5ccce4ae99")
   ERC20_COUNT=$(echo "$RESULT" | jq -r ".data.erc20 | length" 2>/dev/null || echo "0")
   NATIVE_COUNT=$(echo "$RESULT" | jq -r ".data.native | length" 2>/dev/null || echo "0")
   

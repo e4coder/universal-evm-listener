@@ -70,7 +70,7 @@ REDIS_URL=redis://your-redis-host:6379
 CACHE_TTL_HOURS=1
 
 # API Server Port (default: 3000)
-API_PORT=3000
+API_PORT=5459
 ```
 
 ### 4. Set Up Redis (Production)
@@ -219,7 +219,7 @@ server {
     server_name your-domain.com;
 
     location / {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://localhost:5459;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -297,7 +297,7 @@ else
 fi
 
 # Check API endpoint
-if curl -s http://localhost:3000/networks | grep -q "success"; then
+if curl -s http://localhost:5459/networks | grep -q "success"; then
     echo "✅ API is responding"
 else
     echo "❌ API is not responding"
@@ -435,7 +435,7 @@ pm2 status api-server
 sudo lsof -i :3000
 
 # Test locally
-curl http://localhost:3000/networks
+curl http://localhost:5459/networks
 ```
 
 ## Production Metrics

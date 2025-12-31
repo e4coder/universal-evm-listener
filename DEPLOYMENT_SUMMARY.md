@@ -153,7 +153,7 @@ REDIS_URL=redis://your-redis-host:6379
 
 # OPTIONAL (with defaults)
 CACHE_TTL_HOURS=1
-API_PORT=3000
+API_PORT=5459
 ```
 
 ---
@@ -191,7 +191,7 @@ After deployment, verify:
 
 2. **API Running:**
    ```bash
-   curl http://localhost:3000/networks
+   curl http://localhost:5459/networks
    # Should return 13 networks
    ```
 

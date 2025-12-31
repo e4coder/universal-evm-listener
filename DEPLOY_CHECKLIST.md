@@ -29,7 +29,7 @@ Complete this checklist before deploying to production.
 - [ ] Node.js v18+ installed
 - [ ] Docker and Docker Compose installed
 - [ ] PM2 installed globally (`npm install -g pm2`)
-- [ ] Firewall configured (port 3000 for API)
+- [ ] Firewall configured (port 5459 for API)
 
 ### Code Deployment
 - [ ] Repository cloned or pulled to server
@@ -51,7 +51,7 @@ Complete this checklist before deploying to production.
 ## Post-Deployment
 
 ### Health Checks
-- [ ] API responding (`curl http://localhost:3000/networks`)
+- [ ] API responding (`curl http://localhost:5459/networks`)
 - [ ] All 13 networks initialized (check logs: `npm run pm2:logs`)
 - [ ] No critical errors in logs
 - [ ] Redis connected and caching data

@@ -13,7 +13,7 @@ while true; do
   # Check each network
   for CHAIN_ID in 1 42161 137 10 8453 100 56 43114 59144 130 1868 146 57073; do
     # Check ERC20 transfers TO this address
-    RESPONSE=$(curl -s "http://localhost:3000/erc20/to/$CHAIN_ID/$WALLET_LOWER")
+    RESPONSE=$(curl -s "http://localhost:5459/erc20/to/$CHAIN_ID/$WALLET_LOWER")
     COUNT=$(echo "$RESPONSE" | jq -r '.data | length' 2>/dev/null || echo "0")
 
     if [ "$COUNT" != "0" ] && [ "$COUNT" != "null" ]; then
@@ -22,7 +22,7 @@ while true; do
     fi
 
     # Check native transfers TO this address
-    NATIVE_RESPONSE=$(curl -s "http://localhost:3000/native/to/$CHAIN_ID/$WALLET_LOWER")
+    NATIVE_RESPONSE=$(curl -s "http://localhost:5459/native/to/$CHAIN_ID/$WALLET_LOWER")
     NATIVE_COUNT=$(echo "$NATIVE_RESPONSE" | jq -r '.data | length' 2>/dev/null || echo "0")
 
     if [ "$NATIVE_COUNT" != "0" ] && [ "$NATIVE_COUNT" != "null" ]; then

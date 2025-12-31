@@ -89,13 +89,13 @@ Once the API server is running, test it:
 
 ```bash
 # Get list of supported networks
-curl http://localhost:3000/networks
+curl http://localhost:5459/networks
 
 # Get all transfers for an address on Ethereum (chainId: 1)
-curl http://localhost:3000/all/1/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
+curl http://localhost:5459/all/1/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 
 # Get ERC20 transfers on Polygon (chainId: 137)
-curl http://localhost:3000/erc20/address/137/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
+curl http://localhost:5459/erc20/address/137/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb
 ```
 
 ## 9. Monitor Logs

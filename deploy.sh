@@ -91,8 +91,8 @@ echo "🏥 Running health checks..."
 sleep 5
 
 # Check API
-if curl -s http://localhost:3000/networks > /dev/null; then
-    echo "✅ API Server: Healthy (port 3000)"
+if curl -s http://localhost:5459/networks > /dev/null; then
+    echo "✅ API Server: Healthy (port 5459)"
 else
     echo "⚠️  API Server: Not responding yet (may need a moment to start)"
 fi

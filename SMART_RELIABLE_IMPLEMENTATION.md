@@ -299,7 +299,7 @@ redis-cli GET "checkpoint:1"
 ### 4. Check DLQ
 ```bash
 # Via API
-curl http://localhost:3000/dlq
+curl http://localhost:5459/dlq
 ```
 
 ### 5. Check Deduplication

@@ -23,6 +23,7 @@ export class SmartReliableERC20Listener {
   private maxReconnectAttempts = 10;
   private lastProcessedBlock = 0;
   private isShuttingDown = false;
+  private isBackfilling = false; // Prevent concurrent backfills
 
   // Configuration
   private readonly MAX_BACKFILL_BLOCKS = 100; // Don't backfill more than this at once (reduced for free tier)
@@ -368,7 +369,7 @@ export class SmartReliableERC20Listener {
     // Poll for new blocks every 15 seconds and backfill any gaps
     setInterval(async () => {
       try {
-        if (!this.isShuttingDown) {
+        if (!this.isShuttingDown && !this.isBackfilling) {
           const currentBlock = await this.alchemy.core.getBlockNumber();
 
           // If we've fallen behind, backfill the gap
@@ -376,18 +377,25 @@ export class SmartReliableERC20Listener {
             const gap = currentBlock - this.lastProcessedBlock;
 
             if (gap > 5) { // Only backfill if gap is significant
+              this.isBackfilling = true; // Set lock
               console.log(
                 `[${this.networkConfig.name}] Syncing ${gap} blocks (${this.lastProcessedBlock + 1} to ${currentBlock})...`
               );
-              await this.backfillBlocks(this.lastProcessedBlock + 1, currentBlock);
-              this.lastProcessedBlock = currentBlock;
-              await this.checkpoint.saveCheckpoint(this.networkConfig.chainId, currentBlock);
+
+              try {
+                await this.backfillBlocks(this.lastProcessedBlock + 1, currentBlock);
+                this.lastProcessedBlock = currentBlock;
+                await this.checkpoint.saveCheckpoint(this.networkConfig.chainId, currentBlock);
+              } finally {
+                this.isBackfilling = false; // Release lock
+              }
             }
           }
         }
       } catch (error) {
         console.error(`[${this.networkConfig.name}] Periodic sync failed:`, error);
         this.monitor.recordError(this.networkConfig.chainId);
+        this.isBackfilling = false; // Release lock on error
       }
     }, 15000); // Check every 15 seconds
   }

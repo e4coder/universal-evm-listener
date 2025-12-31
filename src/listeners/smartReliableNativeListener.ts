@@ -21,6 +21,7 @@ export class SmartReliableNativeListener {
   private maxReconnectAttempts = 10;
   private lastProcessedBlock = 0;
   private isShuttingDown = false;
+  private isBackfilling = false; // Prevent concurrent backfills
 
   private readonly MAX_BACKFILL_BLOCKS = 50; // Smaller for native (reduced for free tier)
   private readonly BACKFILL_CHUNK_SIZE = 10;
@@ -382,7 +383,7 @@ export class SmartReliableNativeListener {
     // Poll for new blocks every 15 seconds and backfill any gaps
     setInterval(async () => {
       try {
-        if (!this.isShuttingDown) {
+        if (!this.isShuttingDown && !this.isBackfilling) {
           const currentBlock = await this.alchemy.core.getBlockNumber();
 
           // If we've fallen behind, backfill the gap
@@ -390,18 +391,25 @@ export class SmartReliableNativeListener {
             const gap = currentBlock - this.lastProcessedBlock;
 
             if (gap > 5) { // Only backfill if gap is significant
+              this.isBackfilling = true; // Set lock
               console.log(
                 `[${this.networkConfig.name}] Syncing ${gap} native blocks (${this.lastProcessedBlock + 1} to ${currentBlock})...`
               );
-              await this.backfillBlocks(this.lastProcessedBlock + 1, currentBlock);
-              this.lastProcessedBlock = currentBlock;
-              await this.checkpoint.saveCheckpoint(parseInt(checkpointKey), currentBlock);
+
+              try {
+                await this.backfillBlocks(this.lastProcessedBlock + 1, currentBlock);
+                this.lastProcessedBlock = currentBlock;
+                await this.checkpoint.saveCheckpoint(parseInt(checkpointKey), currentBlock);
+              } finally {
+                this.isBackfilling = false; // Release lock
+              }
             }
           }
         }
       } catch (error) {
         console.error(`[${this.networkConfig.name}] Periodic sync failed (native):`, error);
         this.monitor.recordError(this.networkConfig.chainId);
+        this.isBackfilling = false; // Release lock on error
       }
     }, 15000); // Check every 15 seconds
   }

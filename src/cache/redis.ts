@@ -49,7 +49,7 @@ export class RedisCache {
       chainId,
     };
 
-    const transferKey = `transfer:erc20:${chainId}:${txHash}:${token}:${from}:${to}`;
+    const transferKey = `transfer:erc20:${chainId}:${txHash}:${token.toLowerCase()}:${from.toLowerCase()}:${to.toLowerCase()}`;
 
     // Store the transfer data
     await this.client.setEx(transferKey, this.TTL, JSON.stringify(transfer));
@@ -96,7 +96,7 @@ export class RedisCache {
       chainId,
     };
 
-    const transferKey = `transfer:native:${chainId}:${txHash}:${from}:${to}`;
+    const transferKey = `transfer:native:${chainId}:${txHash}:${from.toLowerCase()}:${to.toLowerCase()}`;
 
     // Store the transfer data
     await this.client.setEx(transferKey, this.TTL, JSON.stringify(transfer));

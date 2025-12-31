@@ -97,6 +97,11 @@ export class SmartReliableNativeListener {
 
   private async setupWebSocketListener(): Promise<void> {
     try {
+      // Remove any existing listeners to prevent duplicates
+      this.alchemy.ws.removeAllListeners('block');
+      this.alchemy.ws.removeAllListeners('error');
+      this.alchemy.ws.removeAllListeners('close');
+
       const checkpointKey = `${this.networkConfig.chainId}_native`;
 
       this.alchemy.ws.on('block', async (blockNumber: number) => {
@@ -401,6 +406,13 @@ export class SmartReliableNativeListener {
     console.log(
       `[${this.networkConfig.name}] Reconnecting (native) in ${delay / 1000}s...`
     );
+
+    // Clean up old WebSocket before reconnecting
+    try {
+      this.alchemy.ws.removeAllListeners();
+    } catch (error) {
+      // Ignore errors during cleanup
+    }
 
     setTimeout(async () => {
       try {

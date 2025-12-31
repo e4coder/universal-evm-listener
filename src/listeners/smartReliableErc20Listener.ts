@@ -107,6 +107,11 @@ export class SmartReliableERC20Listener {
 
   private async setupWebSocketListener(): Promise<void> {
     try {
+      // Remove any existing listeners to prevent duplicates
+      this.alchemy.ws.removeAllListeners('block');
+      this.alchemy.ws.removeAllListeners('error');
+      this.alchemy.ws.removeAllListeners('close');
+
       // Listen to block events to track progress
       this.alchemy.ws.on('block', async (blockNumber: number) => {
         // Track that WebSocket is alive
@@ -371,6 +376,13 @@ export class SmartReliableERC20Listener {
     console.log(
       `[${this.networkConfig.name}] Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
     );
+
+    // Clean up old WebSocket before reconnecting
+    try {
+      this.alchemy.ws.removeAllListeners();
+    } catch (error) {
+      // Ignore errors during cleanup
+    }
 
     setTimeout(async () => {
       try {

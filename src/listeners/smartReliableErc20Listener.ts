@@ -121,6 +121,9 @@ export class SmartReliableERC20Listener {
               );
               this.monitor.recordMissedBlocks(this.networkConfig.chainId, missedBlocks);
               await this.backfillBlocks(this.lastProcessedBlock + 1, blockNumber - 1);
+              // Update lastProcessedBlock to prevent re-processing
+              this.lastProcessedBlock = blockNumber - 1;
+              await this.checkpoint.saveCheckpoint(this.networkConfig.chainId, blockNumber - 1);
             } finally {
               this.isBackfilling = false;
             }

@@ -17,27 +17,43 @@ The Ethereum listener (and potentially other networks) was stuck in a loop, repe
 
 ### Root Cause
 
-There were **TWO sources** triggering backfills concurrently:
+The bug had **TWO issues** that combined to create the infinite loop:
 
+**Issue 1: Missing Checkpoint Update**
+The block listener's backfill didn't update `lastProcessedBlock` after completing:
+- Block listener detects missed blocks and triggers backfill
+- Backfill processes blocks 24133445-24133469
+- `lastProcessedBlock` remains at 24133444 (never updated!)
+- Next block arrives (24133470)
+- Block listener thinks blocks 24133445-24133469 are STILL missed
+- **Infinite loop**: Same blocks backfilled repeatedly
+
+**Issue 2: Concurrent Backfills**
+Two sources could trigger backfills simultaneously:
 1. **Periodic Sync**: `setupPeriodicSync()` runs every 15 seconds
 2. **Block Listener**: `alchemy.ws.on('block')` detects missed blocks in real-time
 
-Both trigger backfills independently, and on busy networks like Ethereum:
-- Backfilling takes longer than 15 seconds
-- A new backfill would start before the previous one finished
-- Multiple concurrent backfills processed the same blocks repeatedly
-- This caused infinite loops and wasted API calls
+Without a lock, both would run concurrently on busy networks where backfills take >15 seconds
 
 ## Solution
 
-Added a **backfill lock** (`isBackfilling` flag) to prevent concurrent backfills from **BOTH sources**.
+Applied **TWO fixes** to solve both issues:
+
+### Fix 1: Update Checkpoint After Block Listener Backfill
+Added `lastProcessedBlock` update and checkpoint save after backfill completes in the block listener.
+
+### Fix 2: Add Backfill Lock
+Added a **backfill lock** (`isBackfilling` flag) to prevent concurrent backfills from both sources.
 
 ### Changes Made
 
 **File**: `src/listeners/smartReliableErc20Listener.ts`
 - Added `private isBackfilling = false;` flag
 - Modified `setupPeriodicSync()` to check the lock before starting backfill
-- Modified `setupWebSocketListener()` block handler to check the lock before starting backfill
+- Modified `setupWebSocketListener()` block handler to:
+  - Check the lock before starting backfill
+  - **Update `lastProcessedBlock` after backfill completes**
+  - **Save checkpoint after backfill completes**
 - Lock is set before backfill starts, released when complete
 - Lock is released even on error (using try/finally)
 
@@ -79,6 +95,9 @@ this.alchemy.ws.on('block', async (blockNumber: number) => {
 
       try {
         await this.backfillBlocks(this.lastProcessedBlock + 1, blockNumber - 1);
+        // CRITICAL: Update lastProcessedBlock to prevent infinite loop
+        this.lastProcessedBlock = blockNumber - 1;
+        await this.checkpoint.saveCheckpoint(this.networkConfig.chainId, blockNumber - 1);
       } finally {
         this.isBackfilling = false; // Always release
       }

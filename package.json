@@ -1,0 +1,34 @@
+{
+  "name": "universal-blockchain-listener",
+  "version": "1.0.0",
+  "description": "Multi-chain blockchain event listener with Redis caching for ERC20 and native transfers",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "api": "node dist/api/server.js",
+    "api:dev": "ts-node src/api/server.ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "blockchain",
+    "alchemy",
+    "redis",
+    "erc20",
+    "event-listener"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "alchemy-sdk": "^3.4.6",
+    "redis": "^4.7.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}

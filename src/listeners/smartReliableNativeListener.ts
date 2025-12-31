@@ -22,9 +22,11 @@ export class SmartReliableNativeListener {
   private lastProcessedBlock = 0;
   private isShuttingDown = false;
   private isBackfilling = false; // Prevent concurrent backfills
+  private blockCache: Map<number, { timestamp: number }> = new Map(); // Cache blocks to reduce API calls
 
   private readonly MAX_BACKFILL_BLOCKS = 50; // Smaller for native (reduced for free tier)
   private readonly BACKFILL_CHUNK_SIZE = 10;
+  private readonly BLOCK_CACHE_SIZE = 100; // Keep last 100 blocks cached
 
   constructor(
     alchemy: Alchemy,
@@ -183,17 +185,32 @@ export class SmartReliableNativeListener {
         return;
       }
 
-      const receipt = await this.rateLimiter.executeWithLimit(async () => {
-        return await this.alchemy.core.getTransactionReceipt(txHash);
-      });
+      // Use blockNumber from tx object (no need for getTransactionReceipt!)
+      const blockNumber = tx.blockNumber;
+      if (!blockNumber) return;
 
-      if (!receipt) return;
+      // Check block cache first to avoid redundant API calls
+      let timestamp: number;
+      const cachedBlock = this.blockCache.get(blockNumber);
 
-      const blockNumber = receipt.blockNumber;
-      const block = await this.rateLimiter.executeWithLimit(async () => {
-        return await this.alchemy.core.getBlock(blockNumber);
-      });
-      const timestamp = block?.timestamp || Math.floor(Date.now() / 1000);
+      if (cachedBlock) {
+        timestamp = cachedBlock.timestamp;
+      } else {
+        // Get block timestamp with rate limiting
+        const block = await this.rateLimiter.executeWithLimit(async () => {
+          return await this.alchemy.core.getBlock(blockNumber);
+        });
+        timestamp = block?.timestamp || Math.floor(Date.now() / 1000);
+
+        // Cache the block (limit cache size)
+        if (this.blockCache.size >= this.BLOCK_CACHE_SIZE) {
+          const firstKey = this.blockCache.keys().next().value;
+          if (firstKey !== undefined) {
+            this.blockCache.delete(firstKey);
+          }
+        }
+        this.blockCache.set(blockNumber, { timestamp });
+      }
 
       try {
         await this.cache.storeNativeTransfer(

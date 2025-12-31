@@ -24,6 +24,7 @@ export class SmartReliableERC20Listener {
   private lastProcessedBlock = 0;
   private isShuttingDown = false;
   private isBackfilling = false; // Prevent concurrent backfills
+  private lastWebSocketBlockTime = Date.now(); // Track last WebSocket block event
 
   // Configuration
   private readonly MAX_BACKFILL_BLOCKS = 100; // Don't backfill more than this at once (reduced for free tier)
@@ -108,6 +109,9 @@ export class SmartReliableERC20Listener {
     try {
       // Listen to block events to track progress
       this.alchemy.ws.on('block', async (blockNumber: number) => {
+        // Track that WebSocket is alive
+        this.lastWebSocketBlockTime = Date.now();
+
         // Check if we missed any blocks
         if (blockNumber > this.lastProcessedBlock + 1 && this.lastProcessedBlock > 0) {
           const missedBlocks = blockNumber - this.lastProcessedBlock - 1;
@@ -384,6 +388,17 @@ export class SmartReliableERC20Listener {
     setInterval(async () => {
       try {
         if (!this.isShuttingDown) {
+          // Check if WebSocket has been silent for too long (2 minutes)
+          const timeSinceLastBlock = Date.now() - this.lastWebSocketBlockTime;
+          if (timeSinceLastBlock > 120000) {
+            console.error(
+              `[${this.networkConfig.name}] ⚠️  WebSocket dead: No block events for ${Math.floor(timeSinceLastBlock / 1000)}s. Reconnecting...`
+            );
+            this.monitor.recordError(this.networkConfig.chainId);
+            this.handleDisconnection();
+            return;
+          }
+
           const blockNumber = await this.alchemy.core.getBlockNumber();
           if (blockNumber < this.lastProcessedBlock) {
             console.warn(

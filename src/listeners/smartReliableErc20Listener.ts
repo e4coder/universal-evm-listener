@@ -76,9 +76,15 @@ export class SmartReliableERC20Listener {
         // Update checkpoint to new starting point
         await this.checkpoint.saveCheckpoint(this.networkConfig.chainId, this.lastProcessedBlock);
       } else if (gap > 0) {
-        console.log(`[${this.networkConfig.name}] Backfilling ${gap} blocks...`);
-        this.lastProcessedBlock = savedCheckpoint;
-        await this.backfillBlocks(savedCheckpoint + 1, currentBlock);
+        console.log(`[${this.networkConfig.name}] Backfilling ${gap} blocks in background...`);
+        // Start from current block immediately, backfill in background
+        this.lastProcessedBlock = currentBlock;
+
+        // Queue startup backfill asynchronously
+        this.queueBackfill(savedCheckpoint + 1, currentBlock).catch((error: any) => {
+          console.error(`[${this.networkConfig.name}] Startup backfill failed:`, error);
+          this.monitor.recordError(this.networkConfig.chainId);
+        });
       } else {
         this.lastProcessedBlock = savedCheckpoint;
       }

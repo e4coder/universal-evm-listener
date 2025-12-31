@@ -33,7 +33,11 @@ This creates a **catch-up spiral** where you're constantly backfilling and falli
 
 ## Solution: Fire-and-Forget Background Backfilling
 
-Process new blocks **immediately** and backfill **asynchronously** in the background:
+Process new blocks **immediately** and backfill **asynchronously** in the background.
+
+This optimization applies to **TWO scenarios**:
+1. **Startup backfilling** - When restarting after downtime
+2. **Runtime gap detection** - When missing blocks during operation
 
 ```typescript
 // NEW (non-blocking):
@@ -86,6 +90,31 @@ private async queueBackfill(fromBlock: number, toBlock: number): Promise<void> {
 }
 ```
 
+### Updated Startup Code
+
+**Before** (blocking):
+```typescript
+// In start() method:
+if (gap > 0) {
+  console.log('Backfilling...');
+  await this.backfillBlocks(savedCheckpoint + 1, currentBlock); // BLOCKS
+  // Other networks wait here!
+}
+await this.setupWebSocketListener(); // Only runs after backfill
+```
+
+**After** (non-blocking):
+```typescript
+// In start() method:
+if (gap > 0) {
+  console.log('Backfilling in background...');
+  this.lastProcessedBlock = currentBlock; // Jump to current immediately
+  this.queueBackfill(savedCheckpoint + 1, currentBlock).catch(handleError);
+  // Don't wait! Continue immediately
+}
+await this.setupWebSocketListener(); // Runs immediately!
+```
+
 ### Updated Block Listener
 
 **Before** (blocking):
@@ -124,7 +153,33 @@ The `isBackfilling` lock now prevents:
 
 ## Performance Impact
 
-### Polygon Example (2-second block time)
+### Startup Example (All Networks)
+
+**Before** (blocking):
+```
+Ethereum: Backfilling 10 blocks... (10s) ← ALL networks blocked
+  Polygon: Waiting...
+  Arbitrum: Waiting...
+  Base: Waiting...
+  ... 9 more networks waiting
+Ethereum: Done → Polygon starts
+Polygon: Backfilling 5 blocks... (5s) ← ALL remaining networks blocked
+  ...
+Total startup: 60+ seconds (sequential)
+```
+
+**After** (non-blocking):
+```
+Ethereum: Backfilling in background... ← Continues immediately
+Polygon: Backfilling in background... ← Starts immediately
+Arbitrum: Backfilling in background... ← Starts immediately
+Base: Backfilling in background... ← Starts immediately
+... All 13 networks start simultaneously
+Total startup: <1 second (all networks listening)
+Background backfills complete in parallel
+```
+
+### Runtime Example (2-second block time)
 
 **Before** (blocking):
 ```

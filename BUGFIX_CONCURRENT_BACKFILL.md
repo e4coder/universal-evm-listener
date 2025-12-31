@@ -17,22 +17,27 @@ The Ethereum listener (and potentially other networks) was stuck in a loop, repe
 
 ### Root Cause
 
-The `setupPeriodicSync()` function runs every 15 seconds and triggers backfills. However:
+There were **TWO sources** triggering backfills concurrently:
 
-1. Backfilling takes longer than 15 seconds for busy networks like Ethereum
-2. The periodic check would start a NEW backfill before the previous one finished
-3. Multiple concurrent backfills were running, processing the same blocks repeatedly
-4. This caused infinite loops and wasted API calls
+1. **Periodic Sync**: `setupPeriodicSync()` runs every 15 seconds
+2. **Block Listener**: `alchemy.ws.on('block')` detects missed blocks in real-time
+
+Both trigger backfills independently, and on busy networks like Ethereum:
+- Backfilling takes longer than 15 seconds
+- A new backfill would start before the previous one finished
+- Multiple concurrent backfills processed the same blocks repeatedly
+- This caused infinite loops and wasted API calls
 
 ## Solution
 
-Added a **backfill lock** (`isBackfilling` flag) to prevent concurrent backfills.
+Added a **backfill lock** (`isBackfilling` flag) to prevent concurrent backfills from **BOTH sources**.
 
 ### Changes Made
 
 **File**: `src/listeners/smartReliableErc20Listener.ts`
 - Added `private isBackfilling = false;` flag
 - Modified `setupPeriodicSync()` to check the lock before starting backfill
+- Modified `setupWebSocketListener()` block handler to check the lock before starting backfill
 - Lock is set before backfill starts, released when complete
 - Lock is released even on error (using try/finally)
 
@@ -41,15 +46,16 @@ Added a **backfill lock** (`isBackfilling` flag) to prevent concurrent backfills
 
 ### How It Works Now
 
+**Periodic Sync**:
 ```typescript
 setInterval(async () => {
   // Only proceed if not currently backfilling
   if (!this.isShuttingDown && !this.isBackfilling) {
     const currentBlock = await this.alchemy.core.getBlockNumber();
-    
+
     if (currentBlock > this.lastProcessedBlock + 1) {
       this.isBackfilling = true; // Lock
-      
+
       try {
         await this.backfillBlocks(...);
         this.lastProcessedBlock = currentBlock;
@@ -60,6 +66,27 @@ setInterval(async () => {
     }
   }
 }, 15000);
+```
+
+**Block Listener**:
+```typescript
+this.alchemy.ws.on('block', async (blockNumber: number) => {
+  if (blockNumber > this.lastProcessedBlock + 1 && this.lastProcessedBlock > 0) {
+    const missedBlocks = blockNumber - this.lastProcessedBlock - 1;
+
+    if (missedBlocks <= this.MAX_BACKFILL_BLOCKS && !this.isBackfilling) {
+      this.isBackfilling = true; // Lock
+
+      try {
+        await this.backfillBlocks(this.lastProcessedBlock + 1, blockNumber - 1);
+      } finally {
+        this.isBackfilling = false; // Always release
+      }
+    }
+  }
+
+  this.lastProcessedBlock = blockNumber;
+});
 ```
 
 ## Impact

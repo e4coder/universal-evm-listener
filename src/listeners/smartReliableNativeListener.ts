@@ -100,12 +100,18 @@ export class SmartReliableNativeListener {
             );
             this.monitor.recordMissedBlocks(this.networkConfig.chainId, missedBlocks);
             this.lastProcessedBlock = blockNumber - 50;
-          } else {
-            console.warn(
-              `[${this.networkConfig.name}] Detected ${missedBlocks} missed native blocks. Backfilling...`
-            );
-            this.monitor.recordMissedBlocks(this.networkConfig.chainId, missedBlocks);
-            await this.backfillBlocks(this.lastProcessedBlock + 1, blockNumber - 1);
+          } else if (!this.isBackfilling) {
+            // Only backfill if not already backfilling (prevent concurrent operations)
+            this.isBackfilling = true;
+            try {
+              console.warn(
+                `[${this.networkConfig.name}] Detected ${missedBlocks} missed native blocks. Backfilling...`
+              );
+              this.monitor.recordMissedBlocks(this.networkConfig.chainId, missedBlocks);
+              await this.backfillBlocks(this.lastProcessedBlock + 1, blockNumber - 1);
+            } finally {
+              this.isBackfilling = false;
+            }
           }
         }
 

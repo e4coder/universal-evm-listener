@@ -75,6 +75,20 @@ pm2 start ecosystem.config.js
 echo "✅ Applications started"
 echo ""
 
+# Configure log rotation
+echo "🔄 Configuring log rotation..."
+if ! pm2 list | grep -q "pm2-logrotate"; then
+    pm2 install pm2-logrotate
+    pm2 set pm2-logrotate:max_size 10M
+    pm2 set pm2-logrotate:retain 7
+    pm2 set pm2-logrotate:compress true
+    pm2 set pm2-logrotate:dateFormat YYYY-MM-DD_HH-mm-ss
+    echo "✅ Log rotation configured (10MB max, 7 files retained)"
+else
+    echo "✅ Log rotation already configured"
+fi
+echo ""
+
 # Save PM2 process list
 echo "💾 Saving PM2 configuration..."
 pm2 save

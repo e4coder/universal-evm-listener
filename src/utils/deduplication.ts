@@ -7,7 +7,7 @@ import { RedisCache } from '../cache/redis';
 export class EventDeduplicator {
   private cache: RedisCache;
   private readonly dedupPrefix = 'dedup';
-  private readonly dedupTTL = 86400 * 2; // 2 days (longer than cache TTL)
+  private readonly dedupTTL = parseInt(process.env.CACHE_TTL_HOURS || '1') * 3600; // Match cache TTL
 
   constructor(cache: RedisCache) {
     this.cache = cache;

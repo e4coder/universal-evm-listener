@@ -2,8 +2,7 @@ import 'dotenv/config';
 import { Alchemy, AlchemySettings } from 'alchemy-sdk';
 import { RedisCache } from './cache/redis';
 import { SUPPORTED_NETWORKS } from './config/networks';
-import { SmartReliableERC20Listener } from './listeners/smartReliableErc20Listener';
-import { SmartReliableNativeListener } from './listeners/smartReliableNativeListener';
+import { PollingERC20Listener } from './listeners/pollingErc20Listener';
 import { QueryService } from './services/queryService';
 import { CheckpointManager } from './persistence/checkpoint';
 import { EventDeduplicator } from './utils/deduplication';
@@ -14,7 +13,7 @@ import { RateLimiter } from './utils/rateLimiter';
 class UniversalBlockchainListener {
   private cache: RedisCache;
   private queryService: QueryService;
-  private listeners: Array<{ erc20: SmartReliableERC20Listener; native: SmartReliableNativeListener }> = [];
+  private listeners: PollingERC20Listener[] = [];
 
   // Reliability utilities
   private checkpoint: CheckpointManager;
@@ -36,8 +35,9 @@ class UniversalBlockchainListener {
   }
 
   async start(): Promise<void> {
-    console.log('🚀 Starting Universal Blockchain Listener with 99.9% Coverage...');
-    console.log(`📡 Monitoring ${SUPPORTED_NETWORKS.length} networks`);
+    console.log('🚀 Starting Universal Blockchain Listener (Polling Mode)...');
+    console.log(`📡 Monitoring ${SUPPORTED_NETWORKS.length} network(s) - ERC20 only`);
+    console.log('ℹ️  Native transfer tracking disabled (no event logs available)');
 
     // Connect to Redis
     await this.cache.connect();
@@ -67,8 +67,8 @@ class UniversalBlockchainListener {
 
         const alchemy = new Alchemy(settings);
 
-        // Create smart reliable listeners with all utilities
-        const erc20Listener = new SmartReliableERC20Listener(
+        // Create polling ERC20 listener
+        const erc20Listener = new PollingERC20Listener(
           alchemy,
           this.cache,
           networkConfig,
@@ -79,33 +79,21 @@ class UniversalBlockchainListener {
           this.rateLimiter
         );
 
-        const nativeListener = new SmartReliableNativeListener(
-          alchemy,
-          this.cache,
-          networkConfig,
-          this.checkpoint,
-          this.deduplicator,
-          this.dlq,
-          this.monitor,
-          this.rateLimiter
-        );
-
-        // Start listeners
+        // Start listener
         await erc20Listener.start();
-        await nativeListener.start();
 
-        this.listeners.push({ erc20: erc20Listener, native: nativeListener });
+        this.listeners.push(erc20Listener);
 
-        console.log(`✅ [${networkConfig.name}] Smart Reliable Listeners started`);
+        console.log(`✅ [${networkConfig.name}] Polling ERC20 Listener started`);
       } catch (error) {
-        console.error(`❌ [${networkConfig.name}] Failed to start listeners:`, error);
+        console.error(`❌ [${networkConfig.name}] Failed to start listener:`, error);
       }
     }
 
-    console.log('\n✅ All listeners initialized with 99.9% reliability');
-    console.log('📊 Features: Checkpointing, Deduplication, DLQ, Auto-reconnect, Rate limiting');
-    console.log('🎯 First start: Listening from current block');
-    console.log('🔁 Restarts: Auto-backfill from last checkpoint\n');
+    console.log('\n✅ All listeners initialized');
+    console.log('📊 Features: Polling-based, Checkpointing, Deduplication, DLQ, Reorg handling');
+    console.log('🎯 Mode: getLogs with 10-block reorg safety, 3-block confirmation');
+    console.log('🔁 Restarts: Auto-resume from last checkpoint\n');
 
     // Keep the process running
     this.setupGracefulShutdown();
@@ -117,8 +105,7 @@ class UniversalBlockchainListener {
 
       // Stop all listeners
       for (const listener of this.listeners) {
-        listener.erc20.stop();
-        listener.native.stop();
+        listener.stop();
       }
 
       // Disconnect from Redis

@@ -31,7 +31,7 @@ class UniversalBlockchainListener {
     this.deduplicator = new EventDeduplicator(this.cache);
     this.dlq = new DeadLetterQueue(this.cache);
     this.monitor = new EventMonitor();
-    this.rateLimiter = new RateLimiter(100, 10); // 100 tokens, 10/sec refill
+    this.rateLimiter = new RateLimiter(200, 30); // 200 tokens, 30/sec refill (for 13 networks)
   }
 
   async start(): Promise<void> {

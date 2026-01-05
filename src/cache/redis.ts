@@ -13,10 +13,19 @@ export class RedisCache {
 
     this.client = createClient({
       url: process.env.REDIS_URL || 'redis://localhost:6379',
+      socket: {
+        reconnectStrategy: (retries) => {
+          console.log(`[Redis] Reconnect attempt ${retries}`);
+          // Exponential backoff: 100ms, 200ms, 400ms... max 30s
+          return Math.min(retries * 100, 30000);
+        },
+      },
     });
 
-    this.client.on('error', (err) => console.error('Redis Client Error', err));
-    this.client.on('connect', () => console.log('Redis Client Connected'));
+    this.client.on('error', (err) => console.error('[Redis] Client Error:', err.message));
+    this.client.on('connect', () => console.log('[Redis] Connected'));
+    this.client.on('reconnecting', () => console.log('[Redis] Reconnecting...'));
+    this.client.on('ready', () => console.log('[Redis] Ready'));
   }
 
   async connect(): Promise<void> {

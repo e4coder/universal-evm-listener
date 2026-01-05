@@ -1,20 +1,32 @@
 import { RedisCache } from '../cache/redis';
 
+interface DLQItem {
+  id: string;
+  type: 'erc20' | 'native';
+  chainId: number;
+  eventData: any;
+  error: string;
+  timestamp: number;
+  retries: number;
+}
+
 /**
- * Dead Letter Queue for failed event processing
+ * In-Memory Dead Letter Queue for failed event processing
  * Stores events that couldn't be cached for later retry
+ * Uses memory instead of Redis to work even when Redis fails
  */
 export class DeadLetterQueue {
   private cache: RedisCache;
-  private readonly dlqPrefix = 'dlq';
   private readonly maxRetries = 3;
+  private readonly maxItems = 10000; // Limit memory usage
+  private items: Map<string, DLQItem> = new Map();
 
   constructor(cache: RedisCache) {
     this.cache = cache;
   }
 
   /**
-   * Add failed event to DLQ
+   * Add failed event to DLQ (in-memory)
    */
   async addToDLQ(
     type: 'erc20' | 'native',
@@ -22,47 +34,42 @@ export class DeadLetterQueue {
     eventData: any,
     error: string
   ): Promise<void> {
-    const key = `${this.dlqPrefix}:${type}:${chainId}:${Date.now()}`;
-    const value = JSON.stringify({
+    // Limit queue size to prevent memory issues
+    if (this.items.size >= this.maxItems) {
+      // Remove oldest item
+      const oldestKey = this.items.keys().next().value;
+      if (oldestKey) {
+        this.items.delete(oldestKey);
+      }
+    }
+
+    const id = `${type}:${chainId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const item: DLQItem = {
+      id,
       type,
       chainId,
       eventData,
       error,
       timestamp: Date.now(),
       retries: 0,
-    });
+    };
 
-    try {
-      await (this.cache as any).client.setEx(key, 86400 * 7, value); // 7 days TTL
-      console.log(`[DLQ] Added ${type} event to dead letter queue: ${key}`);
-    } catch (err) {
-      console.error('[DLQ] Failed to add to dead letter queue:', err);
-    }
+    this.items.set(id, item);
+    console.log(`[DLQ] Added ${type} event (${this.items.size} items in queue)`);
   }
 
   /**
    * Get all DLQ items
    */
-  async getDLQItems(): Promise<any[]> {
-    try {
-      const keys = await (this.cache as any).client.keys(`${this.dlqPrefix}:*`);
-      const items: any[] = [];
+  async getDLQItems(): Promise<DLQItem[]> {
+    return Array.from(this.items.values());
+  }
 
-      for (const key of keys) {
-        const value = await (this.cache as any).client.get(key);
-        if (value) {
-          items.push({
-            key,
-            ...JSON.parse(value),
-          });
-        }
-      }
-
-      return items;
-    } catch (error) {
-      console.error('[DLQ] Error getting DLQ items:', error);
-      return [];
-    }
+  /**
+   * Get DLQ size
+   */
+  getSize(): number {
+    return this.items.size;
   }
 
   /**
@@ -73,12 +80,17 @@ export class DeadLetterQueue {
     let success = 0;
     let failed = 0;
 
-    console.log(`[DLQ] Processing ${items.length} items from dead letter queue...`);
+    if (items.length === 0) {
+      return { success: 0, failed: 0 };
+    }
+
+    console.log(`[DLQ] Processing ${items.length} items...`);
 
     for (const item of items) {
       try {
         if (item.retries >= this.maxRetries) {
-          console.log(`[DLQ] Max retries reached for ${item.key}, skipping`);
+          console.log(`[DLQ] Max retries reached for ${item.id}, removing`);
+          this.items.delete(item.id);
           failed++;
           continue;
         }
@@ -108,31 +120,29 @@ export class DeadLetterQueue {
         }
 
         // Success! Remove from DLQ
-        await (this.cache as any).client.del(item.key);
+        this.items.delete(item.id);
         success++;
-        console.log(`[DLQ] Successfully reprocessed ${item.key}`);
       } catch (error) {
         // Failed again, increment retry count
         item.retries++;
-        await (this.cache as any).client.setEx(item.key, 86400 * 7, JSON.stringify(item));
+        this.items.set(item.id, item);
         failed++;
-        console.error(`[DLQ] Failed to reprocess ${item.key}:`, error);
       }
     }
 
-    console.log(`[DLQ] Processing complete: ${success} success, ${failed} failed`);
+    if (success > 0 || failed > 0) {
+      console.log(`[DLQ] Processing complete: ${success} success, ${failed} failed, ${this.items.size} remaining`);
+    }
     return { success, failed };
   }
 
   /**
    * Start automatic DLQ processing
    */
-  startAutoProcessing(intervalMs = 300000): void {
-    // Every 5 minutes
+  startAutoProcessing(intervalMs = 30000): void {
+    // Every 30 seconds (faster since it's in-memory)
     setInterval(async () => {
-      const items = await this.getDLQItems();
-      if (items.length > 0) {
-        console.log(`[DLQ] Auto-processing ${items.length} items...`);
+      if (this.items.size > 0) {
         await this.processDLQ();
       }
     }, intervalMs);
@@ -141,19 +151,20 @@ export class DeadLetterQueue {
   /**
    * Clear old DLQ items
    */
-  async clearOldItems(olderThanDays = 7): Promise<number> {
-    const items = await this.getDLQItems();
-    const cutoff = Date.now() - olderThanDays * 86400 * 1000;
+  async clearOldItems(olderThanMs = 600000): Promise<number> {
+    const cutoff = Date.now() - olderThanMs;
     let cleared = 0;
 
-    for (const item of items) {
+    for (const [id, item] of this.items) {
       if (item.timestamp < cutoff) {
-        await (this.cache as any).client.del(item.key);
+        this.items.delete(id);
         cleared++;
       }
     }
 
-    console.log(`[DLQ] Cleared ${cleared} old items`);
+    if (cleared > 0) {
+      console.log(`[DLQ] Cleared ${cleared} old items`);
+    }
     return cleared;
   }
 }

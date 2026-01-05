@@ -41,9 +41,9 @@ class UniversalBlockchainListener {
 
     // Connect to Redis
     await this.cache.connect();
-    const cacheTTL = process.env.CACHE_TTL_HOURS || '1';
+    const cacheTTL = process.env.CACHE_TTL_MINS || '10';
     console.log('✅ Redis connected');
-    console.log(`⏱️  Cache TTL: ${cacheTTL} hour(s)`);
+    console.log(`⏱️  Cache TTL: ${cacheTTL} minute(s)`);
 
     // Start reliability services
     console.log('🔄 Starting Dead Letter Queue auto-processing...');

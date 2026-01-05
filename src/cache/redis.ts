@@ -5,11 +5,11 @@ export class RedisCache {
   private readonly TTL: number;
 
   constructor() {
-    // Default to 1 hour (3600 seconds), configurable via CACHE_TTL_HOURS
-    const ttlHours = process.env.CACHE_TTL_HOURS
-      ? parseInt(process.env.CACHE_TTL_HOURS, 10)
-      : 1;
-    this.TTL = ttlHours * 60 * 60; // Convert hours to seconds
+    // Default to 10 minutes (600 seconds), configurable via CACHE_TTL_MINS
+    const ttlMins = process.env.CACHE_TTL_MINS
+      ? parseInt(process.env.CACHE_TTL_MINS, 10)
+      : 10;
+    this.TTL = ttlMins * 60; // Convert minutes to seconds
 
     this.client = createClient({
       url: process.env.REDIS_URL || 'redis://localhost:6379',

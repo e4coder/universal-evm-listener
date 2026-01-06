@@ -12,13 +12,13 @@ interface DLQItem {
 
 /**
  * In-Memory Dead Letter Queue for failed event processing
- * Stores events that couldn't be cached for later retry
- * Uses memory instead of Redis to work even when Redis fails
+ * Limited size to prevent memory issues
+ * Events are dropped after max size or max retries
  */
 export class DeadLetterQueue {
   private cache: RedisCache;
   private readonly maxRetries = 3;
-  private readonly maxItems = 10000; // Limit memory usage
+  private readonly maxItems = 1000; // Small limit - polling pauses when Redis is down anyway
   private items: Map<string, DLQItem> = new Map();
 
   constructor(cache: RedisCache) {
@@ -34,6 +34,11 @@ export class DeadLetterQueue {
     eventData: any,
     error: string
   ): Promise<void> {
+    // If Redis is down, don't even add to DLQ - polling is paused
+    if (!this.cache.isHealthy()) {
+      return;
+    }
+
     // Limit queue size to prevent memory issues
     if (this.items.size >= this.maxItems) {
       // Remove oldest item
@@ -76,6 +81,11 @@ export class DeadLetterQueue {
    * Retry processing DLQ items
    */
   async processDLQ(): Promise<{ success: number; failed: number }> {
+    // Don't process if Redis is down
+    if (!this.cache.isHealthy()) {
+      return { success: 0, failed: 0 };
+    }
+
     const items = await this.getDLQItems();
     let success = 0;
     let failed = 0;
@@ -140,9 +150,8 @@ export class DeadLetterQueue {
    * Start automatic DLQ processing
    */
   startAutoProcessing(intervalMs = 30000): void {
-    // Every 30 seconds (faster since it's in-memory)
     setInterval(async () => {
-      if (this.items.size > 0) {
+      if (this.items.size > 0 && this.cache.isHealthy()) {
         await this.processDLQ();
       }
     }, intervalMs);

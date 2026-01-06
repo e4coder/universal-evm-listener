@@ -3,6 +3,7 @@ import { createClient, RedisClientType } from 'redis';
 export class RedisCache {
   private client: RedisClientType;
   private readonly TTL: number;
+  private _isHealthy: boolean = false;
 
   constructor() {
     // Default to 10 minutes (600 seconds), configurable via CACHE_TTL_MINS
@@ -22,10 +23,24 @@ export class RedisCache {
       },
     });
 
-    this.client.on('error', (err) => console.error('[Redis] Client Error:', err.message));
+    this.client.on('error', (err) => {
+      this._isHealthy = false;
+      console.error('[Redis] Client Error:', err.message);
+    });
     this.client.on('connect', () => console.log('[Redis] Connected'));
-    this.client.on('reconnecting', () => console.log('[Redis] Reconnecting...'));
-    this.client.on('ready', () => console.log('[Redis] Ready'));
+    this.client.on('reconnecting', () => {
+      this._isHealthy = false;
+      console.log('[Redis] Reconnecting...');
+    });
+    this.client.on('ready', () => {
+      this._isHealthy = true;
+      console.log('[Redis] Ready');
+    });
+  }
+
+  // Check if Redis is healthy
+  isHealthy(): boolean {
+    return this._isHealthy && this.client.isReady;
   }
 
   async connect(): Promise<void> {

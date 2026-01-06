@@ -90,6 +90,12 @@ export class PollingERC20Listener {
         return;
       }
 
+      // Skip polling if Redis is unhealthy - prevents DLQ from exploding
+      if (!this.cache.isHealthy()) {
+        console.log(`[${this.networkConfig.name}] ⏸️ Skipping poll - Redis unhealthy`);
+        return;
+      }
+
       try {
         await this.pollForEvents();
       } catch (error) {

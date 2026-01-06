@@ -35,6 +35,7 @@ export class PollingERC20Listener {
   private readonly POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
   private readonly MAX_BLOCKS_PER_QUERY = 100; // Max blocks to query at once
   private readonly BLOCK_CACHE_SIZE = 100; // Keep last 100 blocks cached
+  private readonly MAX_BACKFILL_BLOCKS = 500; // Don't backfill more than 500 blocks on startup
 
   constructor(
     alchemy: Alchemy,
@@ -64,10 +65,22 @@ export class PollingERC20Listener {
     const savedCheckpoint = await this.checkpoint.getCheckpoint(this.networkConfig.chainId);
 
     if (savedCheckpoint) {
-      console.log(
-        `[${this.networkConfig.name}] Found checkpoint at block ${savedCheckpoint} (current: ${currentBlock})`
-      );
-      this.lastProcessedBlock = savedCheckpoint;
+      const blocksBehind = currentBlock - savedCheckpoint;
+
+      if (blocksBehind > this.MAX_BACKFILL_BLOCKS) {
+        // Checkpoint too old - skip to recent blocks to prevent memory explosion
+        const newStart = currentBlock - this.REORG_SAFETY_BLOCKS;
+        console.log(
+          `[${this.networkConfig.name}] ⚠️ Checkpoint ${savedCheckpoint} is ${blocksBehind} blocks behind (max: ${this.MAX_BACKFILL_BLOCKS}). Skipping to block ${newStart}`
+        );
+        this.lastProcessedBlock = newStart;
+        await this.checkpoint.saveCheckpoint(this.networkConfig.chainId, newStart);
+      } else {
+        console.log(
+          `[${this.networkConfig.name}] Found checkpoint at block ${savedCheckpoint} (${blocksBehind} blocks behind)`
+        );
+        this.lastProcessedBlock = savedCheckpoint;
+      }
     } else {
       // First start - begin from current block minus safety margin
       const startBlock = currentBlock - this.REORG_SAFETY_BLOCKS;

@@ -1,7 +1,29 @@
+# Node.js
 node_modules/
 dist/
-.env
 *.log
-.DS_Store
 logs/
+
+# Environment
+.env
+
+# Rust
+rust-listener/target/
+
+# SQLite database
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# OS
+.DS_Store
+
+# PM2
 .pm2/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

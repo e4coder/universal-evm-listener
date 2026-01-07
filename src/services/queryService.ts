@@ -1,9 +1,9 @@
-import { RedisCache } from '../cache/redis';
+import { SQLiteCache } from '../cache/sqlite';
 
 export class QueryService {
-  private cache: RedisCache;
+  private cache: SQLiteCache;
 
-  constructor(cache: RedisCache) {
+  constructor(cache: SQLiteCache) {
     this.cache = cache;
   }
 

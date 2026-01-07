@@ -29,10 +29,12 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "alchemy-sdk": "^3.4.6",
-    "redis": "^4.7.0",
+    "better-sqlite3": "^12.5.0",
     "dotenv": "^16.4.7",
-    "ethers": "^6.13.4"
+    "ethers": "^6.13.4",
+    "redis": "^4.7.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",

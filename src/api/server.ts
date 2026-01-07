@@ -1,10 +1,11 @@
 import 'dotenv/config';
 import http from 'http';
-import { RedisCache } from '../cache/redis';
+import { SQLiteCache } from '../cache/sqlite';
 import { QueryService } from '../services/queryService';
 import { getNetworkConfig } from '../config/networks';
 
-const cache = new RedisCache();
+const sqlitePath = process.env.SQLITE_PATH || '/home/ubuntu/universal_listener/data/transfers.db';
+const cache = new SQLiteCache(sqlitePath);
 const queryService = new QueryService(cache);
 
 interface APIResponse {
@@ -112,9 +113,8 @@ function sendResponse(res: http.ServerResponse, statusCode: number, data: APIRes
   res.end(JSON.stringify(data, null, 2));
 }
 
-async function startServer(): Promise<void> {
-  await cache.connect();
-  console.log('✅ Redis connected');
+function startServer(): void {
+  console.log(`✅ SQLite connected: ${sqlitePath}`);
 
   const PORT = process.env.API_PORT || 3000;
   const server = http.createServer(handleRequest);
@@ -127,24 +127,26 @@ async function startServer(): Promise<void> {
     console.log('  GET /erc20/to/:chainId/:address');
     console.log('  GET /erc20/both/:chainId/:from/:to');
     console.log('  GET /erc20/address/:chainId/:address');
-    console.log('  GET /native/from/:chainId/:address');
-    console.log('  GET /native/to/:chainId/:address');
-    console.log('  GET /native/both/:chainId/:from/:to');
-    console.log('  GET /native/address/:chainId/:address');
+    console.log('  GET /native/from/:chainId/:address (returns empty - not supported)');
+    console.log('  GET /native/to/:chainId/:address (returns empty - not supported)');
+    console.log('  GET /native/both/:chainId/:from/:to (returns empty - not supported)');
+    console.log('  GET /native/address/:chainId/:address (returns empty - not supported)');
     console.log('  GET /all/:chainId/:address');
   });
 
   // Graceful shutdown
-  process.on('SIGINT', async () => {
+  process.on('SIGINT', () => {
     console.log('\n⏸️  Shutting down API server...');
     server.close();
-    await cache.disconnect();
+    cache.close();
     console.log('👋 Shutdown complete');
     process.exit(0);
   });
 }
 
-startServer().catch((error) => {
+try {
+  startServer();
+} catch (error: any) {
   console.error('❌ Failed to start API server:', error);
   process.exit(1);
-});
+}

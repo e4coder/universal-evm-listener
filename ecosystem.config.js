@@ -1,9 +1,12 @@
+const path = require('path');
+const baseDir = __dirname;
+
 module.exports = {
   apps: [
     {
       name: 'rust-listener',
       script: './rust-listener/target/release/rust-listener',
-      cwd: './rust-listener',
+      cwd: path.join(baseDir, 'rust-listener'),
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
@@ -11,12 +14,12 @@ module.exports = {
       max_memory_restart: '500M',
       env: {
         ALCHEMY_API_KEY: process.env.ALCHEMY_API_KEY,
-        SQLITE_PATH: '/home/ubuntu/universal_listener/data/transfers.db',
+        SQLITE_PATH: path.join(baseDir, 'data', 'transfers.db'),
         TTL_SECS: '600',
         LOG_LEVEL: 'info',
       },
-      error_file: './logs/rust-listener-error.log',
-      out_file: './logs/rust-listener-out.log',
+      error_file: path.join(baseDir, 'logs', 'rust-listener-error.log'),
+      out_file: path.join(baseDir, 'logs', 'rust-listener-out.log'),
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       merge_logs: true,
       time: true,
@@ -24,6 +27,7 @@ module.exports = {
     {
       name: 'blockchain-api',
       script: 'dist/api/server.js',
+      cwd: baseDir,
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
@@ -32,10 +36,10 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         API_PORT: 5459,
-        SQLITE_PATH: '/home/ubuntu/universal_listener/data/transfers.db',
+        SQLITE_PATH: path.join(baseDir, 'data', 'transfers.db'),
       },
-      error_file: './logs/api-error.log',
-      out_file: './logs/api-out.log',
+      error_file: path.join(baseDir, 'logs', 'api-error.log'),
+      out_file: path.join(baseDir, 'logs', 'api-out.log'),
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       merge_logs: true,
       time: true,

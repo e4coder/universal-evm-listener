@@ -421,7 +421,7 @@ impl ChainPoller {
     }
 
     /// Process EscrowWithdrawal event
-    async fn process_escrow_withdrawal(&self, log: &Log, _timestamp: u64) -> Result<(), String> {
+    async fn process_escrow_withdrawal(&self, log: &Log, timestamp: u64) -> Result<(), String> {
         let secret = decode_escrow_withdrawal(&log.data)
             .ok_or_else(|| "Failed to decode EscrowWithdrawal data".to_string())?;
 
@@ -434,16 +434,25 @@ impl ChainPoller {
             // Determine if this is src or dst withdrawal based on chain_id
             let is_src = swap.src_chain_id == self.network.chain_id;
 
-            // Update the swap status with secret
+            // Update the swap status with secret and tx details
             let updated = self.db
-                .update_fusion_plus_withdrawal_by_hashlock(&hashlock, self.network.chain_id, is_src, &secret)
+                .update_fusion_plus_withdrawal_by_hashlock(
+                    &hashlock,
+                    self.network.chain_id,
+                    is_src,
+                    &secret,
+                    &log.transaction_hash,
+                    log.block_number_u64(),
+                    timestamp,
+                    log.log_index_u32(),
+                )
                 .map_err(|e| format!("DB error: {}", e))?;
 
             if updated {
                 let side = if is_src { "source" } else { "destination" };
                 info!(
-                    "[{}] Fusion+ {} withdrawal: order_hash={} secret={}",
-                    self.network.name, side, swap.order_hash, secret
+                    "[{}] Fusion+ {} withdrawal: order_hash={} secret={} tx={}",
+                    self.network.name, side, swap.order_hash, secret, log.transaction_hash
                 );
             }
         }

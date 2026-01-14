@@ -583,6 +583,10 @@ impl Database {
         chain_id: u32,
         is_src: bool,
         secret: &str,
+        tx_hash: &str,
+        block_number: u64,
+        block_timestamp: u64,
+        log_index: u32,
     ) -> Result<bool, DbError> {
         let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
         let now = SystemTime::now()
@@ -599,20 +603,40 @@ impl Database {
         } else {
             "UPDATE fusion_plus_swaps SET
                 dst_status = 'withdrawn',
+                dst_tx_hash = ?5,
+                dst_block_number = ?6,
+                dst_block_timestamp = ?7,
+                dst_log_index = ?8,
                 secret = ?1,
                 updated_at = ?2
              WHERE hashlock = ?3 AND dst_chain_id = ?4"
         };
 
-        let result = conn.execute(
-            sql,
-            params![
-                secret.to_lowercase(),
-                now,
-                hashlock.to_lowercase(),
-                chain_id
-            ],
-        )?;
+        let result = if is_src {
+            conn.execute(
+                sql,
+                params![
+                    secret.to_lowercase(),
+                    now,
+                    hashlock.to_lowercase(),
+                    chain_id
+                ],
+            )?
+        } else {
+            conn.execute(
+                sql,
+                params![
+                    secret.to_lowercase(),
+                    now,
+                    hashlock.to_lowercase(),
+                    chain_id,
+                    tx_hash.to_lowercase(),
+                    block_number,
+                    block_timestamp,
+                    log_index
+                ],
+            )?
+        };
 
         Ok(result > 0)
     }

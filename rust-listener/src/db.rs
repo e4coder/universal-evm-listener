@@ -1,4 +1,4 @@
-use crate::types::Transfer;
+use crate::types::{DstEscrowCreatedData, FusionPlusSwap, Transfer};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -55,6 +55,18 @@ impl Database {
             [],
         )?;
 
+        // Add swap_type column if it doesn't exist (for existing databases)
+        // SQLite doesn't have ADD COLUMN IF NOT EXISTS, so we check first
+        let has_swap_type: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('transfers') WHERE name = 'swap_type'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_swap_type {
+            conn.execute("ALTER TABLE transfers ADD COLUMN swap_type TEXT", [])?;
+        }
+
         // Create indexes for query patterns
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_from ON transfers(chain_id, from_addr, block_timestamp DESC)",
@@ -68,6 +80,14 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_created ON transfers(created_at)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_swap_type ON transfers(chain_id, swap_type, block_timestamp DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_hash ON transfers(chain_id, tx_hash)",
+            [],
+        )?;
 
         // Create checkpoints table
         conn.execute(
@@ -76,6 +96,87 @@ impl Database {
                 block_number INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             )",
+            [],
+        )?;
+
+        // Create fusion_plus_swaps table for 1inch Fusion+ cross-chain swaps
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fusion_plus_swaps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- Correlation keys (SAME on both chains)
+                order_hash TEXT NOT NULL UNIQUE,
+                hashlock TEXT NOT NULL,
+                secret TEXT,
+
+                -- Source chain data (from SrcEscrowCreated event)
+                src_chain_id INTEGER NOT NULL,
+                src_tx_hash TEXT NOT NULL,
+                src_block_number INTEGER NOT NULL,
+                src_block_timestamp INTEGER NOT NULL,
+                src_log_index INTEGER NOT NULL,
+                src_escrow_address TEXT,
+                src_maker TEXT NOT NULL,
+                src_taker TEXT NOT NULL,
+                src_token TEXT NOT NULL,
+                src_amount TEXT NOT NULL,
+                src_safety_deposit TEXT NOT NULL,
+                src_timelocks TEXT NOT NULL,
+                src_status TEXT NOT NULL DEFAULT 'created',
+
+                -- Destination chain data (NULLABLE until DstEscrowCreated)
+                dst_chain_id INTEGER NOT NULL,
+                dst_tx_hash TEXT,
+                dst_block_number INTEGER,
+                dst_block_timestamp INTEGER,
+                dst_log_index INTEGER,
+                dst_escrow_address TEXT,
+                dst_maker TEXT NOT NULL,
+                dst_taker TEXT,
+                dst_token TEXT NOT NULL,
+                dst_amount TEXT NOT NULL,
+                dst_safety_deposit TEXT NOT NULL,
+                dst_timelocks TEXT,
+                dst_status TEXT NOT NULL DEFAULT 'pending',
+
+                -- Metadata
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+
+        // Create indexes for fusion_plus_swaps
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_hashlock ON fusion_plus_swaps(hashlock)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_src_chain ON fusion_plus_swaps(src_chain_id, src_block_timestamp DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_dst_chain ON fusion_plus_swaps(dst_chain_id, dst_block_timestamp DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_src_maker ON fusion_plus_swaps(src_maker)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_dst_maker ON fusion_plus_swaps(dst_maker)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_src_taker ON fusion_plus_swaps(src_taker)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_status ON fusion_plus_swaps(src_status, dst_status)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fp_created ON fusion_plus_swaps(created_at)",
             [],
         )?;
 
@@ -287,5 +388,347 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(transfers)
+    }
+
+    // =========================================================================
+    // Fusion+ Methods
+    // =========================================================================
+
+    /// Insert a new Fusion+ swap (from SrcEscrowCreated event)
+    pub fn insert_fusion_plus_swap(&self, swap: &FusionPlusSwap) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO fusion_plus_swaps (
+                order_hash, hashlock, secret,
+                src_chain_id, src_tx_hash, src_block_number, src_block_timestamp, src_log_index,
+                src_escrow_address, src_maker, src_taker, src_token, src_amount,
+                src_safety_deposit, src_timelocks, src_status,
+                dst_chain_id, dst_tx_hash, dst_block_number, dst_block_timestamp, dst_log_index,
+                dst_escrow_address, dst_maker, dst_taker, dst_token, dst_amount,
+                dst_safety_deposit, dst_timelocks, dst_status,
+                created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
+            )",
+            params![
+                swap.order_hash.to_lowercase(),
+                swap.hashlock.to_lowercase(),
+                swap.secret,
+                swap.src_chain_id,
+                swap.src_tx_hash.to_lowercase(),
+                swap.src_block_number,
+                swap.src_block_timestamp,
+                swap.src_log_index,
+                swap.src_escrow_address.as_ref().map(|s| s.to_lowercase()),
+                swap.src_maker.to_lowercase(),
+                swap.src_taker.to_lowercase(),
+                swap.src_token.to_lowercase(),
+                swap.src_amount,
+                swap.src_safety_deposit,
+                swap.src_timelocks,
+                swap.src_status,
+                swap.dst_chain_id,
+                swap.dst_tx_hash.as_ref().map(|s| s.to_lowercase()),
+                swap.dst_block_number,
+                swap.dst_block_timestamp,
+                swap.dst_log_index,
+                swap.dst_escrow_address.as_ref().map(|s| s.to_lowercase()),
+                swap.dst_maker.to_lowercase(),
+                swap.dst_taker.as_ref().map(|s| s.to_lowercase()),
+                swap.dst_token.to_lowercase(),
+                swap.dst_amount,
+                swap.dst_safety_deposit,
+                swap.dst_timelocks,
+                swap.dst_status,
+                now,
+                now
+            ],
+        )?;
+
+        Ok(result > 0)
+    }
+
+    /// Update swap with destination data (from DstEscrowCreated event)
+    pub fn update_fusion_plus_dst(
+        &self,
+        order_hash: &str,
+        dst_data: &DstEscrowCreatedData,
+        chain_id: u32,
+        tx_hash: &str,
+        block_number: u64,
+        block_timestamp: u64,
+        log_index: u32,
+        escrow_address: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result = conn.execute(
+            "UPDATE fusion_plus_swaps SET
+                dst_tx_hash = ?1,
+                dst_block_number = ?2,
+                dst_block_timestamp = ?3,
+                dst_log_index = ?4,
+                dst_escrow_address = ?5,
+                dst_taker = ?6,
+                dst_timelocks = ?7,
+                dst_status = 'created',
+                updated_at = ?8
+             WHERE order_hash = ?9 AND dst_chain_id = ?10",
+            params![
+                tx_hash.to_lowercase(),
+                block_number,
+                block_timestamp,
+                log_index,
+                escrow_address.map(|s| s.to_lowercase()),
+                dst_data.dst_taker.to_lowercase(),
+                dst_data.dst_timelocks,
+                now,
+                order_hash.to_lowercase(),
+                chain_id
+            ],
+        )?;
+
+        Ok(result > 0)
+    }
+
+    /// Update swap status on withdrawal (updates secret and status)
+    pub fn update_fusion_plus_withdrawal(
+        &self,
+        order_hash: &str,
+        chain_id: u32,
+        is_src: bool,
+        secret: &str,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let sql = if is_src {
+            "UPDATE fusion_plus_swaps SET
+                src_status = 'withdrawn',
+                secret = ?1,
+                updated_at = ?2
+             WHERE order_hash = ?3 AND src_chain_id = ?4"
+        } else {
+            "UPDATE fusion_plus_swaps SET
+                dst_status = 'withdrawn',
+                secret = ?1,
+                updated_at = ?2
+             WHERE order_hash = ?3 AND dst_chain_id = ?4"
+        };
+
+        let result = conn.execute(
+            sql,
+            params![
+                secret.to_lowercase(),
+                now,
+                order_hash.to_lowercase(),
+                chain_id
+            ],
+        )?;
+
+        Ok(result > 0)
+    }
+
+    /// Update swap status on cancellation
+    pub fn update_fusion_plus_cancelled(
+        &self,
+        order_hash: &str,
+        chain_id: u32,
+        is_src: bool,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let sql = if is_src {
+            "UPDATE fusion_plus_swaps SET
+                src_status = 'cancelled',
+                updated_at = ?1
+             WHERE order_hash = ?2 AND src_chain_id = ?3"
+        } else {
+            "UPDATE fusion_plus_swaps SET
+                dst_status = 'cancelled',
+                updated_at = ?1
+             WHERE order_hash = ?2 AND dst_chain_id = ?3"
+        };
+
+        let result = conn.execute(
+            sql,
+            params![now, order_hash.to_lowercase(), chain_id],
+        )?;
+
+        Ok(result > 0)
+    }
+
+    /// Label transfers in a transaction as fusion_plus
+    pub fn label_transfers_as_fusion(
+        &self,
+        chain_id: u32,
+        tx_hash: &str,
+        swap_type: &str,
+    ) -> Result<usize, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+
+        let result = conn.execute(
+            "UPDATE transfers SET swap_type = ?1 WHERE chain_id = ?2 AND tx_hash = ?3",
+            params![swap_type, chain_id, tx_hash.to_lowercase()],
+        )?;
+
+        Ok(result)
+    }
+
+    /// Get Fusion+ swap by order_hash
+    pub fn get_fusion_plus_swap(&self, order_hash: &str) -> Result<Option<FusionPlusSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+
+        let result = conn.query_row(
+            "SELECT order_hash, hashlock, secret,
+                    src_chain_id, src_tx_hash, src_block_number, src_block_timestamp, src_log_index,
+                    src_escrow_address, src_maker, src_taker, src_token, src_amount,
+                    src_safety_deposit, src_timelocks, src_status,
+                    dst_chain_id, dst_tx_hash, dst_block_number, dst_block_timestamp, dst_log_index,
+                    dst_escrow_address, dst_maker, dst_taker, dst_token, dst_amount,
+                    dst_safety_deposit, dst_timelocks, dst_status
+             FROM fusion_plus_swaps WHERE order_hash = ?1",
+            params![order_hash.to_lowercase()],
+            |row| {
+                Ok(FusionPlusSwap {
+                    order_hash: row.get(0)?,
+                    hashlock: row.get(1)?,
+                    secret: row.get(2)?,
+                    src_chain_id: row.get(3)?,
+                    src_tx_hash: row.get(4)?,
+                    src_block_number: row.get(5)?,
+                    src_block_timestamp: row.get(6)?,
+                    src_log_index: row.get(7)?,
+                    src_escrow_address: row.get(8)?,
+                    src_maker: row.get(9)?,
+                    src_taker: row.get(10)?,
+                    src_token: row.get(11)?,
+                    src_amount: row.get(12)?,
+                    src_safety_deposit: row.get(13)?,
+                    src_timelocks: row.get(14)?,
+                    src_status: row.get(15)?,
+                    dst_chain_id: row.get(16)?,
+                    dst_tx_hash: row.get(17)?,
+                    dst_block_number: row.get(18)?,
+                    dst_block_timestamp: row.get(19)?,
+                    dst_log_index: row.get(20)?,
+                    dst_escrow_address: row.get(21)?,
+                    dst_maker: row.get(22)?,
+                    dst_taker: row.get(23)?,
+                    dst_token: row.get(24)?,
+                    dst_amount: row.get(25)?,
+                    dst_safety_deposit: row.get(26)?,
+                    dst_timelocks: row.get(27)?,
+                    dst_status: row.get(28)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(swap) => Ok(Some(swap)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get Fusion+ swap by hashlock (for matching withdrawal events)
+    pub fn get_fusion_plus_swap_by_hashlock(&self, hashlock: &str) -> Result<Option<FusionPlusSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+
+        let result = conn.query_row(
+            "SELECT order_hash, hashlock, secret,
+                    src_chain_id, src_tx_hash, src_block_number, src_block_timestamp, src_log_index,
+                    src_escrow_address, src_maker, src_taker, src_token, src_amount,
+                    src_safety_deposit, src_timelocks, src_status,
+                    dst_chain_id, dst_tx_hash, dst_block_number, dst_block_timestamp, dst_log_index,
+                    dst_escrow_address, dst_maker, dst_taker, dst_token, dst_amount,
+                    dst_safety_deposit, dst_timelocks, dst_status
+             FROM fusion_plus_swaps WHERE hashlock = ?1",
+            params![hashlock.to_lowercase()],
+            |row| {
+                Ok(FusionPlusSwap {
+                    order_hash: row.get(0)?,
+                    hashlock: row.get(1)?,
+                    secret: row.get(2)?,
+                    src_chain_id: row.get(3)?,
+                    src_tx_hash: row.get(4)?,
+                    src_block_number: row.get(5)?,
+                    src_block_timestamp: row.get(6)?,
+                    src_log_index: row.get(7)?,
+                    src_escrow_address: row.get(8)?,
+                    src_maker: row.get(9)?,
+                    src_taker: row.get(10)?,
+                    src_token: row.get(11)?,
+                    src_amount: row.get(12)?,
+                    src_safety_deposit: row.get(13)?,
+                    src_timelocks: row.get(14)?,
+                    src_status: row.get(15)?,
+                    dst_chain_id: row.get(16)?,
+                    dst_tx_hash: row.get(17)?,
+                    dst_block_number: row.get(18)?,
+                    dst_block_timestamp: row.get(19)?,
+                    dst_log_index: row.get(20)?,
+                    dst_escrow_address: row.get(21)?,
+                    dst_maker: row.get(22)?,
+                    dst_taker: row.get(23)?,
+                    dst_token: row.get(24)?,
+                    dst_amount: row.get(25)?,
+                    dst_safety_deposit: row.get(26)?,
+                    dst_timelocks: row.get(27)?,
+                    dst_status: row.get(28)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(swap) => Ok(Some(swap)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get total count of Fusion+ swaps (for monitoring)
+    pub fn get_fusion_plus_count(&self) -> Result<u64, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM fusion_plus_swaps",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Clean up old Fusion+ swaps based on TTL
+    pub fn cleanup_old_fusion_plus(&self, ttl_secs: u64) -> Result<usize, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - ttl_secs;
+
+        let deleted = conn.execute(
+            "DELETE FROM fusion_plus_swaps WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+
+        Ok(deleted)
     }
 }

@@ -100,6 +100,75 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return sendResponse(res, 200, { success: true, data: SUPPORTED_NETWORKS });
     }
 
+    // =========================================================================
+    // Fusion+ Endpoints
+    // =========================================================================
+
+    // GET /fusion-plus/swap/:orderHash - Get swap by order hash
+    if (path.match(/^\/fusion-plus\/swap\/0x[a-fA-F0-9]{64}$/)) {
+      const orderHash = path.split('/')[3];
+      const swap = cache.getFusionPlusSwap(orderHash);
+      if (swap) {
+        return sendResponse(res, 200, { success: true, data: swap });
+      }
+      return sendResponse(res, 404, { success: false, error: 'Swap not found' });
+    }
+
+    // GET /fusion-plus/address/:address - Get swaps by maker/taker address
+    if (path.match(/^\/fusion-plus\/address\/0x[a-fA-F0-9]{40}$/)) {
+      const address = path.split('/')[3];
+      const swaps = cache.getFusionPlusSwapsByAddress(address);
+      return sendResponse(res, 200, { success: true, data: swaps });
+    }
+
+    // GET /fusion-plus/pending - Get swaps awaiting dst escrow
+    if (path === '/fusion-plus/pending') {
+      const swaps = cache.getFusionPlusPending();
+      return sendResponse(res, 200, { success: true, data: swaps });
+    }
+
+    // GET /fusion-plus/completed - Get fully completed swaps
+    if (path === '/fusion-plus/completed') {
+      const swaps = cache.getFusionPlusCompleted();
+      return sendResponse(res, 200, { success: true, data: swaps });
+    }
+
+    // GET /fusion-plus/src-chain/:chainId - Get swaps by source chain
+    if (path.match(/^\/fusion-plus\/src-chain\/\d+$/)) {
+      const chainId = parseInt(path.split('/')[3]);
+      const swaps = cache.getFusionPlusSwapsBySrcChain(chainId);
+      return sendResponse(res, 200, { success: true, data: swaps });
+    }
+
+    // GET /fusion-plus/dst-chain/:chainId - Get swaps by destination chain
+    if (path.match(/^\/fusion-plus\/dst-chain\/\d+$/)) {
+      const chainId = parseInt(path.split('/')[3]);
+      const swaps = cache.getFusionPlusSwapsByDstChain(chainId);
+      return sendResponse(res, 200, { success: true, data: swaps });
+    }
+
+    // GET /transfer/swap/:chainId/:txHash - Get swap details for a specific transfer
+    if (path.match(/^\/transfer\/swap\/\d+\/0x[a-fA-F0-9]{64}$/)) {
+      const [, , , chainIdStr, txHash] = path.split('/');
+      const chainId = parseInt(chainIdStr);
+      const swap = cache.getSwapForTransfer(chainId, txHash);
+      return sendResponse(res, 200, { success: true, data: swap });
+    }
+
+    // GET /erc20/fusion/:chainId/:address - Get fusion-labeled transfers for an address
+    if (path.match(/^\/erc20\/fusion\/\d+\/0x[a-fA-F0-9]{40}$/)) {
+      const [, , , chainIdStr, address] = path.split('/');
+      const chainId = parseInt(chainIdStr);
+      const transfers = cache.getFusionPlusTransfersByAddress(chainId, address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /stats - Get database statistics
+    if (path === '/stats') {
+      const stats = cache.getStats();
+      return sendResponse(res, 200, { success: true, data: stats });
+    }
+
     // 404 Not Found
     return sendResponse(res, 404, { success: false, error: 'Endpoint not found' });
   } catch (error: any) {
@@ -123,15 +192,28 @@ function startServer(): void {
     console.log(`🚀 API Server running on http://localhost:${PORT}`);
     console.log('\nAvailable endpoints:');
     console.log('  GET /networks');
+    console.log('  GET /stats');
+    console.log('\n  ERC20 Transfers:');
     console.log('  GET /erc20/from/:chainId/:address');
     console.log('  GET /erc20/to/:chainId/:address');
     console.log('  GET /erc20/both/:chainId/:from/:to');
     console.log('  GET /erc20/address/:chainId/:address');
-    console.log('  GET /native/from/:chainId/:address (returns empty - not supported)');
-    console.log('  GET /native/to/:chainId/:address (returns empty - not supported)');
-    console.log('  GET /native/both/:chainId/:from/:to (returns empty - not supported)');
-    console.log('  GET /native/address/:chainId/:address (returns empty - not supported)');
+    console.log('  GET /erc20/fusion/:chainId/:address');
+    console.log('\n  Native Transfers (not supported in SQLite mode):');
+    console.log('  GET /native/from/:chainId/:address');
+    console.log('  GET /native/to/:chainId/:address');
+    console.log('  GET /native/both/:chainId/:from/:to');
+    console.log('  GET /native/address/:chainId/:address');
+    console.log('\n  Combined:');
     console.log('  GET /all/:chainId/:address');
+    console.log('\n  Fusion+ Swaps:');
+    console.log('  GET /fusion-plus/swap/:orderHash');
+    console.log('  GET /fusion-plus/address/:address');
+    console.log('  GET /fusion-plus/pending');
+    console.log('  GET /fusion-plus/completed');
+    console.log('  GET /fusion-plus/src-chain/:chainId');
+    console.log('  GET /fusion-plus/dst-chain/:chainId');
+    console.log('  GET /transfer/swap/:chainId/:txHash');
   });
 
   // Graceful shutdown

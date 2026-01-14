@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod fusion;
 mod poller;
 mod rpc;
 mod types;
@@ -61,6 +62,7 @@ async fn main() {
         loop {
             sleep(Duration::from_secs(60)).await;
 
+            // Clean up old transfers
             match db_cleanup.cleanup_old(ttl_secs) {
                 Ok(deleted) => {
                     if deleted > 0 {
@@ -72,15 +74,25 @@ async fn main() {
                 }
             }
 
-            // Log stats every cleanup cycle
-            match db_cleanup.get_transfer_count() {
-                Ok(count) => {
-                    info!("Database stats: {} transfers stored", count);
+            // Clean up old Fusion+ swaps
+            match db_cleanup.cleanup_old_fusion_plus(ttl_secs) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        info!("Cleanup: removed {} old Fusion+ swaps", deleted);
+                    }
                 }
                 Err(e) => {
-                    warn!("Failed to get stats: {}", e);
+                    warn!("Fusion+ cleanup error: {}", e);
                 }
             }
+
+            // Log stats every cleanup cycle
+            let transfer_count = db_cleanup.get_transfer_count().unwrap_or(0);
+            let fusion_count = db_cleanup.get_fusion_plus_count().unwrap_or(0);
+            info!(
+                "Database stats: {} transfers, {} Fusion+ swaps stored",
+                transfer_count, fusion_count
+            );
         }
     });
 

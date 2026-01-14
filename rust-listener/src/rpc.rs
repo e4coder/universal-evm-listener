@@ -212,6 +212,56 @@ impl RpcClient {
         self.request("eth_getLogs", params).await
     }
 
+    /// Get logs from a specific contract address with topic filter (eth_getLogs)
+    ///
+    /// Used for fetching events from specific contracts like EscrowFactory
+    pub async fn get_logs_by_address(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        address: &str,
+        topics: Vec<Option<String>>,
+    ) -> Result<Vec<Log>, RpcError> {
+        debug!(
+            "[{}] Getting logs from {} for blocks {} to {}",
+            self.chain_name, address, from_block, to_block
+        );
+
+        let params = json!([{
+            "fromBlock": format!("0x{:x}", from_block),
+            "toBlock": format!("0x{:x}", to_block),
+            "address": address,
+            "topics": topics
+        }]);
+
+        self.request("eth_getLogs", params).await
+    }
+
+    /// Get logs with multiple possible topics (OR filter for topic[0])
+    ///
+    /// Used for fetching multiple event types in one call
+    pub async fn get_logs_multi_topics(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        address: &str,
+        topic0_options: Vec<String>,
+    ) -> Result<Vec<Log>, RpcError> {
+        debug!(
+            "[{}] Getting logs from {} with {} topic options for blocks {} to {}",
+            self.chain_name, address, topic0_options.len(), from_block, to_block
+        );
+
+        let params = json!([{
+            "fromBlock": format!("0x{:x}", from_block),
+            "toBlock": format!("0x{:x}", to_block),
+            "address": address,
+            "topics": [topic0_options]
+        }]);
+
+        self.request("eth_getLogs", params).await
+    }
+
     /// Get block by number (eth_getBlockByNumber)
     ///
     /// Returns block header without transactions (for getting timestamp)

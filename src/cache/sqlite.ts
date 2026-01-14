@@ -66,7 +66,7 @@ export class SQLiteCache {
   getERC20TransfersByFrom(chainId: number, from: string): any[] {
     const stmt = this.db.prepare(`
       SELECT chain_id as chainId, tx_hash as txHash, token, from_addr as "from", to_addr as "to",
-             value, block_number as blockNumber, block_timestamp as timestamp
+             value, block_number as blockNumber, block_timestamp as timestamp, swap_type as swapType
       FROM transfers
       WHERE chain_id = ? AND from_addr = ?
       ORDER BY block_timestamp DESC
@@ -78,7 +78,7 @@ export class SQLiteCache {
   getERC20TransfersByTo(chainId: number, to: string): any[] {
     const stmt = this.db.prepare(`
       SELECT chain_id as chainId, tx_hash as txHash, token, from_addr as "from", to_addr as "to",
-             value, block_number as blockNumber, block_timestamp as timestamp
+             value, block_number as blockNumber, block_timestamp as timestamp, swap_type as swapType
       FROM transfers
       WHERE chain_id = ? AND to_addr = ?
       ORDER BY block_timestamp DESC
@@ -90,7 +90,7 @@ export class SQLiteCache {
   getERC20TransfersByBoth(chainId: number, from: string, to: string): any[] {
     const stmt = this.db.prepare(`
       SELECT chain_id as chainId, tx_hash as txHash, token, from_addr as "from", to_addr as "to",
-             value, block_number as blockNumber, block_timestamp as timestamp
+             value, block_number as blockNumber, block_timestamp as timestamp, swap_type as swapType
       FROM transfers
       WHERE chain_id = ? AND from_addr = ? AND to_addr = ?
       ORDER BY block_timestamp DESC

@@ -575,6 +575,48 @@ impl Database {
         Ok(result > 0)
     }
 
+    /// Update swap status on withdrawal by hashlock (for when we don't know order_hash)
+    /// This is used when processing EscrowWithdrawal events
+    pub fn update_fusion_plus_withdrawal_by_hashlock(
+        &self,
+        hashlock: &str,
+        chain_id: u32,
+        is_src: bool,
+        secret: &str,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let sql = if is_src {
+            "UPDATE fusion_plus_swaps SET
+                src_status = 'withdrawn',
+                secret = ?1,
+                updated_at = ?2
+             WHERE hashlock = ?3 AND src_chain_id = ?4"
+        } else {
+            "UPDATE fusion_plus_swaps SET
+                dst_status = 'withdrawn',
+                secret = ?1,
+                updated_at = ?2
+             WHERE hashlock = ?3 AND dst_chain_id = ?4"
+        };
+
+        let result = conn.execute(
+            sql,
+            params![
+                secret.to_lowercase(),
+                now,
+                hashlock.to_lowercase(),
+                chain_id
+            ],
+        )?;
+
+        Ok(result > 0)
+    }
+
     /// Label transfers in a transaction as fusion_plus
     pub fn label_transfers_as_fusion(
         &self,

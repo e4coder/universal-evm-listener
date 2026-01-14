@@ -1,4 +1,5 @@
 use crate::types::{DstEscrowCreatedData, SrcEscrowCreatedData};
+use sha3::{Digest, Keccak256};
 
 /// Decode SrcEscrowCreated event data
 ///
@@ -111,6 +112,22 @@ pub fn decode_escrow_withdrawal(data: &str) -> Option<String> {
     }
 
     Some(format!("0x{}", &hex[0..64].to_lowercase()))
+}
+
+/// Compute hashlock from secret using keccak256
+/// hashlock = keccak256(secret)
+pub fn compute_hashlock_from_secret(secret: &str) -> Option<String> {
+    let secret_hex = secret.strip_prefix("0x").unwrap_or(secret);
+
+    // Decode the secret from hex to bytes
+    let secret_bytes = hex::decode(secret_hex).ok()?;
+
+    // Compute keccak256 hash
+    let mut hasher = Keccak256::new();
+    hasher.update(&secret_bytes);
+    let result = hasher.finalize();
+
+    Some(format!("0x{}", hex::encode(result)))
 }
 
 #[cfg(test)]

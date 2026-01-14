@@ -16,11 +16,13 @@ pub const SRC_ESCROW_CREATED_TOPIC: &str = "0x0e534c62f0afd2fa0f0fa71198e8aa2d54
 /// DstEscrowCreated event topic - emitted on destination chain when resolver creates escrow
 pub const DST_ESCROW_CREATED_TOPIC: &str = "0x4d81cba2e6bb297be9304a3fd015ef78782b99f914a881ee9bd2f93291ee6eab";
 
-/// EscrowWithdrawal event topic - emitted when escrow is withdrawn (reveals secret)
-pub const ESCROW_WITHDRAWAL_TOPIC: &str = "0xbd74e509ab3bcbbaa9ee979d61e331c3f713f39325be2929dca5e6625e34f5d0";
+/// EscrowWithdrawal(bytes32 secret) event topic - emitted when escrow is withdrawn (reveals secret)
+/// keccak256("EscrowWithdrawal(bytes32)") = 0xe346f5c97a360db5188bfa5d3ec5f0583abde420c6ba4d08b6cfe61addc17105
+pub const ESCROW_WITHDRAWAL_TOPIC: &str = "0xe346f5c97a360db5188bfa5d3ec5f0583abde420c6ba4d08b6cfe61addc17105";
 
-/// EscrowCancelled event topic - emitted when escrow is cancelled
-pub const ESCROW_CANCELLED_TOPIC: &str = "0x7be8ac5ba29ab8ec09d5d66e9fc5d4050be86891af6a8ae794f74b9a4956b7cd";
+/// EscrowCancelled() event topic - emitted when escrow is cancelled
+/// keccak256("EscrowCancelled()") = 0x6e3be9294e58d10b9c8053cfd5e09871b67e442fe394d6b0870d336b9df984a9
+pub const ESCROW_CANCELLED_TOPIC: &str = "0x6e3be9294e58d10b9c8053cfd5e09871b67e442fe394d6b0870d336b9df984a9";
 
 /// Network configuration for a blockchain
 #[derive(Debug, Clone)]

@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::fusion::{decode_dst_escrow_created, decode_escrow_withdrawal, decode_src_escrow_created};
+use crate::fusion::{compute_hashlock_from_secret, decode_dst_escrow_created, decode_escrow_withdrawal, decode_src_escrow_created};
 use crate::rpc::RpcClient;
 use crate::types::{
     FusionPlusSwap, Log, NetworkConfig, Transfer,
@@ -426,9 +426,28 @@ impl ChainPoller {
         let secret = decode_escrow_withdrawal(&log.data)
             .ok_or_else(|| "Failed to decode EscrowWithdrawal data".to_string())?;
 
-        // The withdrawal event doesn't contain the order_hash, so we need to find it by escrow address
-        // For now, we'll look up by the escrow address which should be stored when we saw DstEscrowCreated
-        // This is a limitation - we might not be able to update if we didn't see the creation event
+        // Compute hashlock from secret: hashlock = keccak256(secret)
+        let hashlock = compute_hashlock_from_secret(&secret)
+            .ok_or_else(|| "Failed to compute hashlock from secret".to_string())?;
+
+        // Look up the swap by hashlock and update its status
+        if let Ok(Some(swap)) = self.db.get_fusion_plus_swap_by_hashlock(&hashlock) {
+            // Determine if this is src or dst withdrawal based on chain_id
+            let is_src = swap.src_chain_id == self.network.chain_id;
+
+            // Update the swap status with secret
+            let updated = self.db
+                .update_fusion_plus_withdrawal_by_hashlock(&hashlock, self.network.chain_id, is_src, &secret)
+                .map_err(|e| format!("DB error: {}", e))?;
+
+            if updated {
+                let side = if is_src { "source" } else { "destination" };
+                info!(
+                    "[{}] Fusion+ {} withdrawal: order_hash={} secret={}",
+                    self.network.name, side, swap.order_hash, secret
+                );
+            }
+        }
 
         // Label transfers in this tx as fusion_plus
         self.db
@@ -436,8 +455,8 @@ impl ChainPoller {
             .map_err(|e| format!("DB error: {}", e))?;
 
         debug!(
-            "[{}] Fusion+ withdrawal from escrow {} with secret {}",
-            self.network.name, log.address, secret
+            "[{}] Fusion+ withdrawal from escrow {} with hashlock {}",
+            self.network.name, log.address, hashlock
         );
 
         Ok(())

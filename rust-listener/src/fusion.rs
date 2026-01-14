@@ -155,4 +155,18 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "0xe9af1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab");
     }
+
+    #[test]
+    fn test_compute_hashlock_from_secret() {
+        // Test with the actual secret from the user's Base transaction
+        // secret: 0x4925e041e603ea86152f3b4e77e355d1e7bff747f7e1b3cb94eb9909ef969cf1
+        let secret = "0x4925e041e603ea86152f3b4e77e355d1e7bff747f7e1b3cb94eb9909ef969cf1";
+        let hashlock = compute_hashlock_from_secret(secret);
+
+        assert!(hashlock.is_some());
+        // The hashlock should be keccak256 of the secret bytes
+        let result = hashlock.unwrap();
+        assert!(result.starts_with("0x"));
+        assert_eq!(result.len(), 66); // 0x + 64 hex chars
+    }
 }

@@ -309,11 +309,10 @@ impl ChainPoller {
         ];
 
         // Note: We can't filter by address for escrow events since escrow addresses vary
-        // So we fetch by topic only and filter by known escrows in the handler
+        // So we fetch by topic only using OR filter
         let escrow_logs = self
             .rpc
-            .get_logs(from_block, to_block, vec![Some(format!("[{},{}]",
-                ESCROW_WITHDRAWAL_TOPIC, ESCROW_CANCELLED_TOPIC))])
+            .get_logs_multi_topics_any_address(from_block, to_block, escrow_topics)
             .await
             .unwrap_or_default();
 

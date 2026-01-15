@@ -8,7 +8,7 @@ use crate::types::{
     FusionPlusSwap, FusionSwap, Log, NetworkConfig, Transfer,
     ESCROW_FACTORY, SRC_ESCROW_CREATED_TOPIC, DST_ESCROW_CREATED_TOPIC,
     ESCROW_WITHDRAWAL_TOPIC, ESCROW_CANCELLED_TOPIC,
-    LIMIT_ORDER_PROTOCOL, LIMIT_ORDER_PROTOCOL_ZKSYNC,
+    AGGREGATION_ROUTER_V6, AGGREGATION_ROUTER_ZKSYNC,
     ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC,
 };
 use std::collections::HashMap;
@@ -499,18 +499,18 @@ impl ChainPoller {
     // Fusion (Single-Chain) Methods
     // =========================================================================
 
-    /// Poll for Fusion events from LimitOrderProtocol
+    /// Poll for Fusion events from Aggregation Router V6
     async fn poll_fusion_events(
         &mut self,
         from_block: u64,
         to_block: u64,
     ) -> Result<usize, String> {
         // Determine contract address based on chain
-        let protocol_address = if self.network.chain_id == 324 {
+        let router_address = if self.network.chain_id == 324 {
             // zkSync Era
-            LIMIT_ORDER_PROTOCOL_ZKSYNC
+            AGGREGATION_ROUTER_ZKSYNC
         } else {
-            LIMIT_ORDER_PROTOCOL
+            AGGREGATION_ROUTER_V6
         };
 
         // Fetch OrderFilled and OrderCancelled events
@@ -521,7 +521,7 @@ impl ChainPoller {
 
         let logs = self
             .rpc
-            .get_logs_multi_topics(from_block, to_block, protocol_address, topics)
+            .get_logs_multi_topics(from_block, to_block, router_address, topics)
             .await
             .unwrap_or_default();
 
@@ -597,8 +597,8 @@ impl ChainPoller {
             .map_err(|e| format!("DB error: {}", e))?;
 
         info!(
-            "[{}] Fusion {} order: order_hash={} maker={}",
-            self.network.name, status, data.order_hash, data.maker
+            "[{}] Fusion {} order: order_hash={} tx={}",
+            self.network.name, status, data.order_hash, log.transaction_hash
         );
 
         Ok(())

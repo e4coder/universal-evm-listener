@@ -131,19 +131,20 @@ pub fn compute_hashlock_from_secret(secret: &str) -> Option<String> {
 }
 
 // ============================================================================
-// 1inch Fusion (Single-Chain) Event Decoding
+// 1inch Fusion (Single-Chain) Event Decoding - Aggregation Router V6
 // ============================================================================
 
-/// Decode OrderFilled event
+/// Decode OrderFilled event from Aggregation Router V6
 ///
-/// Event: OrderFilled(address indexed maker, bytes32 orderHash, uint256 remaining)
-/// topic[0]: event signature
-/// topic[1]: maker address (indexed, padded to 32 bytes)
+/// Event: OrderFilled(bytes32 orderHash, uint256 remainingAmount)
+/// topic[0]: event signature (0xfec331350fce78ba658e082a71da20ac9f8d798a99b3c79681c8440cbfe77e07)
 /// data:
 ///   Word 0: orderHash (bytes32)
-///   Word 1: remaining (uint256)
+///   Word 1: remainingAmount (uint256)
+///
+/// Note: Router V6 does NOT have an indexed maker address in the event
 pub fn decode_order_filled(topics: &[String], data: &str) -> Option<OrderFilledData> {
-    if topics.len() < 2 {
+    if topics.is_empty() {
         return None;
     }
 
@@ -154,16 +155,13 @@ pub fn decode_order_filled(topics: &[String], data: &str) -> Option<OrderFilledD
         return None;
     }
 
-    // maker is in topic[1], last 40 chars (20 bytes) of the 32-byte padded address
-    let maker_topic = topics[1].trim_start_matches("0x");
-    let maker = format!("0x{}", &maker_topic[24..].to_lowercase());
-
     let get_word = |idx: usize| -> &str {
         &hex[idx * 64..(idx + 1) * 64]
     };
 
     Some(OrderFilledData {
-        maker,
+        // Router V6 doesn't emit maker in the event, we'll extract from tx later if needed
+        maker: String::new(),
         order_hash: format!("0x{}", get_word(0).to_lowercase()),
         remaining: format!("0x{}", get_word(1).to_lowercase()),
     })
@@ -216,10 +214,10 @@ mod tests {
 
     #[test]
     fn test_decode_order_filled() {
-        // Simulated OrderFilled event
+        // Simulated OrderFilled event from Aggregation Router V6
+        // OrderFilled(bytes32 orderHash, uint256 remainingAmount)
         let topics = vec![
-            "0xb9ed0243fdf00f0545c63a0af8850c090d86bb46682baec4bf3c496814fe4f02".to_string(),
-            "0x000000000000000000000000335dc7abe02d1e1a51043d553349ea3b8e5f24c5".to_string(),
+            "0xfec331350fce78ba658e082a71da20ac9f8d798a99b3c79681c8440cbfe77e07".to_string(),
         ];
         let data = "0x169c0db441eaf375fc6dd71f7f81d684ddbe8c751c68dd87dddf5032aaafafa90000000000000000000000000000000000000000000000000000000000000000";
 
@@ -227,7 +225,7 @@ mod tests {
         assert!(result.is_some());
 
         let parsed = result.unwrap();
-        assert_eq!(parsed.maker, "0x335dc7abe02d1e1a51043d553349ea3b8e5f24c5");
+        assert_eq!(parsed.maker, ""); // Router V6 doesn't emit maker
         assert_eq!(parsed.order_hash, "0x169c0db441eaf375fc6dd71f7f81d684ddbe8c751c68dd87dddf5032aaafafa9");
         assert_eq!(parsed.remaining, "0x0000000000000000000000000000000000000000000000000000000000000000");
     }

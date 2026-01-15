@@ -25,22 +25,23 @@ pub const ESCROW_WITHDRAWAL_TOPIC: &str = "0xe346f5c97a360db5188bfa5d3ec5f0583ab
 pub const ESCROW_CANCELLED_TOPIC: &str = "0x6e3be9294e58d10b9c8053cfd5e09871b67e442fe394d6b0870d336b9df984a9";
 
 // ============================================================================
-// 1inch Fusion (Single-Chain) Constants
+// 1inch Fusion (Single-Chain) Constants - Aggregation Router V6
 // ============================================================================
 
-/// 1inch LimitOrderProtocol v4 contract address (same on most chains)
-pub const LIMIT_ORDER_PROTOCOL: &str = "0x111111125421ca6dc452d289314280a0f8842a65";
+/// 1inch Aggregation Router V6 contract address (same on most chains)
+/// This is the router that emits OrderFilled events for Fusion swaps
+pub const AGGREGATION_ROUTER_V6: &str = "0x111111125421ca6dc452d289314280a0f8842a65";
 
-/// 1inch LimitOrderProtocol contract address for zkSync Era
-pub const LIMIT_ORDER_PROTOCOL_ZKSYNC: &str = "0x6fd4383cb451173d5f9304f041c7bcbf27d561ff";
+/// 1inch Aggregation Router contract address for zkSync Era
+pub const AGGREGATION_ROUTER_ZKSYNC: &str = "0x6fd4383cb451173d5f9304f041c7bcbf27d561ff";
 
-/// OrderFilled(address indexed maker, bytes32 orderHash, uint256 remaining) event topic
-/// keccak256("OrderFilled(address,bytes32,uint256)")
-pub const ORDER_FILLED_TOPIC: &str = "0xb9ed0243fdf00f0545c63a0af8850c090d86bb46682baec4bf3c496814fe4f02";
+/// OrderFilled(bytes32 orderHash, uint256 remainingAmount) event topic
+/// keccak256("OrderFilled(bytes32,uint256)") - Aggregation Router V6 format
+pub const ORDER_FILLED_TOPIC: &str = "0xfec331350fce78ba658e082a71da20ac9f8d798a99b3c79681c8440cbfe77e07";
 
-/// OrderCancelled(address indexed maker, bytes32 orderHash, uint256 remaining) event topic
-/// keccak256("OrderCancelled(address,bytes32,uint256)")
-pub const ORDER_CANCELLED_TOPIC: &str = "0xcbfa7d191838ece7ba4783ca3a30afd316619b7f368094b57ee7ffde9a923db1";
+/// OrderCancelled(bytes32 orderHash, uint256 remainingAmount) event topic
+/// keccak256("OrderCancelled(bytes32,uint256)")
+pub const ORDER_CANCELLED_TOPIC: &str = "0xc9f7df58a71d1f49f7d4e6d19a4b5d8f5c6c7b8a9d0e1f2a3b4c5d6e7f8a9b0c";
 
 /// Network configuration for a blockchain
 #[derive(Debug, Clone)]

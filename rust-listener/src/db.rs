@@ -436,6 +436,39 @@ impl Database {
         Ok(transfers)
     }
 
+    /// Get transfers by transaction hash (for enriching Fusion swap data)
+    pub fn get_transfers_by_tx_hash(
+        &self,
+        chain_id: u32,
+        tx_hash: &str,
+    ) -> Result<Vec<Transfer>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp
+             FROM transfers
+             WHERE chain_id = ?1 AND tx_hash = ?2
+             ORDER BY log_index ASC"
+        )?;
+
+        let transfers = stmt
+            .query_map(params![chain_id, tx_hash.to_lowercase()], |row| {
+                Ok(Transfer {
+                    chain_id: row.get(0)?,
+                    tx_hash: row.get(1)?,
+                    log_index: row.get(2)?,
+                    token: row.get(3)?,
+                    from_addr: row.get(4)?,
+                    to_addr: row.get(5)?,
+                    value: row.get(6)?,
+                    block_number: row.get(7)?,
+                    block_timestamp: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(transfers)
+    }
+
     // =========================================================================
     // Fusion+ Methods
     // =========================================================================

@@ -569,6 +569,10 @@ impl ChainPoller {
         let remaining_hex = data.remaining.trim_start_matches("0x");
         let is_partial = !remaining_hex.chars().all(|c| c == '0');
 
+        // Try to enrich swap data from transfers in the same transaction
+        let (maker, maker_token, taker_token, maker_amount, taker_amount) =
+            self.extract_swap_details_from_transfers(&log.transaction_hash);
+
         let swap = FusionSwap {
             order_hash: data.order_hash.clone(),
             chain_id: self.network.chain_id,
@@ -576,11 +580,11 @@ impl ChainPoller {
             block_number: log.block_number_u64(),
             block_timestamp: timestamp,
             log_index: log.log_index_u32(),
-            maker: data.maker.clone(),
-            maker_token: None, // Could be enriched from transfers
-            taker_token: None,
-            maker_amount: None,
-            taker_amount: None,
+            maker,
+            maker_token,
+            taker_token,
+            maker_amount,
+            taker_amount,
             remaining: data.remaining.clone(),
             is_partial_fill: is_partial,
             status: status.to_string(),
@@ -597,11 +601,84 @@ impl ChainPoller {
             .map_err(|e| format!("DB error: {}", e))?;
 
         info!(
-            "[{}] Fusion {} order: order_hash={} tx={}",
-            self.network.name, status, data.order_hash, log.transaction_hash
+            "[{}] Fusion {} order: order_hash={} maker={} tx={}",
+            self.network.name, status, data.order_hash, swap.maker, log.transaction_hash
         );
 
         Ok(())
+    }
+
+    /// Extract swap details (maker, tokens, amounts) from transfers in the same transaction
+    ///
+    /// Logic: Find an address that both sent and received tokens in the same tx.
+    /// That address is the maker (user). The token they sent is maker_token,
+    /// the token they received is taker_token.
+    fn extract_swap_details_from_transfers(
+        &self,
+        tx_hash: &str,
+    ) -> (String, Option<String>, Option<String>, Option<String>, Option<String>) {
+        // Get all transfers in this transaction
+        let transfers = match self.db.get_transfers_by_tx_hash(self.network.chain_id, tx_hash) {
+            Ok(t) => t,
+            Err(_) => return (String::new(), None, None, None, None),
+        };
+
+        if transfers.is_empty() {
+            return (String::new(), None, None, None, None);
+        }
+
+        // Build maps of who sent what and who received what
+        use std::collections::HashMap;
+        let mut sent_by: HashMap<String, Vec<(String, String)>> = HashMap::new(); // addr -> [(token, value)]
+        let mut received_by: HashMap<String, Vec<(String, String)>> = HashMap::new(); // addr -> [(token, value)]
+
+        for t in &transfers {
+            sent_by
+                .entry(t.from_addr.clone())
+                .or_default()
+                .push((t.token.clone(), t.value.clone()));
+            received_by
+                .entry(t.to_addr.clone())
+                .or_default()
+                .push((t.token.clone(), t.value.clone()));
+        }
+
+        // Find an address that both sent and received tokens (the maker/user)
+        // Exclude common router/aggregator addresses
+        let router_addresses: Vec<&str> = vec![
+            "0x111111125421ca6dc452d289314280a0f8842a65", // Aggregation Router V6
+            "0x1111111254eeb25477b68fb85ed929f73a960582", // Aggregation Router V5
+            "0x6fd4383cb451173d5f9304f041c7bcbf27d561ff", // zkSync Router
+        ];
+
+        for (addr, sent_tokens) in &sent_by {
+            // Skip router addresses
+            if router_addresses.contains(&addr.as_str()) {
+                continue;
+            }
+
+            if let Some(received_tokens) = received_by.get(addr) {
+                // This address both sent and received - likely the maker
+                // Get the first token sent and first token received
+                if let (Some((maker_token, maker_amount)), Some((taker_token, taker_amount))) =
+                    (sent_tokens.first(), received_tokens.first())
+                {
+                    // Make sure they're different tokens (actual swap, not just routing)
+                    if maker_token != taker_token {
+                        return (
+                            addr.clone(),
+                            Some(maker_token.clone()),
+                            Some(taker_token.clone()),
+                            Some(maker_amount.clone()),
+                            Some(taker_amount.clone()),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Fallback: if no clear maker found, return empty
+        (String::new(), None, None, None, None)
     }
 
     /// Get block timestamp with caching

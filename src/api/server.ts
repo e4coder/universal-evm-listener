@@ -192,6 +192,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
+    // GET /fusion/taker/:address - Get swaps by taker address (recipient of output tokens)
+    if (path.match(/^\/fusion\/taker\/0x[a-fA-F0-9]{40}$/)) {
+      const address = path.split('/')[3];
+      const swaps = cache.getFusionSwapsByTaker(address);
+      return sendResponse(res, 200, { success: true, data: swaps });
+    }
+
     // GET /fusion/chain/:chainId - Get swaps by chain
     if (path.match(/^\/fusion\/chain\/\d+$/)) {
       const chainId = parseInt(path.split('/')[3]);
@@ -280,6 +287,7 @@ function startServer(): void {
     console.log('\n  Fusion Swaps (Single-Chain):');
     console.log('  GET /fusion/swap/:orderHash');
     console.log('  GET /fusion/maker/:address');
+    console.log('  GET /fusion/taker/:address');
     console.log('  GET /fusion/chain/:chainId');
     console.log('  GET /fusion/filled');
     console.log('  GET /fusion/cancelled');

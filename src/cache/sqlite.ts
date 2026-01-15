@@ -57,6 +57,7 @@ interface FusionSwap {
   block_timestamp: number;
   log_index: number;
   maker: string;
+  taker?: string;  // Address that receives taker_token (may differ from maker)
   maker_token?: string;
   taker_token?: string;
   maker_amount?: string;
@@ -349,6 +350,21 @@ export class SQLiteCache {
         LIMIT ?
       `);
       return stmt.all(maker.toLowerCase(), limit) as FusionSwap[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get Fusion swaps by taker address (recipient of output tokens)
+  getFusionSwapsByTaker(taker: string, limit: number = 100): FusionSwap[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM fusion_swaps
+        WHERE taker = ?
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(taker.toLowerCase(), limit) as FusionSwap[];
     } catch {
       return [];
     }

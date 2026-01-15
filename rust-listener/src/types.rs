@@ -256,6 +256,7 @@ pub struct FusionSwap {
     pub block_timestamp: u64,
     pub log_index: u32,
     pub maker: String,
+    pub taker: Option<String>,        // Address that receives taker_token (may differ from maker)
     pub maker_token: Option<String>,
     pub taker_token: Option<String>,
     pub maker_amount: Option<String>,

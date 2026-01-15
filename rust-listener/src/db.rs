@@ -191,6 +191,7 @@ impl Database {
                 block_timestamp INTEGER NOT NULL,
                 log_index INTEGER NOT NULL,
                 maker TEXT NOT NULL,
+                taker TEXT,
                 maker_token TEXT,
                 taker_token TEXT,
                 maker_amount TEXT,
@@ -204,6 +205,9 @@ impl Database {
             [],
         )?;
 
+        // Add taker column if it doesn't exist (for existing databases)
+        let _ = conn.execute("ALTER TABLE fusion_swaps ADD COLUMN taker TEXT", []);
+
         // Create indexes for fusion_swaps
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fs_order_hash ON fusion_swaps(order_hash)",
@@ -215,6 +219,10 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fs_maker ON fusion_swaps(maker)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_taker ON fusion_swaps(taker)",
             [],
         )?;
         conn.execute(
@@ -892,9 +900,9 @@ impl Database {
         let result = conn.execute(
             "INSERT OR IGNORE INTO fusion_swaps (
                 order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
-                maker, maker_token, taker_token, maker_amount, taker_amount,
+                maker, taker, maker_token, taker_token, maker_amount, taker_amount,
                 remaining, is_partial_fill, status, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 swap.order_hash.to_lowercase(),
                 swap.chain_id,
@@ -903,6 +911,7 @@ impl Database {
                 swap.block_timestamp,
                 swap.log_index,
                 swap.maker.to_lowercase(),
+                swap.taker.as_ref().map(|s| s.to_lowercase()),
                 swap.maker_token.as_ref().map(|s| s.to_lowercase()),
                 swap.taker_token.as_ref().map(|s| s.to_lowercase()),
                 swap.maker_amount,
@@ -923,7 +932,7 @@ impl Database {
 
         let result = conn.query_row(
             "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
-                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    maker, taker, maker_token, taker_token, maker_amount, taker_amount,
                     remaining, is_partial_fill, status
              FROM fusion_swaps WHERE order_hash = ?1
              ORDER BY block_timestamp DESC LIMIT 1",
@@ -937,13 +946,14 @@ impl Database {
                     block_timestamp: row.get(4)?,
                     log_index: row.get(5)?,
                     maker: row.get(6)?,
-                    maker_token: row.get(7)?,
-                    taker_token: row.get(8)?,
-                    maker_amount: row.get(9)?,
-                    taker_amount: row.get(10)?,
-                    remaining: row.get(11)?,
-                    is_partial_fill: row.get::<_, i32>(12)? != 0,
-                    status: row.get(13)?,
+                    taker: row.get(7)?,
+                    maker_token: row.get(8)?,
+                    taker_token: row.get(9)?,
+                    maker_amount: row.get(10)?,
+                    taker_amount: row.get(11)?,
+                    remaining: row.get(12)?,
+                    is_partial_fill: row.get::<_, i32>(13)? != 0,
+                    status: row.get(14)?,
                 })
             },
         );
@@ -960,7 +970,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
-                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    maker, taker, maker_token, taker_token, maker_amount, taker_amount,
                     remaining, is_partial_fill, status
              FROM fusion_swaps WHERE maker = ?1
              ORDER BY block_timestamp DESC LIMIT ?2"
@@ -976,13 +986,14 @@ impl Database {
                     block_timestamp: row.get(4)?,
                     log_index: row.get(5)?,
                     maker: row.get(6)?,
-                    maker_token: row.get(7)?,
-                    taker_token: row.get(8)?,
-                    maker_amount: row.get(9)?,
-                    taker_amount: row.get(10)?,
-                    remaining: row.get(11)?,
-                    is_partial_fill: row.get::<_, i32>(12)? != 0,
-                    status: row.get(13)?,
+                    taker: row.get(7)?,
+                    maker_token: row.get(8)?,
+                    taker_token: row.get(9)?,
+                    maker_amount: row.get(10)?,
+                    taker_amount: row.get(11)?,
+                    remaining: row.get(12)?,
+                    is_partial_fill: row.get::<_, i32>(13)? != 0,
+                    status: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -995,7 +1006,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
-                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    maker, taker, maker_token, taker_token, maker_amount, taker_amount,
                     remaining, is_partial_fill, status
              FROM fusion_swaps WHERE chain_id = ?1
              ORDER BY block_timestamp DESC LIMIT ?2"
@@ -1011,13 +1022,14 @@ impl Database {
                     block_timestamp: row.get(4)?,
                     log_index: row.get(5)?,
                     maker: row.get(6)?,
-                    maker_token: row.get(7)?,
-                    taker_token: row.get(8)?,
-                    maker_amount: row.get(9)?,
-                    taker_amount: row.get(10)?,
-                    remaining: row.get(11)?,
-                    is_partial_fill: row.get::<_, i32>(12)? != 0,
-                    status: row.get(13)?,
+                    taker: row.get(7)?,
+                    maker_token: row.get(8)?,
+                    taker_token: row.get(9)?,
+                    maker_amount: row.get(10)?,
+                    taker_amount: row.get(11)?,
+                    remaining: row.get(12)?,
+                    is_partial_fill: row.get::<_, i32>(13)? != 0,
+                    status: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1030,7 +1042,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
-                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    maker, taker, maker_token, taker_token, maker_amount, taker_amount,
                     remaining, is_partial_fill, status
              FROM fusion_swaps WHERE status = ?1
              ORDER BY block_timestamp DESC LIMIT ?2"
@@ -1046,13 +1058,14 @@ impl Database {
                     block_timestamp: row.get(4)?,
                     log_index: row.get(5)?,
                     maker: row.get(6)?,
-                    maker_token: row.get(7)?,
-                    taker_token: row.get(8)?,
-                    maker_amount: row.get(9)?,
-                    taker_amount: row.get(10)?,
-                    remaining: row.get(11)?,
-                    is_partial_fill: row.get::<_, i32>(12)? != 0,
-                    status: row.get(13)?,
+                    taker: row.get(7)?,
+                    maker_token: row.get(8)?,
+                    taker_token: row.get(9)?,
+                    maker_amount: row.get(10)?,
+                    taker_amount: row.get(11)?,
+                    remaining: row.get(12)?,
+                    is_partial_fill: row.get::<_, i32>(13)? != 0,
+                    status: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1065,7 +1078,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
-                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    maker, taker, maker_token, taker_token, maker_amount, taker_amount,
                     remaining, is_partial_fill, status
              FROM fusion_swaps
              ORDER BY block_timestamp DESC LIMIT ?1"
@@ -1081,13 +1094,50 @@ impl Database {
                     block_timestamp: row.get(4)?,
                     log_index: row.get(5)?,
                     maker: row.get(6)?,
-                    maker_token: row.get(7)?,
-                    taker_token: row.get(8)?,
-                    maker_amount: row.get(9)?,
-                    taker_amount: row.get(10)?,
-                    remaining: row.get(11)?,
-                    is_partial_fill: row.get::<_, i32>(12)? != 0,
-                    status: row.get(13)?,
+                    taker: row.get(7)?,
+                    maker_token: row.get(8)?,
+                    taker_token: row.get(9)?,
+                    maker_amount: row.get(10)?,
+                    taker_amount: row.get(11)?,
+                    remaining: row.get(12)?,
+                    is_partial_fill: row.get::<_, i32>(13)? != 0,
+                    status: row.get(14)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(swaps)
+    }
+
+    /// Get Fusion swaps by taker address
+    pub fn get_fusion_swaps_by_taker(&self, taker: &str, limit: u32) -> Result<Vec<FusionSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                    maker, taker, maker_token, taker_token, maker_amount, taker_amount,
+                    remaining, is_partial_fill, status
+             FROM fusion_swaps WHERE taker = ?1
+             ORDER BY block_timestamp DESC LIMIT ?2"
+        )?;
+
+        let swaps = stmt
+            .query_map(params![taker.to_lowercase(), limit], |row| {
+                Ok(FusionSwap {
+                    order_hash: row.get(0)?,
+                    chain_id: row.get(1)?,
+                    tx_hash: row.get(2)?,
+                    block_number: row.get(3)?,
+                    block_timestamp: row.get(4)?,
+                    log_index: row.get(5)?,
+                    maker: row.get(6)?,
+                    taker: row.get(7)?,
+                    maker_token: row.get(8)?,
+                    taker_token: row.get(9)?,
+                    maker_amount: row.get(10)?,
+                    taker_amount: row.get(11)?,
+                    remaining: row.get(12)?,
+                    is_partial_fill: row.get::<_, i32>(13)? != 0,
+                    status: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

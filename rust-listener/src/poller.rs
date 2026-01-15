@@ -570,7 +570,7 @@ impl ChainPoller {
         let is_partial = !remaining_hex.chars().all(|c| c == '0');
 
         // Try to enrich swap data from transfers in the same transaction
-        let (maker, maker_token, taker_token, maker_amount, taker_amount) =
+        let (maker, taker, maker_token, taker_token, maker_amount, taker_amount) =
             self.extract_swap_details_from_transfers(&log.transaction_hash);
 
         let swap = FusionSwap {
@@ -581,6 +581,7 @@ impl ChainPoller {
             block_timestamp: timestamp,
             log_index: log.log_index_u32(),
             maker,
+            taker,
             maker_token,
             taker_token,
             maker_amount,
@@ -601,34 +602,35 @@ impl ChainPoller {
             .map_err(|e| format!("DB error: {}", e))?;
 
         info!(
-            "[{}] Fusion {} order: order_hash={} maker={} tx={}",
-            self.network.name, status, data.order_hash, swap.maker, log.transaction_hash
+            "[{}] Fusion {} order: order_hash={} maker={} taker={:?} tx={}",
+            self.network.name, status, data.order_hash, swap.maker, swap.taker, log.transaction_hash
         );
 
         Ok(())
     }
 
-    /// Extract swap details (maker, tokens, amounts) from transfers in the same transaction
+    /// Extract swap details (maker, taker, tokens, amounts) from transfers in the same transaction
     ///
-    /// Logic: Find an address that both sent and received tokens in the same tx.
-    /// That address is the maker (user). The token they sent is maker_token,
-    /// the token they received is taker_token.
+    /// Returns: (maker, taker, maker_token, taker_token, maker_amount, taker_amount)
+    ///
+    /// Logic:
+    /// - Strategy 1: Find address that both sent AND received different tokens (self-swap)
+    /// - Strategy 2: Find maker who sent but didn't receive (swap to different recipient)
     fn extract_swap_details_from_transfers(
         &self,
         tx_hash: &str,
-    ) -> (String, Option<String>, Option<String>, Option<String>, Option<String>) {
+    ) -> (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) {
         // Get all transfers in this transaction
         let transfers = match self.db.get_transfers_by_tx_hash(self.network.chain_id, tx_hash) {
             Ok(t) => t,
-            Err(_) => return (String::new(), None, None, None, None),
+            Err(_) => return (String::new(), None, None, None, None, None),
         };
 
         if transfers.is_empty() {
-            return (String::new(), None, None, None, None);
+            return (String::new(), None, None, None, None, None);
         }
 
         // Build maps of who sent what and who received what
-        use std::collections::HashMap;
         let mut sent_by: HashMap<String, Vec<(String, String)>> = HashMap::new(); // addr -> [(token, value)]
         let mut received_by: HashMap<String, Vec<(String, String)>> = HashMap::new(); // addr -> [(token, value)]
 
@@ -643,7 +645,6 @@ impl ChainPoller {
                 .push((t.token.clone(), t.value.clone()));
         }
 
-        // Find an address that both sent and received tokens (the maker/user)
         // Exclude common router/aggregator addresses
         let router_addresses: Vec<&str> = vec![
             "0x111111125421ca6dc452d289314280a0f8842a65", // Aggregation Router V6
@@ -651,22 +652,21 @@ impl ChainPoller {
             "0x6fd4383cb451173d5f9304f041c7bcbf27d561ff", // zkSync Router
         ];
 
+        // Strategy 1: Find address that both sent and received different tokens (self-swap)
         for (addr, sent_tokens) in &sent_by {
-            // Skip router addresses
             if router_addresses.contains(&addr.as_str()) {
                 continue;
             }
 
             if let Some(received_tokens) = received_by.get(addr) {
-                // This address both sent and received - likely the maker
-                // Get the first token sent and first token received
                 if let (Some((maker_token, maker_amount)), Some((taker_token, taker_amount))) =
                     (sent_tokens.first(), received_tokens.first())
                 {
-                    // Make sure they're different tokens (actual swap, not just routing)
                     if maker_token != taker_token {
+                        // maker == taker (same address sent and received)
                         return (
                             addr.clone(),
+                            Some(addr.clone()), // taker = maker
                             Some(maker_token.clone()),
                             Some(taker_token.clone()),
                             Some(maker_amount.clone()),
@@ -677,8 +677,44 @@ impl ChainPoller {
             }
         }
 
+        // Strategy 2: Find maker who sent but didn't receive (swap to different recipient)
+        for (addr, sent_tokens) in &sent_by {
+            if router_addresses.contains(&addr.as_str()) {
+                continue;
+            }
+
+            // This address sent tokens but didn't receive any token back
+            let has_received = received_by.get(addr).map(|v| !v.is_empty()).unwrap_or(false);
+            if !has_received {
+                if let Some((maker_token, maker_amount)) = sent_tokens.first() {
+                    // Find who received a different token (the taker)
+                    for (recv_addr, recv_tokens) in &received_by {
+                        if router_addresses.contains(&recv_addr.as_str()) {
+                            continue;
+                        }
+                        if recv_addr == addr {
+                            continue;
+                        }
+
+                        if let Some((taker_token, taker_amount)) = recv_tokens.first() {
+                            if maker_token != taker_token {
+                                return (
+                                    addr.clone(),             // maker
+                                    Some(recv_addr.clone()),  // taker (different address)
+                                    Some(maker_token.clone()),
+                                    Some(taker_token.clone()),
+                                    Some(maker_amount.clone()),
+                                    Some(taker_amount.clone()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Fallback: if no clear maker found, return empty
-        (String::new(), None, None, None, None)
+        (String::new(), None, None, None, None, None)
     }
 
     /// Get block timestamp with caching

@@ -613,14 +613,15 @@ impl ChainPoller {
     ///
     /// Returns: (maker, taker, maker_token, taker_token, maker_amount, taker_amount)
     ///
-    /// Logic:
-    /// - Strategy 1: Find address that both sent AND received different tokens (self-swap)
-    /// - Strategy 2: Find maker who sent but didn't receive (swap to different recipient)
+    /// Logic based on 1inch Fusion swap mechanics:
+    /// - First ERC20 transfer in the tx = maker sends input token (maker_token)
+    /// - Last ERC20 transfer in the tx = taker receives output token (taker_token)
+    /// - Transfers are ordered by log_index ASC from the database
     fn extract_swap_details_from_transfers(
         &self,
         tx_hash: &str,
     ) -> (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) {
-        // Get all transfers in this transaction
+        // Get all transfers in this transaction (ordered by log_index ASC)
         let transfers = match self.db.get_transfers_by_tx_hash(self.network.chain_id, tx_hash) {
             Ok(t) => t,
             Err(_) => return (String::new(), None, None, None, None, None),
@@ -630,91 +631,26 @@ impl ChainPoller {
             return (String::new(), None, None, None, None, None);
         }
 
-        // Build maps of who sent what and who received what
-        let mut sent_by: HashMap<String, Vec<(String, String)>> = HashMap::new(); // addr -> [(token, value)]
-        let mut received_by: HashMap<String, Vec<(String, String)>> = HashMap::new(); // addr -> [(token, value)]
+        // First transfer = maker sends input token
+        let first = &transfers[0];
+        let maker = first.from_addr.clone();
+        let maker_token = first.token.clone();
+        let maker_amount = first.value.clone();
 
-        for t in &transfers {
-            sent_by
-                .entry(t.from_addr.clone())
-                .or_default()
-                .push((t.token.clone(), t.value.clone()));
-            received_by
-                .entry(t.to_addr.clone())
-                .or_default()
-                .push((t.token.clone(), t.value.clone()));
-        }
+        // Last transfer = taker receives output token
+        let last = &transfers[transfers.len() - 1];
+        let taker = last.to_addr.clone();
+        let taker_token = last.token.clone();
+        let taker_amount = last.value.clone();
 
-        // Exclude common router/aggregator addresses
-        let router_addresses: Vec<&str> = vec![
-            "0x111111125421ca6dc452d289314280a0f8842a65", // Aggregation Router V6
-            "0x1111111254eeb25477b68fb85ed929f73a960582", // Aggregation Router V5
-            "0x6fd4383cb451173d5f9304f041c7bcbf27d561ff", // zkSync Router
-        ];
-
-        // Strategy 1: Find address that both sent and received different tokens (self-swap)
-        for (addr, sent_tokens) in &sent_by {
-            if router_addresses.contains(&addr.as_str()) {
-                continue;
-            }
-
-            if let Some(received_tokens) = received_by.get(addr) {
-                if let (Some((maker_token, maker_amount)), Some((taker_token, taker_amount))) =
-                    (sent_tokens.first(), received_tokens.first())
-                {
-                    if maker_token != taker_token {
-                        // maker == taker (same address sent and received)
-                        return (
-                            addr.clone(),
-                            Some(addr.clone()), // taker = maker
-                            Some(maker_token.clone()),
-                            Some(taker_token.clone()),
-                            Some(maker_amount.clone()),
-                            Some(taker_amount.clone()),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Strategy 2: Find maker who sent but didn't receive (swap to different recipient)
-        for (addr, sent_tokens) in &sent_by {
-            if router_addresses.contains(&addr.as_str()) {
-                continue;
-            }
-
-            // This address sent tokens but didn't receive any token back
-            let has_received = received_by.get(addr).map(|v| !v.is_empty()).unwrap_or(false);
-            if !has_received {
-                if let Some((maker_token, maker_amount)) = sent_tokens.first() {
-                    // Find who received a different token (the taker)
-                    for (recv_addr, recv_tokens) in &received_by {
-                        if router_addresses.contains(&recv_addr.as_str()) {
-                            continue;
-                        }
-                        if recv_addr == addr {
-                            continue;
-                        }
-
-                        if let Some((taker_token, taker_amount)) = recv_tokens.first() {
-                            if maker_token != taker_token {
-                                return (
-                                    addr.clone(),             // maker
-                                    Some(recv_addr.clone()),  // taker (different address)
-                                    Some(maker_token.clone()),
-                                    Some(taker_token.clone()),
-                                    Some(maker_amount.clone()),
-                                    Some(taker_amount.clone()),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fallback: if no clear maker found, return empty
-        (String::new(), None, None, None, None, None)
+        (
+            maker,
+            Some(taker),
+            Some(maker_token),
+            Some(taker_token),
+            Some(maker_amount),
+            Some(taker_amount),
+        )
     }
 
     /// Get block timestamp with caching

@@ -24,6 +24,24 @@ pub const ESCROW_WITHDRAWAL_TOPIC: &str = "0xe346f5c97a360db5188bfa5d3ec5f0583ab
 /// keccak256("EscrowCancelled()") = 0x6e3be9294e58d10b9c8053cfd5e09871b67e442fe394d6b0870d336b9df984a9
 pub const ESCROW_CANCELLED_TOPIC: &str = "0x6e3be9294e58d10b9c8053cfd5e09871b67e442fe394d6b0870d336b9df984a9";
 
+// ============================================================================
+// 1inch Fusion (Single-Chain) Constants
+// ============================================================================
+
+/// 1inch LimitOrderProtocol v4 contract address (same on most chains)
+pub const LIMIT_ORDER_PROTOCOL: &str = "0x111111125421ca6dc452d289314280a0f8842a65";
+
+/// 1inch LimitOrderProtocol contract address for zkSync Era
+pub const LIMIT_ORDER_PROTOCOL_ZKSYNC: &str = "0x6fd4383cb451173d5f9304f041c7bcbf27d561ff";
+
+/// OrderFilled(address indexed maker, bytes32 orderHash, uint256 remaining) event topic
+/// keccak256("OrderFilled(address,bytes32,uint256)")
+pub const ORDER_FILLED_TOPIC: &str = "0xb9ed0243fdf00f0545c63a0af8850c090d86bb46682baec4bf3c496814fe4f02";
+
+/// OrderCancelled(address indexed maker, bytes32 orderHash, uint256 remaining) event topic
+/// keccak256("OrderCancelled(address,bytes32,uint256)")
+pub const ORDER_CANCELLED_TOPIC: &str = "0xcbfa7d191838ece7ba4783ca3a30afd316619b7f368094b57ee7ffde9a923db1";
+
 /// Network configuration for a blockchain
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -213,4 +231,35 @@ impl FusionPlusSwap {
             dst_status: "pending".to_string(),
         }
     }
+}
+
+// ============================================================================
+// 1inch Fusion (Single-Chain) Data Structures
+// ============================================================================
+
+/// Data decoded from OrderFilled/OrderCancelled events
+#[derive(Debug, Clone)]
+pub struct OrderFilledData {
+    pub maker: String,
+    pub order_hash: String,
+    pub remaining: String,
+}
+
+/// Fusion swap record stored in database (single-chain)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionSwap {
+    pub order_hash: String,
+    pub chain_id: u32,
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub maker: String,
+    pub maker_token: Option<String>,
+    pub taker_token: Option<String>,
+    pub maker_amount: Option<String>,
+    pub taker_amount: Option<String>,
+    pub remaining: String,
+    pub is_partial_fill: bool,
+    pub status: String,
 }

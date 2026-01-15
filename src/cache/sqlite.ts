@@ -48,6 +48,25 @@ interface FusionPlusSwap {
   updated_at: number;
 }
 
+interface FusionSwap {
+  id: number;
+  order_hash: string;
+  chain_id: number;
+  tx_hash: string;
+  block_number: number;
+  block_timestamp: number;
+  log_index: number;
+  maker: string;
+  maker_token?: string;
+  taker_token?: string;
+  maker_amount?: string;
+  taker_amount?: string;
+  remaining: string;
+  is_partial_fill: number;
+  status: string;
+  created_at: number;
+}
+
 /**
  * SQLite cache client for the Node.js API
  * Reads from the SQLite database populated by the Rust listener
@@ -129,15 +148,24 @@ export class SQLiteCache {
 
   // Get stats
 
-  getStats(): { transferCount: number; fusionPlusCount: number } {
+  getStats(): { transferCount: number; fusionPlusCount: number; fusionCount: number } {
     const transferStmt = this.db.prepare('SELECT COUNT(*) as count FROM transfers');
     const transferResult = transferStmt.get() as { count: number };
 
     let fusionPlusCount = 0;
     try {
-      const fusionStmt = this.db.prepare('SELECT COUNT(*) as count FROM fusion_plus_swaps');
+      const fusionPlusStmt = this.db.prepare('SELECT COUNT(*) as count FROM fusion_plus_swaps');
+      const fusionPlusResult = fusionPlusStmt.get() as { count: number };
+      fusionPlusCount = fusionPlusResult.count;
+    } catch {
+      // Table might not exist yet
+    }
+
+    let fusionCount = 0;
+    try {
+      const fusionStmt = this.db.prepare('SELECT COUNT(*) as count FROM fusion_swaps');
       const fusionResult = fusionStmt.get() as { count: number };
-      fusionPlusCount = fusionResult.count;
+      fusionCount = fusionResult.count;
     } catch {
       // Table might not exist yet
     }
@@ -145,6 +173,7 @@ export class SQLiteCache {
     return {
       transferCount: transferResult.count,
       fusionPlusCount,
+      fusionCount,
     };
   }
 
@@ -287,6 +316,97 @@ export class SQLiteCache {
              block_timestamp as timestamp, swap_type as swapType
       FROM transfers
       WHERE chain_id = ? AND swap_type = 'fusion_plus' AND (from_addr = ? OR to_addr = ?)
+      ORDER BY block_timestamp DESC
+      LIMIT ?
+    `);
+    return stmt.all(chainId, addr, addr, limit);
+  }
+
+  // =========================================================================
+  // Fusion (Single-Chain) Query Methods
+  // =========================================================================
+
+  // Get Fusion swap by order_hash
+  getFusionSwap(orderHash: string): FusionSwap | null {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM fusion_swaps WHERE order_hash = ?
+        ORDER BY block_timestamp DESC LIMIT 1
+      `);
+      return (stmt.get(orderHash.toLowerCase()) as FusionSwap) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Get Fusion swaps by maker address
+  getFusionSwapsByMaker(maker: string, limit: number = 100): FusionSwap[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM fusion_swaps
+        WHERE maker = ?
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(maker.toLowerCase(), limit) as FusionSwap[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get Fusion swaps by chain
+  getFusionSwapsByChain(chainId: number, limit: number = 100): FusionSwap[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM fusion_swaps
+        WHERE chain_id = ?
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(chainId, limit) as FusionSwap[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get Fusion swaps by status
+  getFusionSwapsByStatus(status: string, limit: number = 100): FusionSwap[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM fusion_swaps
+        WHERE status = ?
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(status, limit) as FusionSwap[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get recent Fusion swaps
+  getRecentFusionSwaps(limit: number = 100): FusionSwap[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM fusion_swaps
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(limit) as FusionSwap[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get Fusion labeled transfers for an address
+  getFusionTransfersByAddress(chainId: number, address: string, limit: number = 1000): any[] {
+    const addr = address.toLowerCase();
+    const stmt = this.db.prepare(`
+      SELECT chain_id as chainId, tx_hash as txHash, token, from_addr as "from",
+             to_addr as "to", value, block_number as blockNumber,
+             block_timestamp as timestamp, swap_type as swapType
+      FROM transfers
+      WHERE chain_id = ? AND swap_type = 'fusion' AND (from_addr = ? OR to_addr = ?)
       ORDER BY block_timestamp DESC
       LIMIT ?
     `);

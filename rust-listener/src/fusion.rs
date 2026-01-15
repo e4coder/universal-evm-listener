@@ -1,4 +1,4 @@
-use crate::types::{DstEscrowCreatedData, SrcEscrowCreatedData};
+use crate::types::{DstEscrowCreatedData, OrderFilledData, SrcEscrowCreatedData};
 use sha3::{Digest, Keccak256};
 
 /// Decode SrcEscrowCreated event data
@@ -130,6 +130,50 @@ pub fn compute_hashlock_from_secret(secret: &str) -> Option<String> {
     Some(format!("0x{}", hex::encode(result)))
 }
 
+// ============================================================================
+// 1inch Fusion (Single-Chain) Event Decoding
+// ============================================================================
+
+/// Decode OrderFilled event
+///
+/// Event: OrderFilled(address indexed maker, bytes32 orderHash, uint256 remaining)
+/// topic[0]: event signature
+/// topic[1]: maker address (indexed, padded to 32 bytes)
+/// data:
+///   Word 0: orderHash (bytes32)
+///   Word 1: remaining (uint256)
+pub fn decode_order_filled(topics: &[String], data: &str) -> Option<OrderFilledData> {
+    if topics.len() < 2 {
+        return None;
+    }
+
+    let hex = data.strip_prefix("0x").unwrap_or(data);
+
+    // Need at least 2 words (2 * 64 hex chars)
+    if hex.len() < 128 {
+        return None;
+    }
+
+    // maker is in topic[1], last 40 chars (20 bytes) of the 32-byte padded address
+    let maker_topic = topics[1].trim_start_matches("0x");
+    let maker = format!("0x{}", &maker_topic[24..].to_lowercase());
+
+    let get_word = |idx: usize| -> &str {
+        &hex[idx * 64..(idx + 1) * 64]
+    };
+
+    Some(OrderFilledData {
+        maker,
+        order_hash: format!("0x{}", get_word(0).to_lowercase()),
+        remaining: format!("0x{}", get_word(1).to_lowercase()),
+    })
+}
+
+/// Decode OrderCancelled event (same format as OrderFilled)
+pub fn decode_order_cancelled(topics: &[String], data: &str) -> Option<OrderFilledData> {
+    decode_order_filled(topics, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +212,23 @@ mod tests {
         let result = hashlock.unwrap();
         assert!(result.starts_with("0x"));
         assert_eq!(result.len(), 66); // 0x + 64 hex chars
+    }
+
+    #[test]
+    fn test_decode_order_filled() {
+        // Simulated OrderFilled event
+        let topics = vec![
+            "0xb9ed0243fdf00f0545c63a0af8850c090d86bb46682baec4bf3c496814fe4f02".to_string(),
+            "0x000000000000000000000000335dc7abe02d1e1a51043d553349ea3b8e5f24c5".to_string(),
+        ];
+        let data = "0x169c0db441eaf375fc6dd71f7f81d684ddbe8c751c68dd87dddf5032aaafafa90000000000000000000000000000000000000000000000000000000000000000";
+
+        let result = decode_order_filled(&topics, data);
+        assert!(result.is_some());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.maker, "0x335dc7abe02d1e1a51043d553349ea3b8e5f24c5");
+        assert_eq!(parsed.order_hash, "0x169c0db441eaf375fc6dd71f7f81d684ddbe8c751c68dd87dddf5032aaafafa9");
+        assert_eq!(parsed.remaining, "0x0000000000000000000000000000000000000000000000000000000000000000");
     }
 }

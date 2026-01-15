@@ -1,4 +1,4 @@
-use crate::types::{DstEscrowCreatedData, FusionPlusSwap, Transfer};
+use crate::types::{DstEscrowCreatedData, FusionPlusSwap, FusionSwap, Transfer};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -177,6 +177,52 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fp_created ON fusion_plus_swaps(created_at)",
+            [],
+        )?;
+
+        // Create fusion_swaps table for 1inch Fusion single-chain swaps
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fusion_swaps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_hash TEXT NOT NULL,
+                chain_id INTEGER NOT NULL,
+                tx_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                block_timestamp INTEGER NOT NULL,
+                log_index INTEGER NOT NULL,
+                maker TEXT NOT NULL,
+                maker_token TEXT,
+                taker_token TEXT,
+                maker_amount TEXT,
+                taker_amount TEXT,
+                remaining TEXT NOT NULL,
+                is_partial_fill INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'filled',
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                UNIQUE(chain_id, tx_hash, log_index)
+            )",
+            [],
+        )?;
+
+        // Create indexes for fusion_swaps
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_order_hash ON fusion_swaps(order_hash)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_chain ON fusion_swaps(chain_id, block_timestamp DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_maker ON fusion_swaps(maker)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_status ON fusion_swaps(status)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_created ON fusion_swaps(created_at)",
             [],
         )?;
 
@@ -792,6 +838,252 @@ impl Database {
 
         let deleted = conn.execute(
             "DELETE FROM fusion_plus_swaps WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+
+        Ok(deleted)
+    }
+
+    // =========================================================================
+    // Fusion (Single-Chain) Methods
+    // =========================================================================
+
+    /// Insert a new Fusion swap (from OrderFilled or OrderCancelled event)
+    pub fn insert_fusion_swap(&self, swap: &FusionSwap) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO fusion_swaps (
+                order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                maker, maker_token, taker_token, maker_amount, taker_amount,
+                remaining, is_partial_fill, status, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                swap.order_hash.to_lowercase(),
+                swap.chain_id,
+                swap.tx_hash.to_lowercase(),
+                swap.block_number,
+                swap.block_timestamp,
+                swap.log_index,
+                swap.maker.to_lowercase(),
+                swap.maker_token.as_ref().map(|s| s.to_lowercase()),
+                swap.taker_token.as_ref().map(|s| s.to_lowercase()),
+                swap.maker_amount,
+                swap.taker_amount,
+                swap.remaining,
+                swap.is_partial_fill as i32,
+                swap.status,
+                now
+            ],
+        )?;
+
+        Ok(result > 0)
+    }
+
+    /// Get Fusion swap by order_hash
+    pub fn get_fusion_swap_by_order_hash(&self, order_hash: &str) -> Result<Option<FusionSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+
+        let result = conn.query_row(
+            "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    remaining, is_partial_fill, status
+             FROM fusion_swaps WHERE order_hash = ?1
+             ORDER BY block_timestamp DESC LIMIT 1",
+            params![order_hash.to_lowercase()],
+            |row| {
+                Ok(FusionSwap {
+                    order_hash: row.get(0)?,
+                    chain_id: row.get(1)?,
+                    tx_hash: row.get(2)?,
+                    block_number: row.get(3)?,
+                    block_timestamp: row.get(4)?,
+                    log_index: row.get(5)?,
+                    maker: row.get(6)?,
+                    maker_token: row.get(7)?,
+                    taker_token: row.get(8)?,
+                    maker_amount: row.get(9)?,
+                    taker_amount: row.get(10)?,
+                    remaining: row.get(11)?,
+                    is_partial_fill: row.get::<_, i32>(12)? != 0,
+                    status: row.get(13)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(swap) => Ok(Some(swap)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get Fusion swaps by maker address
+    pub fn get_fusion_swaps_by_maker(&self, maker: &str, limit: u32) -> Result<Vec<FusionSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    remaining, is_partial_fill, status
+             FROM fusion_swaps WHERE maker = ?1
+             ORDER BY block_timestamp DESC LIMIT ?2"
+        )?;
+
+        let swaps = stmt
+            .query_map(params![maker.to_lowercase(), limit], |row| {
+                Ok(FusionSwap {
+                    order_hash: row.get(0)?,
+                    chain_id: row.get(1)?,
+                    tx_hash: row.get(2)?,
+                    block_number: row.get(3)?,
+                    block_timestamp: row.get(4)?,
+                    log_index: row.get(5)?,
+                    maker: row.get(6)?,
+                    maker_token: row.get(7)?,
+                    taker_token: row.get(8)?,
+                    maker_amount: row.get(9)?,
+                    taker_amount: row.get(10)?,
+                    remaining: row.get(11)?,
+                    is_partial_fill: row.get::<_, i32>(12)? != 0,
+                    status: row.get(13)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(swaps)
+    }
+
+    /// Get Fusion swaps by chain
+    pub fn get_fusion_swaps_by_chain(&self, chain_id: u32, limit: u32) -> Result<Vec<FusionSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    remaining, is_partial_fill, status
+             FROM fusion_swaps WHERE chain_id = ?1
+             ORDER BY block_timestamp DESC LIMIT ?2"
+        )?;
+
+        let swaps = stmt
+            .query_map(params![chain_id, limit], |row| {
+                Ok(FusionSwap {
+                    order_hash: row.get(0)?,
+                    chain_id: row.get(1)?,
+                    tx_hash: row.get(2)?,
+                    block_number: row.get(3)?,
+                    block_timestamp: row.get(4)?,
+                    log_index: row.get(5)?,
+                    maker: row.get(6)?,
+                    maker_token: row.get(7)?,
+                    taker_token: row.get(8)?,
+                    maker_amount: row.get(9)?,
+                    taker_amount: row.get(10)?,
+                    remaining: row.get(11)?,
+                    is_partial_fill: row.get::<_, i32>(12)? != 0,
+                    status: row.get(13)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(swaps)
+    }
+
+    /// Get Fusion swaps by status
+    pub fn get_fusion_swaps_by_status(&self, status: &str, limit: u32) -> Result<Vec<FusionSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    remaining, is_partial_fill, status
+             FROM fusion_swaps WHERE status = ?1
+             ORDER BY block_timestamp DESC LIMIT ?2"
+        )?;
+
+        let swaps = stmt
+            .query_map(params![status, limit], |row| {
+                Ok(FusionSwap {
+                    order_hash: row.get(0)?,
+                    chain_id: row.get(1)?,
+                    tx_hash: row.get(2)?,
+                    block_number: row.get(3)?,
+                    block_timestamp: row.get(4)?,
+                    log_index: row.get(5)?,
+                    maker: row.get(6)?,
+                    maker_token: row.get(7)?,
+                    taker_token: row.get(8)?,
+                    maker_amount: row.get(9)?,
+                    taker_amount: row.get(10)?,
+                    remaining: row.get(11)?,
+                    is_partial_fill: row.get::<_, i32>(12)? != 0,
+                    status: row.get(13)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(swaps)
+    }
+
+    /// Get recent Fusion swaps
+    pub fn get_recent_fusion_swaps(&self, limit: u32) -> Result<Vec<FusionSwap>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                    maker, maker_token, taker_token, maker_amount, taker_amount,
+                    remaining, is_partial_fill, status
+             FROM fusion_swaps
+             ORDER BY block_timestamp DESC LIMIT ?1"
+        )?;
+
+        let swaps = stmt
+            .query_map(params![limit], |row| {
+                Ok(FusionSwap {
+                    order_hash: row.get(0)?,
+                    chain_id: row.get(1)?,
+                    tx_hash: row.get(2)?,
+                    block_number: row.get(3)?,
+                    block_timestamp: row.get(4)?,
+                    log_index: row.get(5)?,
+                    maker: row.get(6)?,
+                    maker_token: row.get(7)?,
+                    taker_token: row.get(8)?,
+                    maker_amount: row.get(9)?,
+                    taker_amount: row.get(10)?,
+                    remaining: row.get(11)?,
+                    is_partial_fill: row.get::<_, i32>(12)? != 0,
+                    status: row.get(13)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(swaps)
+    }
+
+    /// Get total count of Fusion swaps (for monitoring)
+    pub fn get_fusion_swap_count(&self) -> Result<u64, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM fusion_swaps",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Clean up old Fusion swaps based on TTL
+    pub fn cleanup_old_fusion_swaps(&self, ttl_secs: u64) -> Result<usize, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - ttl_secs;
+
+        let deleted = conn.execute(
+            "DELETE FROM fusion_swaps WHERE created_at < ?1",
             params![cutoff],
         )?;
 

@@ -1,10 +1,15 @@
 use crate::db::Database;
-use crate::fusion::{compute_hashlock_from_secret, decode_dst_escrow_created, decode_escrow_withdrawal, decode_src_escrow_created};
+use crate::fusion::{
+    compute_hashlock_from_secret, decode_dst_escrow_created, decode_escrow_withdrawal,
+    decode_order_filled, decode_src_escrow_created,
+};
 use crate::rpc::RpcClient;
 use crate::types::{
-    FusionPlusSwap, Log, NetworkConfig, Transfer,
+    FusionPlusSwap, FusionSwap, Log, NetworkConfig, Transfer,
     ESCROW_FACTORY, SRC_ESCROW_CREATED_TOPIC, DST_ESCROW_CREATED_TOPIC,
     ESCROW_WITHDRAWAL_TOPIC, ESCROW_CANCELLED_TOPIC,
+    LIMIT_ORDER_PROTOCOL, LIMIT_ORDER_PROTOCOL_ZKSYNC,
+    ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -249,7 +254,10 @@ impl ChainPoller {
         };
 
         // Fetch and process Fusion+ events from EscrowFactory
-        let fusion_events = self.poll_fusion_plus_events(from_block, actual_to_block).await?;
+        let fusion_plus_events = self.poll_fusion_plus_events(from_block, actual_to_block).await?;
+
+        // Fetch and process Fusion (single-chain) events from LimitOrderProtocol
+        let fusion_events = self.poll_fusion_events(from_block, actual_to_block).await?;
 
         // Update checkpoint
         *last_processed_block = actual_to_block;
@@ -257,7 +265,7 @@ impl ChainPoller {
             .set_checkpoint(self.network.chain_id, actual_to_block)
             .map_err(|e| format!("DB error: {}", e))?;
 
-        Ok(inserted + fusion_events)
+        Ok(inserted + fusion_plus_events + fusion_events)
     }
 
     /// Poll for Fusion+ events from EscrowFactory contract
@@ -482,6 +490,115 @@ impl ChainPoller {
         debug!(
             "[{}] Fusion+ escrow cancelled: {}",
             self.network.name, log.address
+        );
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Fusion (Single-Chain) Methods
+    // =========================================================================
+
+    /// Poll for Fusion events from LimitOrderProtocol
+    async fn poll_fusion_events(
+        &mut self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<usize, String> {
+        // Determine contract address based on chain
+        let protocol_address = if self.network.chain_id == 324 {
+            // zkSync Era
+            LIMIT_ORDER_PROTOCOL_ZKSYNC
+        } else {
+            LIMIT_ORDER_PROTOCOL
+        };
+
+        // Fetch OrderFilled and OrderCancelled events
+        let topics = vec![
+            ORDER_FILLED_TOPIC.to_string(),
+            ORDER_CANCELLED_TOPIC.to_string(),
+        ];
+
+        let logs = self
+            .rpc
+            .get_logs_multi_topics(from_block, to_block, protocol_address, topics)
+            .await
+            .unwrap_or_default();
+
+        let mut events_processed = 0;
+
+        for log in &logs {
+            if log.topics.is_empty() {
+                continue;
+            }
+
+            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
+            let topic0 = log.topics[0].to_lowercase();
+
+            if topic0 == ORDER_FILLED_TOPIC {
+                if let Err(e) = self.process_order_filled(log, timestamp, "filled").await {
+                    debug!("[{}] Failed to process OrderFilled: {}", self.network.name, e);
+                } else {
+                    events_processed += 1;
+                }
+            } else if topic0 == ORDER_CANCELLED_TOPIC {
+                if let Err(e) = self.process_order_filled(log, timestamp, "cancelled").await {
+                    debug!("[{}] Failed to process OrderCancelled: {}", self.network.name, e);
+                } else {
+                    events_processed += 1;
+                }
+            }
+        }
+
+        if events_processed > 0 {
+            info!(
+                "[{}] Processed {} Fusion events in blocks {}-{}",
+                self.network.name, events_processed, from_block, to_block
+            );
+        }
+
+        Ok(events_processed)
+    }
+
+    /// Process OrderFilled or OrderCancelled event
+    async fn process_order_filled(&self, log: &Log, timestamp: u64, status: &str) -> Result<(), String> {
+        let data = decode_order_filled(&log.topics, &log.data)
+            .ok_or_else(|| "Failed to decode OrderFilled data".to_string())?;
+
+        // Check if remaining > 0 (partial fill)
+        let remaining_hex = data.remaining.trim_start_matches("0x");
+        let is_partial = !remaining_hex.chars().all(|c| c == '0');
+
+        let swap = FusionSwap {
+            order_hash: data.order_hash.clone(),
+            chain_id: self.network.chain_id,
+            tx_hash: log.transaction_hash.clone(),
+            block_number: log.block_number_u64(),
+            block_timestamp: timestamp,
+            log_index: log.log_index_u32(),
+            maker: data.maker.clone(),
+            maker_token: None, // Could be enriched from transfers
+            taker_token: None,
+            maker_amount: None,
+            taker_amount: None,
+            remaining: data.remaining.clone(),
+            is_partial_fill: is_partial,
+            status: status.to_string(),
+        };
+
+        // Insert swap record
+        self.db
+            .insert_fusion_swap(&swap)
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        // Label all transfers in this tx as 'fusion'
+        self.db
+            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion")
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        info!(
+            "[{}] Fusion {} order: order_hash={} maker={}",
+            self.network.name, status, data.order_hash, data.maker
         );
 
         Ok(())

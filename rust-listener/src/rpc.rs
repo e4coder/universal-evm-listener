@@ -285,6 +285,29 @@ impl RpcClient {
         self.request("eth_getLogs", params).await
     }
 
+    /// Get logs by a single topic without address filter
+    ///
+    /// Used for fetching events from any address matching a specific topic (e.g., EIP-7702 delegate events)
+    pub async fn get_logs_by_topic_any_address(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        topic0: &str,
+    ) -> Result<Vec<Log>, RpcError> {
+        debug!(
+            "[{}] Getting logs for topic {} (any address) for blocks {} to {}",
+            self.chain_name, topic0, from_block, to_block
+        );
+
+        let params = json!([{
+            "fromBlock": format!("0x{:x}", from_block),
+            "toBlock": format!("0x{:x}", to_block),
+            "topics": [topic0]
+        }]);
+
+        self.request("eth_getLogs", params).await
+    }
+
     /// Get block by number (eth_getBlockByNumber)
     ///
     /// Returns block header without transactions (for getting timestamp)

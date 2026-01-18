@@ -1,4 +1,4 @@
-use crate::types::{DstEscrowCreatedData, FusionPlusSwap, FusionSwap, Transfer};
+use crate::types::{Crypto2FiatEvent, DstEscrowCreatedData, FusionPlusSwap, FusionSwap, Transfer};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -231,6 +231,48 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fs_created ON fusion_swaps(created_at)",
+            [],
+        )?;
+
+        // Create crypto2fiat_events table for KentuckyDelegate crypto-to-fiat offramps
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS crypto2fiat_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                token TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                metadata TEXT,
+                chain_id INTEGER NOT NULL,
+                tx_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                block_timestamp INTEGER NOT NULL,
+                log_index INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                UNIQUE(chain_id, tx_hash, log_index)
+            )",
+            [],
+        )?;
+
+        // Create indexes for crypto2fiat_events
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_c2f_order_id ON crypto2fiat_events(order_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_c2f_token ON crypto2fiat_events(token)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_c2f_recipient ON crypto2fiat_events(recipient)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_c2f_chain ON crypto2fiat_events(chain_id, block_timestamp DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_c2f_created ON crypto2fiat_events(created_at)",
             [],
         )?;
 
@@ -1167,6 +1209,166 @@ impl Database {
 
         let deleted = conn.execute(
             "DELETE FROM fusion_swaps WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+
+        Ok(deleted)
+    }
+
+    // =========================================================================
+    // Crypto2Fiat Methods
+    // =========================================================================
+
+    /// Insert a new Crypto2Fiat event
+    pub fn insert_crypto2fiat_event(&self, event: &Crypto2FiatEvent) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result = conn.execute(
+            "INSERT OR IGNORE INTO crypto2fiat_events (
+                order_id, token, amount, recipient, metadata,
+                chain_id, tx_hash, block_number, block_timestamp, log_index, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event.order_id.to_lowercase(),
+                event.token.to_lowercase(),
+                event.amount,
+                event.recipient.to_lowercase(),
+                event.metadata,
+                event.chain_id,
+                event.tx_hash.to_lowercase(),
+                event.block_number,
+                event.block_timestamp,
+                event.log_index,
+                now
+            ],
+        )?;
+
+        Ok(result > 0)
+    }
+
+    /// Get Crypto2Fiat event by order_id
+    pub fn get_crypto2fiat_by_order_id(&self, order_id: &str) -> Result<Option<Crypto2FiatEvent>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+
+        let result = conn.query_row(
+            "SELECT order_id, token, amount, recipient, metadata,
+                    chain_id, tx_hash, block_number, block_timestamp, log_index
+             FROM crypto2fiat_events WHERE order_id = ?1",
+            params![order_id.to_lowercase()],
+            |row| {
+                Ok(Crypto2FiatEvent {
+                    order_id: row.get(0)?,
+                    token: row.get(1)?,
+                    amount: row.get(2)?,
+                    recipient: row.get(3)?,
+                    metadata: row.get(4)?,
+                    chain_id: row.get(5)?,
+                    tx_hash: row.get(6)?,
+                    block_number: row.get(7)?,
+                    block_timestamp: row.get(8)?,
+                    log_index: row.get(9)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(event) => Ok(Some(event)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get Crypto2Fiat events by recipient address
+    pub fn get_crypto2fiat_by_recipient(&self, recipient: &str, limit: u32) -> Result<Vec<Crypto2FiatEvent>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT order_id, token, amount, recipient, metadata,
+                    chain_id, tx_hash, block_number, block_timestamp, log_index
+             FROM crypto2fiat_events WHERE recipient = ?1
+             ORDER BY block_timestamp DESC LIMIT ?2"
+        )?;
+
+        let events = stmt
+            .query_map(params![recipient.to_lowercase(), limit], |row| {
+                Ok(Crypto2FiatEvent {
+                    order_id: row.get(0)?,
+                    token: row.get(1)?,
+                    amount: row.get(2)?,
+                    recipient: row.get(3)?,
+                    metadata: row.get(4)?,
+                    chain_id: row.get(5)?,
+                    tx_hash: row.get(6)?,
+                    block_number: row.get(7)?,
+                    block_timestamp: row.get(8)?,
+                    log_index: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(events)
+    }
+
+    /// Get Crypto2Fiat events by chain
+    pub fn get_crypto2fiat_by_chain(&self, chain_id: u32, limit: u32) -> Result<Vec<Crypto2FiatEvent>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT order_id, token, amount, recipient, metadata,
+                    chain_id, tx_hash, block_number, block_timestamp, log_index
+             FROM crypto2fiat_events WHERE chain_id = ?1
+             ORDER BY block_timestamp DESC LIMIT ?2"
+        )?;
+
+        let events = stmt
+            .query_map(params![chain_id, limit], |row| {
+                Ok(Crypto2FiatEvent {
+                    order_id: row.get(0)?,
+                    token: row.get(1)?,
+                    amount: row.get(2)?,
+                    recipient: row.get(3)?,
+                    metadata: row.get(4)?,
+                    chain_id: row.get(5)?,
+                    tx_hash: row.get(6)?,
+                    block_number: row.get(7)?,
+                    block_timestamp: row.get(8)?,
+                    log_index: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(events)
+    }
+
+    /// Label transfers in a transaction as crypto_to_fiat
+    pub fn label_transfers_as_crypto2fiat(&self, chain_id: u32, tx_hash: &str) -> Result<usize, DbError> {
+        self.label_transfers_as_fusion(chain_id, tx_hash, "crypto_to_fiat")
+    }
+
+    /// Get total count of Crypto2Fiat events (for monitoring)
+    pub fn get_crypto2fiat_count(&self) -> Result<u64, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM crypto2fiat_events",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Clean up old Crypto2Fiat events based on TTL
+    pub fn cleanup_old_crypto2fiat(&self, ttl_secs: u64) -> Result<usize, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - ttl_secs;
+
+        let deleted = conn.execute(
+            "DELETE FROM crypto2fiat_events WHERE created_at < ?1",
             params![cutoff],
         )?;
 

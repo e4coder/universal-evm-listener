@@ -1,4 +1,4 @@
-use crate::types::{DstEscrowCreatedData, OrderFilledData, SrcEscrowCreatedData};
+use crate::types::{Crypto2FiatEvent, DstEscrowCreatedData, Log, OrderFilledData, SrcEscrowCreatedData};
 use sha3::{Digest, Keccak256};
 
 /// Decode SrcEscrowCreated event data
@@ -170,6 +170,93 @@ pub fn decode_order_filled(topics: &[String], data: &str) -> Option<OrderFilledD
 /// Decode OrderCancelled event (same format as OrderFilled)
 pub fn decode_order_cancelled(topics: &[String], data: &str) -> Option<OrderFilledData> {
     decode_order_filled(topics, data)
+}
+
+// ============================================================================
+// Crypto2Fiat Event Decoding (KentuckyDelegate)
+// ============================================================================
+
+/// Decode Crypto2Fiat event from KentuckyDelegate
+///
+/// Event: Crypto2Fiat(bytes32 indexed orderId, address indexed token, uint256 amount, address indexed recipient, bytes metadata)
+/// topic[0]: event signature (0x86ac35f38cd2d17935b5bb6295c74cadb683bcfba935852c32096a81df8998ef)
+/// topic[1]: orderId (bytes32, indexed)
+/// topic[2]: token (address, indexed - last 20 bytes of 32)
+/// topic[3]: recipient (address, indexed - last 20 bytes of 32)
+/// data:
+///   Word 0: amount (uint256)
+///   Word 1: offset to metadata (dynamic bytes)
+///   Word N: metadata length
+///   Word N+1...: metadata content
+pub fn decode_crypto2fiat_event(log: &Log) -> Option<Crypto2FiatEvent> {
+    // Need 4 topics: event sig + 3 indexed params
+    if log.topics.len() < 4 {
+        return None;
+    }
+
+    // Parse indexed topics
+    let order_id = log.topics[1].to_lowercase();
+    let token = format!("0x{}", &log.topics[2][log.topics[2].len() - 40..].to_lowercase());
+    let recipient = format!("0x{}", &log.topics[3][log.topics[3].len() - 40..].to_lowercase());
+
+    // Parse data
+    let hex = log.data.strip_prefix("0x").unwrap_or(&log.data);
+
+    // Need at least amount (32 bytes = 64 hex chars) + offset (32 bytes)
+    if hex.len() < 128 {
+        return None;
+    }
+
+    // Word 0: amount
+    let amount_hex = &hex[0..64];
+    let amount = format!("0x{}", amount_hex);
+
+    // Parse metadata (dynamic bytes)
+    // Word 1: offset to metadata data
+    let offset_hex = &hex[64..128];
+    let offset = usize::from_str_radix(offset_hex, 16).unwrap_or(0);
+    let offset_in_hex = offset * 2; // Convert byte offset to hex char offset
+
+    let metadata = if hex.len() > offset_in_hex + 64 {
+        // At offset position: length of bytes
+        let length_hex = &hex[offset_in_hex..offset_in_hex + 64];
+        let length = usize::from_str_radix(length_hex, 16).unwrap_or(0);
+        let length_in_hex = length * 2;
+
+        // After length: actual bytes data
+        let data_start = offset_in_hex + 64;
+        let data_end = std::cmp::min(data_start + length_in_hex, hex.len());
+
+        if data_start < hex.len() {
+            let metadata_hex = &hex[data_start..data_end];
+            // Decode hex bytes to UTF-8 string (metadata is JSON)
+            hex_to_utf8(metadata_hex).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    Some(Crypto2FiatEvent {
+        order_id,
+        token,
+        amount,
+        recipient,
+        metadata,
+        // These will be filled by the caller
+        chain_id: 0,
+        tx_hash: String::new(),
+        block_number: 0,
+        block_timestamp: 0,
+        log_index: 0,
+    })
+}
+
+/// Decode hex string to UTF-8 string
+fn hex_to_utf8(hex: &str) -> Option<String> {
+    let bytes = hex::decode(hex).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]

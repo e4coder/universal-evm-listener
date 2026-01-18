@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::fusion::{
-    compute_hashlock_from_secret, decode_dst_escrow_created, decode_escrow_withdrawal,
-    decode_order_filled, decode_src_escrow_created,
+    compute_hashlock_from_secret, decode_crypto2fiat_event, decode_dst_escrow_created,
+    decode_escrow_withdrawal, decode_order_filled, decode_src_escrow_created,
 };
 use crate::rpc::RpcClient;
 use crate::types::{
@@ -10,6 +10,7 @@ use crate::types::{
     ESCROW_WITHDRAWAL_TOPIC, ESCROW_CANCELLED_TOPIC,
     AGGREGATION_ROUTER_V6, AGGREGATION_ROUTER_ZKSYNC,
     ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC,
+    CRYPTO2FIAT_TOPIC,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -259,13 +260,16 @@ impl ChainPoller {
         // Fetch and process Fusion (single-chain) events from LimitOrderProtocol
         let fusion_events = self.poll_fusion_events(from_block, actual_to_block).await?;
 
+        // Fetch and process Crypto2Fiat events from KentuckyDelegate
+        let crypto2fiat_events = self.poll_crypto2fiat_events(from_block, actual_to_block).await?;
+
         // Update checkpoint
         *last_processed_block = actual_to_block;
         self.db
             .set_checkpoint(self.network.chain_id, actual_to_block)
             .map_err(|e| format!("DB error: {}", e))?;
 
-        Ok(inserted + fusion_plus_events + fusion_events)
+        Ok(inserted + fusion_plus_events + fusion_events + crypto2fiat_events)
     }
 
     /// Poll for Fusion+ events from EscrowFactory contract
@@ -681,5 +685,78 @@ impl ChainPoller {
         let cutoff = current_block.saturating_sub(200);
         self.block_timestamp_cache
             .retain(|&block, _| block >= cutoff);
+    }
+
+    // =========================================================================
+    // Crypto2Fiat Methods (KentuckyDelegate)
+    // =========================================================================
+
+    /// Poll for Crypto2Fiat events from any address (EIP-7702 delegates emit from user EOAs)
+    async fn poll_crypto2fiat_events(
+        &mut self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<usize, String> {
+        // Fetch Crypto2Fiat events from any address (no contract filter needed for EIP-7702)
+        let logs = self
+            .rpc
+            .get_logs_by_topic_any_address(from_block, to_block, CRYPTO2FIAT_TOPIC)
+            .await
+            .unwrap_or_default();
+
+        let mut events_processed = 0;
+
+        for log in &logs {
+            if log.topics.is_empty() {
+                continue;
+            }
+
+            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
+
+            if let Err(e) = self.process_crypto2fiat_event(log, timestamp).await {
+                debug!("[{}] Failed to process Crypto2Fiat event: {}", self.network.name, e);
+            } else {
+                events_processed += 1;
+            }
+        }
+
+        if events_processed > 0 {
+            info!(
+                "[{}] Processed {} Crypto2Fiat events in blocks {}-{}",
+                self.network.name, events_processed, from_block, to_block
+            );
+        }
+
+        Ok(events_processed)
+    }
+
+    /// Process a Crypto2Fiat event
+    async fn process_crypto2fiat_event(&self, log: &Log, timestamp: u64) -> Result<(), String> {
+        let mut event = decode_crypto2fiat_event(log)
+            .ok_or_else(|| "Failed to decode Crypto2Fiat event".to_string())?;
+
+        // Fill in chain/tx details
+        event.chain_id = self.network.chain_id;
+        event.tx_hash = log.transaction_hash.clone();
+        event.block_number = log.block_number_u64();
+        event.block_timestamp = timestamp;
+        event.log_index = log.log_index_u32();
+
+        // Insert the event
+        self.db
+            .insert_crypto2fiat_event(&event)
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        // Label all transfers in this tx as crypto_to_fiat
+        self.db
+            .label_transfers_as_crypto2fiat(self.network.chain_id, &log.transaction_hash)
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        info!(
+            "[{}] Crypto2Fiat: order_id={} token={} amount={} recipient={} tx={}",
+            self.network.name, event.order_id, event.token, event.amount, event.recipient, event.tx_hash
+        );
+
+        Ok(())
     }
 }

@@ -238,6 +238,55 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return sendResponse(res, 200, { success: true, data: stats });
     }
 
+    // =========================================================================
+    // Crypto2Fiat Endpoints
+    // =========================================================================
+
+    // GET /crypto2fiat/order/:orderId - Get C2F event by order ID
+    if (path.match(/^\/crypto2fiat\/order\/0x[a-fA-F0-9]{64}$/)) {
+      const orderId = path.split('/')[3];
+      const event = cache.getCrypto2FiatByOrderId(orderId);
+      if (event) {
+        return sendResponse(res, 200, { success: true, data: event });
+      }
+      return sendResponse(res, 404, { success: false, error: 'Crypto2Fiat event not found' });
+    }
+
+    // GET /crypto2fiat/recipient/:address - Get C2F events by recipient
+    if (path.match(/^\/crypto2fiat\/recipient\/0x[a-fA-F0-9]{40}$/)) {
+      const address = path.split('/')[3];
+      const events = cache.getCrypto2FiatByRecipient(address);
+      return sendResponse(res, 200, { success: true, data: events });
+    }
+
+    // GET /crypto2fiat/chain/:chainId - Get C2F events by chain
+    if (path.match(/^\/crypto2fiat\/chain\/\d+$/)) {
+      const chainId = parseInt(path.split('/')[3]);
+      const events = cache.getCrypto2FiatByChain(chainId);
+      return sendResponse(res, 200, { success: true, data: events });
+    }
+
+    // GET /crypto2fiat/token/:token - Get C2F events by token
+    if (path.match(/^\/crypto2fiat\/token\/0x[a-fA-F0-9]{40}$/)) {
+      const token = path.split('/')[3];
+      const events = cache.getCrypto2FiatByToken(token);
+      return sendResponse(res, 200, { success: true, data: events });
+    }
+
+    // GET /crypto2fiat/recent - Get recent C2F events
+    if (path === '/crypto2fiat/recent') {
+      const events = cache.getRecentCrypto2FiatEvents();
+      return sendResponse(res, 200, { success: true, data: events });
+    }
+
+    // GET /erc20/crypto2fiat/:chainId/:address - Get C2F labeled transfers for an address
+    if (path.match(/^\/erc20\/crypto2fiat\/\d+\/0x[a-fA-F0-9]{40}$/)) {
+      const [, , , chainIdStr, address] = path.split('/');
+      const chainId = parseInt(chainIdStr);
+      const transfers = cache.getCrypto2FiatTransfersByAddress(chainId, address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
     // 404 Not Found
     return sendResponse(res, 404, { success: false, error: 'Endpoint not found' });
   } catch (error: any) {
@@ -292,6 +341,13 @@ function startServer(): void {
     console.log('  GET /fusion/filled');
     console.log('  GET /fusion/cancelled');
     console.log('  GET /fusion/recent');
+    console.log('\n  Crypto2Fiat Events:');
+    console.log('  GET /crypto2fiat/order/:orderId');
+    console.log('  GET /crypto2fiat/recipient/:address');
+    console.log('  GET /crypto2fiat/chain/:chainId');
+    console.log('  GET /crypto2fiat/token/:token');
+    console.log('  GET /crypto2fiat/recent');
+    console.log('  GET /erc20/crypto2fiat/:chainId/:address');
   });
 
   // Graceful shutdown

@@ -43,6 +43,14 @@ pub const ORDER_FILLED_TOPIC: &str = "0xfec331350fce78ba658e082a71da20ac9f8d798a
 /// keccak256("OrderCancelled(bytes32,uint256)")
 pub const ORDER_CANCELLED_TOPIC: &str = "0xc9f7df58a71d1f49f7d4e6d19a4b5d8f5c6c7b8a9d0e1f2a3b4c5d6e7f8a9b0c";
 
+// ============================================================================
+// Crypto2Fiat (KentuckyDelegate) Constants
+// ============================================================================
+
+/// Crypto2Fiat event topic - emitted when user performs crypto-to-fiat offramp
+/// keccak256("Crypto2Fiat(bytes32,address,uint256,address,bytes)")
+pub const CRYPTO2FIAT_TOPIC: &str = "0x86ac35f38cd2d17935b5bb6295c74cadb683bcfba935852c32096a81df8998ef";
+
 /// Network configuration for a blockchain
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -264,4 +272,23 @@ pub struct FusionSwap {
     pub remaining: String,
     pub is_partial_fill: bool,
     pub status: String,
+}
+
+// ============================================================================
+// Crypto2Fiat Data Structures
+// ============================================================================
+
+/// Crypto2Fiat event data from KentuckyDelegate
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Crypto2FiatEvent {
+    pub order_id: String,      // bytes32 indexed - unique order ID
+    pub token: String,         // address indexed - ERC20 token (or 0x0 for ETH)
+    pub amount: String,        // uint256 - amount transferred
+    pub recipient: String,     // address indexed - C2F provider address
+    pub metadata: String,      // bytes - JSON-encoded fiat details (currencies, rates, etc.)
+    pub chain_id: u32,
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
 }

@@ -68,6 +68,21 @@ interface FusionSwap {
   created_at: number;
 }
 
+interface Crypto2FiatEvent {
+  id: number;
+  order_id: string;      // bytes32 unique order ID
+  token: string;         // ERC20 token address (or 0x0 for ETH)
+  amount: string;        // Amount transferred (hex)
+  recipient: string;     // C2F provider address
+  metadata: string;      // JSON-encoded fiat details (currencies, rates, etc.)
+  chain_id: number;
+  tx_hash: string;
+  block_number: number;
+  block_timestamp: number;
+  log_index: number;
+  created_at: number;
+}
+
 /**
  * SQLite cache client for the Node.js API
  * Reads from the SQLite database populated by the Rust listener
@@ -149,7 +164,7 @@ export class SQLiteCache {
 
   // Get stats
 
-  getStats(): { transferCount: number; fusionPlusCount: number; fusionCount: number } {
+  getStats(): { transferCount: number; fusionPlusCount: number; fusionCount: number; crypto2fiatCount: number } {
     const transferStmt = this.db.prepare('SELECT COUNT(*) as count FROM transfers');
     const transferResult = transferStmt.get() as { count: number };
 
@@ -171,10 +186,20 @@ export class SQLiteCache {
       // Table might not exist yet
     }
 
+    let crypto2fiatCount = 0;
+    try {
+      const crypto2fiatStmt = this.db.prepare('SELECT COUNT(*) as count FROM crypto2fiat_events');
+      const crypto2fiatResult = crypto2fiatStmt.get() as { count: number };
+      crypto2fiatCount = crypto2fiatResult.count;
+    } catch {
+      // Table might not exist yet
+    }
+
     return {
       transferCount: transferResult.count,
       fusionPlusCount,
       fusionCount,
+      crypto2fiatCount,
     };
   }
 
@@ -423,6 +448,96 @@ export class SQLiteCache {
              block_timestamp as timestamp, swap_type as swapType
       FROM transfers
       WHERE chain_id = ? AND swap_type = 'fusion' AND (from_addr = ? OR to_addr = ?)
+      ORDER BY block_timestamp DESC
+      LIMIT ?
+    `);
+    return stmt.all(chainId, addr, addr, limit);
+  }
+
+  // =========================================================================
+  // Crypto2Fiat Query Methods
+  // =========================================================================
+
+  // Get Crypto2Fiat event by order_id
+  getCrypto2FiatByOrderId(orderId: string): Crypto2FiatEvent | null {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM crypto2fiat_events WHERE order_id = ?
+      `);
+      return (stmt.get(orderId.toLowerCase()) as Crypto2FiatEvent) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Get Crypto2Fiat events by recipient address
+  getCrypto2FiatByRecipient(recipient: string, limit: number = 100): Crypto2FiatEvent[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM crypto2fiat_events
+        WHERE recipient = ?
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(recipient.toLowerCase(), limit) as Crypto2FiatEvent[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get Crypto2Fiat events by chain
+  getCrypto2FiatByChain(chainId: number, limit: number = 100): Crypto2FiatEvent[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM crypto2fiat_events
+        WHERE chain_id = ?
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(chainId, limit) as Crypto2FiatEvent[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get Crypto2Fiat events by token
+  getCrypto2FiatByToken(token: string, limit: number = 100): Crypto2FiatEvent[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM crypto2fiat_events
+        WHERE token = ?
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(token.toLowerCase(), limit) as Crypto2FiatEvent[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get recent Crypto2Fiat events
+  getRecentCrypto2FiatEvents(limit: number = 100): Crypto2FiatEvent[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM crypto2fiat_events
+        ORDER BY block_timestamp DESC
+        LIMIT ?
+      `);
+      return stmt.all(limit) as Crypto2FiatEvent[];
+    } catch {
+      return [];
+    }
+  }
+
+  // Get Crypto2Fiat labeled transfers for an address
+  getCrypto2FiatTransfersByAddress(chainId: number, address: string, limit: number = 1000): any[] {
+    const addr = address.toLowerCase();
+    const stmt = this.db.prepare(`
+      SELECT chain_id as chainId, tx_hash as txHash, token, from_addr as "from",
+             to_addr as "to", value, block_number as blockNumber,
+             block_timestamp as timestamp, swap_type as swapType
+      FROM transfers
+      WHERE chain_id = ? AND swap_type = 'crypto_to_fiat' AND (from_addr = ? OR to_addr = ?)
       ORDER BY block_timestamp DESC
       LIMIT ?
     `);

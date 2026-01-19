@@ -698,11 +698,20 @@ impl ChainPoller {
         to_block: u64,
     ) -> Result<usize, String> {
         // Fetch Crypto2Fiat events from any address (no contract filter needed for EIP-7702)
-        let logs = self
+        let logs = match self
             .rpc
             .get_logs_by_topic_any_address(from_block, to_block, CRYPTO2FIAT_TOPIC)
             .await
-            .unwrap_or_default();
+        {
+            Ok(logs) => logs,
+            Err(e) => {
+                warn!(
+                    "[{}] Failed to fetch Crypto2Fiat logs for blocks {}-{}: {}",
+                    self.network.name, from_block, to_block, e
+                );
+                return Ok(0);
+            }
+        };
 
         let mut events_processed = 0;
 

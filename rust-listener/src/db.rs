@@ -29,11 +29,14 @@ impl Database {
         let conn = Connection::open(path)?;
 
         // Enable WAL mode for concurrent reads while writing
+        // Reduced cache_size from 10000 to 2000 pages (~8MB) to limit memory usage
+        // Added wal_autocheckpoint to prevent WAL file growth
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = 10000;
-             PRAGMA temp_store = MEMORY;"
+             PRAGMA cache_size = 2000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA wal_autocheckpoint = 1000;"
         )?;
 
         // Create transfers table with deduplication via UNIQUE constraint
@@ -403,6 +406,14 @@ impl Database {
         )?;
 
         Ok(deleted)
+    }
+
+    /// Force a WAL checkpoint to release memory and reduce WAL file size
+    /// This moves data from WAL back to the main database file
+    pub fn checkpoint(&self) -> Result<(), DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     /// Get total count of transfers (for monitoring)

@@ -86,6 +86,11 @@ async fn main() {
                 }
             }
 
+            // Force WAL checkpoint to release memory after cleanup
+            if let Err(e) = db_cleanup.checkpoint() {
+                warn!("WAL checkpoint error: {}", e);
+            }
+
             // Log stats every cleanup cycle
             let transfer_count = db_cleanup.get_transfer_count().unwrap_or(0);
             let fusion_count = db_cleanup.get_fusion_plus_count().unwrap_or(0);

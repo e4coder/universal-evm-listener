@@ -52,8 +52,8 @@ impl RpcClient {
         retry_base_delay_ms: u64,
     ) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(5)
+            .timeout(Duration::from_secs(60))  // Increased from 30s for large getLogs queries
+            .pool_max_idle_per_host(2)         // Reduced from 5 to save memory
             .build()
             .expect("Failed to create HTTP client");
 

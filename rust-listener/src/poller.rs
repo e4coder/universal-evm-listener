@@ -38,7 +38,7 @@ impl Default for PollerConfig {
             reorg_safety_blocks: 10,
             confirmation_blocks: 3,
             poll_interval_ms: 2000,
-            max_blocks_per_query: 100,
+            max_blocks_per_query: 50,  // Reduced from 100 to limit memory usage per query
             max_backfill_blocks: 500,
         }
     }

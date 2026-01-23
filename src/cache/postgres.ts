@@ -532,6 +532,19 @@ export class PostgresCache {
     }
   }
 
+  async getCrypto2FiatByTxHash(chainId: number, txHash: string): Promise<Crypto2FiatEvent | null> {
+    try {
+      const result = await this.pool.query(
+        `SELECT * FROM crypto2fiat_events
+         WHERE chain_id = $1 AND tx_hash = $2`,
+        [chainId, txHash.toLowerCase()]
+      );
+      return result.rows[0] || null;
+    } catch {
+      return null;
+    }
+  }
+
   async getCrypto2FiatTransfersByAddress(chainId: number, address: string, limit: number = 1000): Promise<any[]> {
     const addr = address.toLowerCase();
     const result = await this.pool.query(

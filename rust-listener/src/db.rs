@@ -245,8 +245,8 @@ impl Database {
 
         let result = client.execute(
             "INSERT INTO transfers
-             (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
             &[
                 &(chain_id as i32),
@@ -258,6 +258,7 @@ impl Database {
                 &transfer.value,
                 &(transfer.block_number as i64),
                 &(transfer.block_timestamp as i64),
+                &transfer.swap_type,
                 &now,
             ],
         ).await?;
@@ -279,8 +280,8 @@ impl Database {
 
         let stmt = client.prepare(
             "INSERT INTO transfers
-             (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING"
         ).await?;
 
@@ -298,6 +299,7 @@ impl Database {
                     &transfer.value,
                     &(transfer.block_number as i64),
                     &(transfer.block_timestamp as i64),
+                    &transfer.swap_type,
                     &now,
                 ],
             ).await?;
@@ -400,7 +402,7 @@ impl Database {
 
         // Get first transfer (lowest log_index)
         let first_row = client.query_opt(
-            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp
+            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type
              FROM transfers
              WHERE chain_id = $1 AND tx_hash = $2
              ORDER BY log_index ASC
@@ -410,7 +412,7 @@ impl Database {
 
         // Get last transfer (highest log_index)
         let last_row = client.query_opt(
-            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp
+            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type
              FROM transfers
              WHERE chain_id = $1 AND tx_hash = $2
              ORDER BY log_index DESC
@@ -430,6 +432,7 @@ impl Database {
                     value: first.get(5),
                     block_number: first.get::<_, i64>(6) as u64,
                     block_timestamp: first.get::<_, i64>(7) as u64,
+                    swap_type: first.get(8),
                 };
                 let last_transfer = Transfer {
                     chain_id,
@@ -441,6 +444,7 @@ impl Database {
                     value: last.get(5),
                     block_number: last.get::<_, i64>(6) as u64,
                     block_timestamp: last.get::<_, i64>(7) as u64,
+                    swap_type: last.get(8),
                 };
                 Ok(Some((first_transfer, last_transfer)))
             }

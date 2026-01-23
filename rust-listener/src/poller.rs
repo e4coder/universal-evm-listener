@@ -208,27 +208,57 @@ impl ChainPoller {
             self.network.name, from_block, actual_to_block, current_block
         );
 
-        // Fetch Transfer events
-        let logs = self
+        // =========================================================================
+        // PHASE 1: Fetch fusion/crypto2fiat logs and build swap_type map
+        // =========================================================================
+        let mut swap_type_map: HashMap<String, String> = HashMap::new();
+
+        // Fetch Fusion+ logs (factory + escrow events)
+        let (fusion_plus_factory_logs, fusion_plus_escrow_logs) =
+            self.fetch_fusion_plus_logs(from_block, actual_to_block).await?;
+
+        for log in &fusion_plus_factory_logs {
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus".to_string());
+        }
+        for log in &fusion_plus_escrow_logs {
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus".to_string());
+        }
+
+        // Fetch Fusion (single-chain) logs
+        let fusion_logs = self.fetch_fusion_logs(from_block, actual_to_block).await?;
+        for log in &fusion_logs {
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion".to_string());
+        }
+
+        // Fetch Crypto2Fiat logs
+        let crypto2fiat_logs = self.fetch_crypto2fiat_logs(from_block, actual_to_block).await?;
+        for log in &crypto2fiat_logs {
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "crypto_to_fiat".to_string());
+        }
+
+        // =========================================================================
+        // PHASE 2: Fetch transfers and insert with swap_type from map
+        // =========================================================================
+        let transfer_logs = self
             .rpc
             .get_transfer_logs(from_block, actual_to_block)
             .await
             .map_err(|e| format!("Failed to get logs: {}", e))?;
 
-        if !logs.is_empty() {
+        if !transfer_logs.is_empty() {
             info!(
                 "[{}] Found {} Transfer events in blocks {}-{}",
                 self.network.name,
-                logs.len(),
+                transfer_logs.len(),
                 from_block,
                 actual_to_block
             );
         }
 
-        // Process logs into transfers
-        let mut transfers = Vec::with_capacity(logs.len());
+        // Process logs into transfers with swap_type
+        let mut transfers = Vec::with_capacity(transfer_logs.len());
 
-        for log in &logs {
+        for log in &transfer_logs {
             // Validate Transfer event structure
             if log.topics.len() < 3 {
                 continue; // Invalid Transfer event
@@ -236,6 +266,9 @@ impl ChainPoller {
 
             let block_number = log.block_number_u64();
             let timestamp = self.get_block_timestamp(block_number).await?;
+
+            // Look up swap_type from the map
+            let swap_type = swap_type_map.get(&log.transaction_hash.to_lowercase()).cloned();
 
             let transfer = Transfer {
                 chain_id: self.network.chain_id,
@@ -247,12 +280,13 @@ impl ChainPoller {
                 value: log.data.clone(),
                 block_number,
                 block_timestamp: timestamp,
+                swap_type,
             };
 
             transfers.push(transfer);
         }
 
-        // Batch insert to PostgreSQL database
+        // Batch insert to PostgreSQL database (with swap_type already set)
         let inserted = if !transfers.is_empty() {
             self.db
                 .insert_transfers_batch(self.network.chain_id, &transfers)
@@ -262,14 +296,12 @@ impl ChainPoller {
             0
         };
 
-        // Fetch and process Fusion+ events from EscrowFactory
-        let fusion_plus_events = self.poll_fusion_plus_events(from_block, actual_to_block).await?;
-
-        // Fetch and process Fusion (single-chain) events from LimitOrderProtocol
-        let fusion_events = self.poll_fusion_events(from_block, actual_to_block).await?;
-
-        // Fetch and process Crypto2Fiat events from KentuckyDelegate
-        let crypto2fiat_events = self.poll_crypto2fiat_events(from_block, actual_to_block).await?;
+        // =========================================================================
+        // PHASE 3: Process fusion events (insert swap records, no UPDATE needed)
+        // =========================================================================
+        let fusion_plus_events = self.process_fusion_plus_logs(&fusion_plus_factory_logs, &fusion_plus_escrow_logs).await?;
+        let fusion_events = self.process_fusion_logs(&fusion_logs).await?;
+        let crypto2fiat_events = self.process_crypto2fiat_logs(&crypto2fiat_logs).await?;
 
         // Update checkpoint
         *last_processed_block = actual_to_block;
@@ -281,12 +313,16 @@ impl ChainPoller {
         Ok(inserted + fusion_plus_events + fusion_events + crypto2fiat_events)
     }
 
-    /// Poll for Fusion+ events from EscrowFactory contract
-    async fn poll_fusion_plus_events(
-        &mut self,
+    // =========================================================================
+    // Log Fetching Methods (return logs without processing)
+    // =========================================================================
+
+    /// Fetch Fusion+ logs (factory and escrow events)
+    async fn fetch_fusion_plus_logs(
+        &self,
         from_block: u64,
         to_block: u64,
-    ) -> Result<usize, String> {
+    ) -> Result<(Vec<Log>, Vec<Log>), String> {
         // Fetch SrcEscrowCreated and DstEscrowCreated events from EscrowFactory
         let factory_topics = vec![
             SRC_ESCROW_CREATED_TOPIC.to_string(),
@@ -299,9 +335,76 @@ impl ChainPoller {
             .await
             .unwrap_or_default();
 
+        // Fetch EscrowWithdrawal and EscrowCancelled events (from any escrow contract)
+        let escrow_topics = vec![
+            ESCROW_WITHDRAWAL_TOPIC.to_string(),
+            ESCROW_CANCELLED_TOPIC.to_string(),
+        ];
+
+        let escrow_logs = self
+            .rpc
+            .get_logs_multi_topics_any_address(from_block, to_block, escrow_topics)
+            .await
+            .unwrap_or_default();
+
+        Ok((factory_logs, escrow_logs))
+    }
+
+    /// Fetch Fusion (single-chain) logs from Aggregation Router
+    async fn fetch_fusion_logs(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<Log>, String> {
+        // Determine contract address based on chain
+        let router_address = if self.network.chain_id == 324 {
+            AGGREGATION_ROUTER_ZKSYNC
+        } else {
+            AGGREGATION_ROUTER_V6
+        };
+
+        let topics = vec![
+            ORDER_FILLED_TOPIC.to_string(),
+            ORDER_CANCELLED_TOPIC.to_string(),
+        ];
+
+        let logs = self
+            .rpc
+            .get_logs_multi_topics(from_block, to_block, router_address, topics)
+            .await
+            .unwrap_or_default();
+
+        Ok(logs)
+    }
+
+    /// Fetch Crypto2Fiat logs from any address
+    async fn fetch_crypto2fiat_logs(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<Log>, String> {
+        let logs = self
+            .rpc
+            .get_logs_by_topic_any_address(from_block, to_block, CRYPTO2FIAT_TOPIC)
+            .await
+            .unwrap_or_default();
+
+        Ok(logs)
+    }
+
+    // =========================================================================
+    // Log Processing Methods (process pre-fetched logs)
+    // =========================================================================
+
+    /// Process Fusion+ logs (factory and escrow events)
+    async fn process_fusion_plus_logs(
+        &mut self,
+        factory_logs: &[Log],
+        escrow_logs: &[Log],
+    ) -> Result<usize, String> {
         let mut events_processed = 0;
 
-        for log in &factory_logs {
+        for log in factory_logs {
             if log.topics.is_empty() {
                 continue;
             }
@@ -323,21 +426,7 @@ impl ChainPoller {
             }
         }
 
-        // Fetch EscrowWithdrawal and EscrowCancelled events (from any escrow contract)
-        let escrow_topics = vec![
-            ESCROW_WITHDRAWAL_TOPIC.to_string(),
-            ESCROW_CANCELLED_TOPIC.to_string(),
-        ];
-
-        // Note: We can't filter by address for escrow events since escrow addresses vary
-        // So we fetch by topic only using OR filter
-        let escrow_logs = self
-            .rpc
-            .get_logs_multi_topics_any_address(from_block, to_block, escrow_topics)
-            .await
-            .unwrap_or_default();
-
-        for log in &escrow_logs {
+        for log in escrow_logs {
             if log.topics.is_empty() {
                 continue;
             }
@@ -361,8 +450,73 @@ impl ChainPoller {
 
         if events_processed > 0 {
             info!(
-                "[{}] Processed {} Fusion+ events in blocks {}-{}",
-                self.network.name, events_processed, from_block, to_block
+                "[{}] Processed {} Fusion+ events",
+                self.network.name, events_processed
+            );
+        }
+
+        Ok(events_processed)
+    }
+
+    /// Process Fusion (single-chain) logs
+    async fn process_fusion_logs(&mut self, logs: &[Log]) -> Result<usize, String> {
+        let mut events_processed = 0;
+
+        for log in logs {
+            if log.topics.is_empty() {
+                continue;
+            }
+
+            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
+            let topic0 = log.topics[0].to_lowercase();
+
+            if topic0 == ORDER_FILLED_TOPIC {
+                if let Err(e) = self.process_order_filled(log, timestamp, "filled").await {
+                    debug!("[{}] Failed to process OrderFilled: {}", self.network.name, e);
+                } else {
+                    events_processed += 1;
+                }
+            } else if topic0 == ORDER_CANCELLED_TOPIC {
+                if let Err(e) = self.process_order_filled(log, timestamp, "cancelled").await {
+                    debug!("[{}] Failed to process OrderCancelled: {}", self.network.name, e);
+                } else {
+                    events_processed += 1;
+                }
+            }
+        }
+
+        if events_processed > 0 {
+            info!(
+                "[{}] Processed {} Fusion events",
+                self.network.name, events_processed
+            );
+        }
+
+        Ok(events_processed)
+    }
+
+    /// Process Crypto2Fiat logs
+    async fn process_crypto2fiat_logs(&mut self, logs: &[Log]) -> Result<usize, String> {
+        let mut events_processed = 0;
+
+        for log in logs {
+            if log.topics.is_empty() {
+                continue;
+            }
+
+            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
+
+            if let Err(e) = self.process_crypto2fiat_event(log, timestamp).await {
+                debug!("[{}] Failed to process Crypto2Fiat event: {}", self.network.name, e);
+            } else {
+                events_processed += 1;
+            }
+        }
+
+        if events_processed > 0 {
+            info!(
+                "[{}] Processed {} Crypto2Fiat events",
+                self.network.name, events_processed
             );
         }
 
@@ -390,11 +544,7 @@ impl ChainPoller {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as fusion_plus
-        self.db
-            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         info!(
             "[{}] Fusion+ SrcEscrow created: order_hash={} dst_chain={}",
@@ -424,11 +574,7 @@ impl ChainPoller {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as fusion_plus
-        self.db
-            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         if updated {
             info!(
@@ -483,11 +629,7 @@ impl ChainPoller {
             }
         }
 
-        // Label transfers in this tx as fusion_plus
-        self.db
-            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         debug!(
             "[{}] Fusion+ withdrawal from escrow {} with hashlock {}",
@@ -499,11 +641,7 @@ impl ChainPoller {
 
     /// Process EscrowCancelled event
     async fn process_escrow_cancelled(&self, log: &Log, _timestamp: u64) -> Result<(), String> {
-        // Label the transfers
-        self.db
-            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         debug!(
             "[{}] Fusion+ escrow cancelled: {}",
@@ -516,67 +654,6 @@ impl ChainPoller {
     // =========================================================================
     // Fusion (Single-Chain) Methods
     // =========================================================================
-
-    /// Poll for Fusion events from Aggregation Router V6
-    async fn poll_fusion_events(
-        &mut self,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<usize, String> {
-        // Determine contract address based on chain
-        let router_address = if self.network.chain_id == 324 {
-            // zkSync Era
-            AGGREGATION_ROUTER_ZKSYNC
-        } else {
-            AGGREGATION_ROUTER_V6
-        };
-
-        // Fetch OrderFilled and OrderCancelled events
-        let topics = vec![
-            ORDER_FILLED_TOPIC.to_string(),
-            ORDER_CANCELLED_TOPIC.to_string(),
-        ];
-
-        let logs = self
-            .rpc
-            .get_logs_multi_topics(from_block, to_block, router_address, topics)
-            .await
-            .unwrap_or_default();
-
-        let mut events_processed = 0;
-
-        for log in &logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-
-            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
-            let topic0 = log.topics[0].to_lowercase();
-
-            if topic0 == ORDER_FILLED_TOPIC {
-                if let Err(e) = self.process_order_filled(log, timestamp, "filled").await {
-                    debug!("[{}] Failed to process OrderFilled: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            } else if topic0 == ORDER_CANCELLED_TOPIC {
-                if let Err(e) = self.process_order_filled(log, timestamp, "cancelled").await {
-                    debug!("[{}] Failed to process OrderCancelled: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            }
-        }
-
-        if events_processed > 0 {
-            info!(
-                "[{}] Processed {} Fusion events in blocks {}-{}",
-                self.network.name, events_processed, from_block, to_block
-            );
-        }
-
-        Ok(events_processed)
-    }
 
     /// Process OrderFilled or OrderCancelled event
     async fn process_order_filled(&self, log: &Log, timestamp: u64, status: &str) -> Result<(), String> {
@@ -636,11 +713,7 @@ impl ChainPoller {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as 'fusion'
-        self.db
-            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion")
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         info!(
             "[{}] Fusion {} order: order_hash={} maker={} taker={:?} tx={}",
@@ -684,54 +757,6 @@ impl ChainPoller {
     // Crypto2Fiat Methods (KentuckyDelegate)
     // =========================================================================
 
-    /// Poll for Crypto2Fiat events from any address (EIP-7702 delegates emit from user EOAs)
-    async fn poll_crypto2fiat_events(
-        &mut self,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<usize, String> {
-        // Fetch Crypto2Fiat events from any address (no contract filter needed for EIP-7702)
-        let logs = match self
-            .rpc
-            .get_logs_by_topic_any_address(from_block, to_block, CRYPTO2FIAT_TOPIC)
-            .await
-        {
-            Ok(logs) => logs,
-            Err(e) => {
-                warn!(
-                    "[{}] Failed to fetch Crypto2Fiat logs for blocks {}-{}: {}",
-                    self.network.name, from_block, to_block, e
-                );
-                return Ok(0);
-            }
-        };
-
-        let mut events_processed = 0;
-
-        for log in &logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-
-            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
-
-            if let Err(e) = self.process_crypto2fiat_event(log, timestamp).await {
-                debug!("[{}] Failed to process Crypto2Fiat event: {}", self.network.name, e);
-            } else {
-                events_processed += 1;
-            }
-        }
-
-        if events_processed > 0 {
-            info!(
-                "[{}] Processed {} Crypto2Fiat events in blocks {}-{}",
-                self.network.name, events_processed, from_block, to_block
-            );
-        }
-
-        Ok(events_processed)
-    }
-
     /// Process a Crypto2Fiat event
     async fn process_crypto2fiat_event(&self, log: &Log, timestamp: u64) -> Result<(), String> {
         let mut event = decode_crypto2fiat_event(log)
@@ -750,11 +775,7 @@ impl ChainPoller {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as crypto_to_fiat
-        self.db
-            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "crypto_to_fiat")
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         info!(
             "[{}] Crypto2Fiat: order_id={} token={} amount={} recipient={} tx={}",

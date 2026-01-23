@@ -59,7 +59,7 @@ pub struct NetworkConfig {
     pub rpc_url: String,
 }
 
-/// Transfer event data to store in SQLite
+/// Transfer event data to store in PostgreSQL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {
     pub chain_id: u32,
@@ -71,6 +71,7 @@ pub struct Transfer {
     pub value: String,
     pub block_number: u64,
     pub block_timestamp: u64,
+    pub swap_type: Option<String>,
 }
 
 /// JSON-RPC response structures

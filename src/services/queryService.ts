@@ -1,9 +1,9 @@
-import { SQLiteCache } from '../cache/sqlite';
+import { PostgresCache } from '../cache/postgres';
 
 export class QueryService {
-  private cache: SQLiteCache;
+  private cache: PostgresCache;
 
-  constructor(cache: SQLiteCache) {
+  constructor(cache: PostgresCache) {
     this.cache = cache;
   }
 

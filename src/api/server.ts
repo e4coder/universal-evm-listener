@@ -1,11 +1,11 @@
 import 'dotenv/config';
 import http from 'http';
-import { SQLiteCache } from '../cache/sqlite';
+import { PostgresCache } from '../cache/postgres';
 import { QueryService } from '../services/queryService';
 import { getNetworkConfig } from '../config/networks';
 
-const sqlitePath = process.env.SQLITE_PATH || '/home/ubuntu/universal_listener/data/transfers.db';
-const cache = new SQLiteCache(sqlitePath);
+const databaseUrl = process.env.DATABASE_URL || 'postgres://erc20cache:erc20cache_pass@localhost:5433/erc20cache';
+const cache = new PostgresCache(databaseUrl);
 const queryService = new QueryService(cache);
 
 interface APIResponse {
@@ -156,7 +156,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // GET /fusion-plus/swap/:orderHash - Get swap by order hash
     if (path.match(/^\/fusion-plus\/swap\/0x[a-fA-F0-9]{64}$/)) {
       const orderHash = path.split('/')[3];
-      const swap = cache.getFusionPlusSwap(orderHash);
+      const swap = await cache.getFusionPlusSwap(orderHash);
       if (swap) {
         return sendResponse(res, 200, { success: true, data: swap });
       }
@@ -166,33 +166,33 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // GET /fusion-plus/address/:address - Get swaps by maker/taker address
     if (path.match(/^\/fusion-plus\/address\/0x[a-fA-F0-9]{40}$/)) {
       const address = path.split('/')[3];
-      const swaps = cache.getFusionPlusSwapsByAddress(address);
+      const swaps = await cache.getFusionPlusSwapsByAddress(address);
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion-plus/pending - Get swaps awaiting dst escrow
     if (path === '/fusion-plus/pending') {
-      const swaps = cache.getFusionPlusPending();
+      const swaps = await cache.getFusionPlusPending();
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion-plus/completed - Get fully completed swaps
     if (path === '/fusion-plus/completed') {
-      const swaps = cache.getFusionPlusCompleted();
+      const swaps = await cache.getFusionPlusCompleted();
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion-plus/src-chain/:chainId - Get swaps by source chain
     if (path.match(/^\/fusion-plus\/src-chain\/\d+$/)) {
       const chainId = parseInt(path.split('/')[3]);
-      const swaps = cache.getFusionPlusSwapsBySrcChain(chainId);
+      const swaps = await cache.getFusionPlusSwapsBySrcChain(chainId);
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion-plus/dst-chain/:chainId - Get swaps by destination chain
     if (path.match(/^\/fusion-plus\/dst-chain\/\d+$/)) {
       const chainId = parseInt(path.split('/')[3]);
-      const swaps = cache.getFusionPlusSwapsByDstChain(chainId);
+      const swaps = await cache.getFusionPlusSwapsByDstChain(chainId);
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
@@ -200,7 +200,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (path.match(/^\/transfer\/swap\/\d+\/0x[a-fA-F0-9]{64}$/)) {
       const [, , , chainIdStr, txHash] = path.split('/');
       const chainId = parseInt(chainIdStr);
-      const swap = cache.getSwapForTransfer(chainId, txHash);
+      const swap = await cache.getSwapForTransfer(chainId, txHash);
       return sendResponse(res, 200, { success: true, data: swap });
     }
 
@@ -208,7 +208,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (path.match(/^\/erc20\/fusion-plus\/\d+\/0x[a-fA-F0-9]{40}$/)) {
       const [, , , chainIdStr, address] = path.split('/');
       const chainId = parseInt(chainIdStr);
-      const transfers = cache.getFusionPlusTransfersByAddress(chainId, address);
+      const transfers = await cache.getFusionPlusTransfersByAddress(chainId, address);
       return sendResponse(res, 200, { success: true, data: transfers });
     }
 
@@ -216,7 +216,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (path.match(/^\/erc20\/fusion\/\d+\/0x[a-fA-F0-9]{40}$/)) {
       const [, , , chainIdStr, address] = path.split('/');
       const chainId = parseInt(chainIdStr);
-      const transfers = cache.getFusionPlusTransfersByAddress(chainId, address);
+      const transfers = await cache.getFusionPlusTransfersByAddress(chainId, address);
       return sendResponse(res, 200, { success: true, data: transfers });
     }
 
@@ -227,7 +227,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // GET /fusion/swap/:orderHash - Get swap by order hash
     if (path.match(/^\/fusion\/swap\/0x[a-fA-F0-9]{64}$/)) {
       const orderHash = path.split('/')[3];
-      const swap = cache.getFusionSwap(orderHash);
+      const swap = await cache.getFusionSwap(orderHash);
       if (swap) {
         return sendResponse(res, 200, { success: true, data: swap });
       }
@@ -237,39 +237,39 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // GET /fusion/maker/:address - Get swaps by maker address
     if (path.match(/^\/fusion\/maker\/0x[a-fA-F0-9]{40}$/)) {
       const address = path.split('/')[3];
-      const swaps = cache.getFusionSwapsByMaker(address);
+      const swaps = await cache.getFusionSwapsByMaker(address);
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion/taker/:address - Get swaps by taker address (recipient of output tokens)
     if (path.match(/^\/fusion\/taker\/0x[a-fA-F0-9]{40}$/)) {
       const address = path.split('/')[3];
-      const swaps = cache.getFusionSwapsByTaker(address);
+      const swaps = await cache.getFusionSwapsByTaker(address);
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion/chain/:chainId - Get swaps by chain
     if (path.match(/^\/fusion\/chain\/\d+$/)) {
       const chainId = parseInt(path.split('/')[3]);
-      const swaps = cache.getFusionSwapsByChain(chainId);
+      const swaps = await cache.getFusionSwapsByChain(chainId);
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion/filled - Get filled swaps
     if (path === '/fusion/filled') {
-      const swaps = cache.getFusionSwapsByStatus('filled');
+      const swaps = await cache.getFusionSwapsByStatus('filled');
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion/cancelled - Get cancelled swaps
     if (path === '/fusion/cancelled') {
-      const swaps = cache.getFusionSwapsByStatus('cancelled');
+      const swaps = await cache.getFusionSwapsByStatus('cancelled');
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
     // GET /fusion/recent - Get recent swaps
     if (path === '/fusion/recent') {
-      const swaps = cache.getRecentFusionSwaps();
+      const swaps = await cache.getRecentFusionSwaps();
       return sendResponse(res, 200, { success: true, data: swaps });
     }
 
@@ -277,13 +277,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (path.match(/^\/erc20\/fusion-single\/\d+\/0x[a-fA-F0-9]{40}$/)) {
       const [, , , chainIdStr, address] = path.split('/');
       const chainId = parseInt(chainIdStr);
-      const transfers = cache.getFusionTransfersByAddress(chainId, address);
+      const transfers = await cache.getFusionTransfersByAddress(chainId, address);
       return sendResponse(res, 200, { success: true, data: transfers });
     }
 
     // GET /stats - Get database statistics
     if (path === '/stats') {
-      const stats = cache.getStats();
+      const stats = await cache.getStats();
       return sendResponse(res, 200, { success: true, data: stats });
     }
 
@@ -294,7 +294,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // GET /crypto2fiat/order/:orderId - Get C2F event by order ID
     if (path.match(/^\/crypto2fiat\/order\/0x[a-fA-F0-9]{64}$/)) {
       const orderId = path.split('/')[3];
-      const event = cache.getCrypto2FiatByOrderId(orderId);
+      const event = await cache.getCrypto2FiatByOrderId(orderId);
       if (event) {
         return sendResponse(res, 200, { success: true, data: event });
       }
@@ -304,27 +304,27 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // GET /crypto2fiat/recipient/:address - Get C2F events by recipient
     if (path.match(/^\/crypto2fiat\/recipient\/0x[a-fA-F0-9]{40}$/)) {
       const address = path.split('/')[3];
-      const events = cache.getCrypto2FiatByRecipient(address);
+      const events = await cache.getCrypto2FiatByRecipient(address);
       return sendResponse(res, 200, { success: true, data: events });
     }
 
     // GET /crypto2fiat/chain/:chainId - Get C2F events by chain
     if (path.match(/^\/crypto2fiat\/chain\/\d+$/)) {
       const chainId = parseInt(path.split('/')[3]);
-      const events = cache.getCrypto2FiatByChain(chainId);
+      const events = await cache.getCrypto2FiatByChain(chainId);
       return sendResponse(res, 200, { success: true, data: events });
     }
 
     // GET /crypto2fiat/token/:token - Get C2F events by token
     if (path.match(/^\/crypto2fiat\/token\/0x[a-fA-F0-9]{40}$/)) {
       const token = path.split('/')[3];
-      const events = cache.getCrypto2FiatByToken(token);
+      const events = await cache.getCrypto2FiatByToken(token);
       return sendResponse(res, 200, { success: true, data: events });
     }
 
     // GET /crypto2fiat/recent - Get recent C2F events
     if (path === '/crypto2fiat/recent') {
-      const events = cache.getRecentCrypto2FiatEvents();
+      const events = await cache.getRecentCrypto2FiatEvents();
       return sendResponse(res, 200, { success: true, data: events });
     }
 
@@ -332,7 +332,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (path.match(/^\/erc20\/crypto2fiat\/\d+\/0x[a-fA-F0-9]{40}$/)) {
       const [, , , chainIdStr, address] = path.split('/');
       const chainId = parseInt(chainIdStr);
-      const transfers = cache.getCrypto2FiatTransfersByAddress(chainId, address);
+      const transfers = await cache.getCrypto2FiatTransfersByAddress(chainId, address);
       return sendResponse(res, 200, { success: true, data: transfers });
     }
 
@@ -358,7 +358,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '100') || 100, 1000);
       const direction = (url.searchParams.get('direction') || 'both') as 'from' | 'to' | 'both';
 
-      const result = cache.getERC20TransfersStream(chainId, address, { sinceId, limit, direction });
+      const result = await cache.getERC20TransfersStream(chainId, address, { sinceId, limit, direction });
       return sendResponse(res, 200, { success: true, data: result });
     }
 
@@ -379,7 +379,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           sinceId: item.sinceId || 0
         }));
 
-        const results = cache.getERC20TransfersBatch(
+        const results = await cache.getERC20TransfersBatch(
           chainId,
           queries,
           body.limit || 50,
@@ -408,14 +408,20 @@ function sendResponse(res: http.ServerResponse, statusCode: number, data: APIRes
   res.end(JSON.stringify(data, null, 2));
 }
 
-function startServer(): void {
-  console.log(`✅ SQLite connected: ${sqlitePath}`);
+async function startServer(): Promise<void> {
+  // Test PostgreSQL connection
+  const healthy = await cache.isHealthy();
+  if (!healthy) {
+    console.error('Failed to connect to PostgreSQL');
+    process.exit(1);
+  }
+  console.log(`PostgreSQL connected: ${databaseUrl.replace(/:[^:@]+@/, ':****@')}`);
 
   const PORT = process.env.API_PORT || 3000;
   const server = http.createServer(handleRequest);
 
   server.listen(PORT, () => {
-    console.log(`🚀 API Server running on http://localhost:${PORT}`);
+    console.log(`API Server running on http://localhost:${PORT}`);
     console.log('\nAvailable endpoints:');
     console.log('  GET /networks');
     console.log('  GET /stats');
@@ -426,7 +432,7 @@ function startServer(): void {
     console.log('  GET /erc20/address/:chainId/:address');
     console.log('  GET /erc20/fusion-plus/:chainId/:address');
     console.log('  GET /erc20/fusion-single/:chainId/:address');
-    console.log('\n  Native Transfers (not supported in SQLite mode):');
+    console.log('\n  Native Transfers (not supported):');
     console.log('  GET /native/from/:chainId/:address');
     console.log('  GET /native/to/:chainId/:address');
     console.log('  GET /native/both/:chainId/:from/:to');
@@ -462,18 +468,16 @@ function startServer(): void {
   });
 
   // Graceful shutdown
-  process.on('SIGINT', () => {
-    console.log('\n⏸️  Shutting down API server...');
+  process.on('SIGINT', async () => {
+    console.log('\nShutting down API server...');
     server.close();
-    cache.close();
-    console.log('👋 Shutdown complete');
+    await cache.close();
+    console.log('Shutdown complete');
     process.exit(0);
   });
 }
 
-try {
-  startServer();
-} catch (error: any) {
-  console.error('❌ Failed to start API server:', error);
+startServer().catch((error) => {
+  console.error('Failed to start API server:', error);
   process.exit(1);
-}
+});

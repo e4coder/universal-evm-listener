@@ -30,4 +30,4 @@ console.log('');
 
 // Re-export the query service for programmatic use
 export { QueryService } from './services/queryService';
-export { SQLiteCache } from './cache/sqlite';
+export { PostgresCache } from './cache/postgres';

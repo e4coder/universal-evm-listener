@@ -5,8 +5,8 @@ mod poller;
 mod rpc;
 mod types;
 
-use crate::config::{get_sqlite_path, get_ttl_secs, load_networks};
-use crate::db::DatabaseManager;
+use crate::config::{get_database_url, get_ttl_secs, load_networks};
+use crate::db::Database;
 use crate::poller::ChainPoller;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,11 +37,11 @@ async fn main() {
     info!("Starting Rust Blockchain Listener");
 
     // Load configuration
-    let sqlite_path = get_sqlite_path();
+    let database_url = get_database_url();
     let ttl_secs = get_ttl_secs();
     let networks = load_networks();
 
-    info!("SQLite data directory: {}", sqlite_path);
+    info!("Database: PostgreSQL");
     info!("TTL: {} seconds ({} minutes)", ttl_secs, ttl_secs / 60);
     info!("Networks: {} chains configured", networks.len());
 
@@ -49,28 +49,28 @@ async fn main() {
     let chain_ids: Vec<u32> = networks.iter().map(|n| n.chain_id).collect();
     info!("Chain IDs: {:?}", chain_ids);
 
-    // Open DatabaseManager (creates per-chain SQLite databases + shared database)
-    let db_manager = match DatabaseManager::open(&sqlite_path, &chain_ids) {
+    // Open PostgreSQL database connection pool
+    let db = match Database::new(&database_url).await {
         Ok(db) => Arc::new(db),
         Err(e) => {
-            error!("Failed to open databases: {}", e);
+            error!("Failed to connect to PostgreSQL: {}", e);
             std::process::exit(1);
         }
     };
 
     info!(
-        "Database initialized: {} chain databases + 1 shared database",
+        "PostgreSQL database connected. Schema auto-created for {} chains.",
         chain_ids.len()
     );
 
     // Spawn cleanup task
-    let db_cleanup = Arc::clone(&db_manager);
+    let db_cleanup = Arc::clone(&db);
     let cleanup_handle = tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(60)).await;
 
-            // Clean up old data from all databases
-            match db_cleanup.cleanup_all(ttl_secs) {
+            // Clean up old data from all tables
+            match db_cleanup.cleanup_all(ttl_secs).await {
                 Ok(stats) => {
                     let total_deleted = stats.transfers_deleted
                         + stats.fusion_plus_deleted
@@ -91,16 +91,11 @@ async fn main() {
                 }
             }
 
-            // Force WAL checkpoint on all databases to release memory
-            if let Err(e) = db_cleanup.checkpoint_all() {
-                warn!("WAL checkpoint error: {}", e);
-            }
-
             // Log stats every cleanup cycle
-            let transfer_count = db_cleanup.get_total_transfer_count().unwrap_or(0);
-            let fusion_plus_count = db_cleanup.shared().get_fusion_plus_count().unwrap_or(0);
-            let fusion_count = db_cleanup.shared().get_fusion_swap_count().unwrap_or(0);
-            let crypto2fiat_count = db_cleanup.shared().get_crypto2fiat_count().unwrap_or(0);
+            let transfer_count = db_cleanup.get_total_transfer_count().await.unwrap_or(0);
+            let fusion_plus_count = db_cleanup.get_fusion_plus_count().await.unwrap_or(0);
+            let fusion_count = db_cleanup.get_fusion_swap_count().await.unwrap_or(0);
+            let crypto2fiat_count = db_cleanup.get_crypto2fiat_count().await.unwrap_or(0);
             info!(
                 "Database stats: {} transfers, {} Fusion+ swaps, {} Fusion swaps, {} Crypto2Fiat events",
                 transfer_count, fusion_plus_count, fusion_count, crypto2fiat_count
@@ -112,21 +107,11 @@ async fn main() {
     let mut poller_handles = Vec::new();
 
     for network in networks {
-        // Get chain-specific database
-        let chain_db = match db_manager.chain(network.chain_id) {
-            Some(db) => db,
-            None => {
-                error!("No database for chain {}", network.chain_id);
-                continue;
-            }
-        };
-
-        // Get shared database for cross-chain data
-        let shared_db = db_manager.shared();
+        let db_clone = Arc::clone(&db);
         let chain_name = network.name.to_string();
 
         let handle = tokio::spawn(async move {
-            let mut poller = ChainPoller::new(network, chain_db, shared_db);
+            let mut poller = ChainPoller::new(network, db_clone);
             poller.run().await;
         });
 

@@ -1,4 +1,4 @@
-use crate::db::{ChainDatabase, SharedDatabase};
+use crate::db::Database;
 use crate::fusion::{
     compute_hashlock_from_secret, decode_crypto2fiat_event, decode_dst_escrow_created,
     decode_escrow_withdrawal, decode_order_filled, decode_src_escrow_created,
@@ -44,29 +44,23 @@ impl Default for PollerConfig {
     }
 }
 
-/// Per-chain poller that fetches Transfer events and stores them in SQLite
+/// Per-chain poller that fetches Transfer events and stores them in PostgreSQL
 pub struct ChainPoller {
     network: NetworkConfig,
     rpc: RpcClient,
-    chain_db: Arc<ChainDatabase>,   // Per-chain data (transfers, checkpoint)
-    shared_db: Arc<SharedDatabase>, // Cross-chain data (fusion+, fusion, crypto2fiat)
+    db: Arc<Database>,  // Shared PostgreSQL database
     config: PollerConfig,
     block_timestamp_cache: HashMap<u64, u64>,
 }
 
 impl ChainPoller {
-    pub fn new(
-        network: NetworkConfig,
-        chain_db: Arc<ChainDatabase>,
-        shared_db: Arc<SharedDatabase>,
-    ) -> Self {
-        Self::with_config(network, chain_db, shared_db, PollerConfig::default())
+    pub fn new(network: NetworkConfig, db: Arc<Database>) -> Self {
+        Self::with_config(network, db, PollerConfig::default())
     }
 
     pub fn with_config(
         network: NetworkConfig,
-        chain_db: Arc<ChainDatabase>,
-        shared_db: Arc<SharedDatabase>,
+        db: Arc<Database>,
         config: PollerConfig,
     ) -> Self {
         let rpc = RpcClient::new(&network.rpc_url, network.name);
@@ -74,8 +68,7 @@ impl ChainPoller {
         Self {
             network,
             rpc,
-            chain_db,
-            shared_db,
+            db,
             config,
             block_timestamp_cache: HashMap::new(),
         }
@@ -135,10 +128,11 @@ impl ChainPoller {
             .await
             .map_err(|e| format!("Failed to get block number: {}", e))?;
 
-        // Check for saved checkpoint (now per-chain database)
+        // Check for saved checkpoint
         let saved_checkpoint = self
-            .chain_db
-            .get_checkpoint()
+            .db
+            .get_checkpoint(self.network.chain_id)
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         let start_block = if let Some(checkpoint) = saved_checkpoint {
@@ -155,8 +149,9 @@ impl ChainPoller {
                     self.config.max_backfill_blocks,
                     new_start
                 );
-                self.chain_db
-                    .set_checkpoint(new_start)
+                self.db
+                    .set_checkpoint(self.network.chain_id, new_start)
+                    .await
                     .map_err(|e| format!("DB error: {}", e))?;
                 new_start
             } else {
@@ -173,8 +168,9 @@ impl ChainPoller {
                 "[{}] First start, beginning from block {}",
                 self.network.name, start_block
             );
-            self.chain_db
-                .set_checkpoint(start_block)
+            self.db
+                .set_checkpoint(self.network.chain_id, start_block)
+                .await
                 .map_err(|e| format!("DB error: {}", e))?;
             start_block
         };
@@ -256,10 +252,11 @@ impl ChainPoller {
             transfers.push(transfer);
         }
 
-        // Batch insert to chain-specific SQLite database
+        // Batch insert to PostgreSQL database
         let inserted = if !transfers.is_empty() {
-            self.chain_db
-                .insert_transfers_batch(&transfers)
+            self.db
+                .insert_transfers_batch(self.network.chain_id, &transfers)
+                .await
                 .map_err(|e| format!("DB error: {}", e))?
         } else {
             0
@@ -274,10 +271,11 @@ impl ChainPoller {
         // Fetch and process Crypto2Fiat events from KentuckyDelegate
         let crypto2fiat_events = self.poll_crypto2fiat_events(from_block, actual_to_block).await?;
 
-        // Update checkpoint in chain-specific database
+        // Update checkpoint
         *last_processed_block = actual_to_block;
-        self.chain_db
-            .set_checkpoint(actual_to_block)
+        self.db
+            .set_checkpoint(self.network.chain_id, actual_to_block)
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         Ok(inserted + fusion_plus_events + fusion_events + crypto2fiat_events)
@@ -386,14 +384,16 @@ impl ChainPoller {
             log.log_index_u32(),
         );
 
-        // Insert the swap into shared database
-        self.shared_db
+        // Insert the swap into database
+        self.db
             .insert_fusion_plus_swap(&swap)
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as fusion_plus (in chain-specific database)
-        self.chain_db
-            .label_transfers_as_fusion(&log.transaction_hash, "fusion_plus")
+        // Label all transfers in this tx as fusion_plus
+        self.db
+            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         info!(
@@ -409,8 +409,8 @@ impl ChainPoller {
         let data = decode_dst_escrow_created(&log.data)
             .ok_or_else(|| "Failed to decode DstEscrowCreated data".to_string())?;
 
-        // Update existing swap with destination data in shared database
-        let updated = self.shared_db
+        // Update existing swap with destination data
+        let updated = self.db
             .update_fusion_plus_dst(
                 &data.order_hash,
                 &data,
@@ -421,11 +421,13 @@ impl ChainPoller {
                 log.log_index_u32(),
                 Some(&log.address),
             )
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as fusion_plus (in chain-specific database)
-        self.chain_db
-            .label_transfers_as_fusion(&log.transaction_hash, "fusion_plus")
+        // Label all transfers in this tx as fusion_plus
+        self.db
+            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         if updated {
@@ -452,13 +454,13 @@ impl ChainPoller {
         let hashlock = compute_hashlock_from_secret(&secret)
             .ok_or_else(|| "Failed to compute hashlock from secret".to_string())?;
 
-        // Look up the swap by hashlock and update its status in shared database
-        if let Ok(Some(swap)) = self.shared_db.get_fusion_plus_swap_by_hashlock(&hashlock) {
+        // Look up the swap by hashlock and update its status
+        if let Ok(Some(swap)) = self.db.get_fusion_plus_swap_by_hashlock(&hashlock).await {
             // Determine if this is src or dst withdrawal based on chain_id
             let is_src = swap.src_chain_id == self.network.chain_id;
 
             // Update the swap status with secret and tx details
-            let updated = self.shared_db
+            let updated = self.db
                 .update_fusion_plus_withdrawal_by_hashlock(
                     &hashlock,
                     self.network.chain_id,
@@ -469,6 +471,7 @@ impl ChainPoller {
                     timestamp,
                     log.log_index_u32(),
                 )
+                .await
                 .map_err(|e| format!("DB error: {}", e))?;
 
             if updated {
@@ -480,9 +483,10 @@ impl ChainPoller {
             }
         }
 
-        // Label transfers in this tx as fusion_plus (in chain-specific database)
-        self.chain_db
-            .label_transfers_as_fusion(&log.transaction_hash, "fusion_plus")
+        // Label transfers in this tx as fusion_plus
+        self.db
+            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         debug!(
@@ -495,11 +499,10 @@ impl ChainPoller {
 
     /// Process EscrowCancelled event
     async fn process_escrow_cancelled(&self, log: &Log, _timestamp: u64) -> Result<(), String> {
-        // Similar to withdrawal, we'd need to track escrow addresses to update the swap record
-        // For now, just label the transfers in chain-specific database
-
-        self.chain_db
-            .label_transfers_as_fusion(&log.transaction_hash, "fusion_plus")
+        // Label the transfers
+        self.db
+            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion_plus")
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         debug!(
@@ -584,10 +587,8 @@ impl ChainPoller {
         let remaining_hex = data.remaining.trim_start_matches("0x");
         let is_partial = !remaining_hex.chars().all(|c| c == '0');
 
-        // Try to enrich swap data from transfers in the same transaction
-        let (maker, taker, maker_token, taker_token, maker_amount, taker_amount) =
-            self.extract_swap_details_from_transfers(&log.transaction_hash);
-
+        // For now, we don't have transfer lookup since we'd need a sync query
+        // The maker address comes from the event data
         let swap = FusionSwap {
             order_hash: data.order_hash.clone(),
             chain_id: self.network.chain_id,
@@ -595,77 +596,35 @@ impl ChainPoller {
             block_number: log.block_number_u64(),
             block_timestamp: timestamp,
             log_index: log.log_index_u32(),
-            maker,
-            taker,
-            maker_token,
-            taker_token,
-            maker_amount,
-            taker_amount,
+            maker: data.maker.clone(),
+            taker: None,
+            maker_token: None,
+            taker_token: None,
+            maker_amount: None,
+            taker_amount: None,
             remaining: data.remaining.clone(),
             is_partial_fill: is_partial,
             status: status.to_string(),
         };
 
-        // Insert swap record into shared database
-        self.shared_db
+        // Insert swap record
+        self.db
             .insert_fusion_swap(&swap)
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as 'fusion' (in chain-specific database)
-        self.chain_db
-            .label_transfers_as_fusion(&log.transaction_hash, "fusion")
+        // Label all transfers in this tx as 'fusion'
+        self.db
+            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "fusion")
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         info!(
-            "[{}] Fusion {} order: order_hash={} maker={} taker={:?} tx={}",
-            self.network.name, status, data.order_hash, swap.maker, swap.taker, log.transaction_hash
+            "[{}] Fusion {} order: order_hash={} maker={} tx={}",
+            self.network.name, status, data.order_hash, swap.maker, log.transaction_hash
         );
 
         Ok(())
-    }
-
-    /// Extract swap details (maker, taker, tokens, amounts) from transfers in the same transaction
-    ///
-    /// Returns: (maker, taker, maker_token, taker_token, maker_amount, taker_amount)
-    ///
-    /// Logic based on 1inch Fusion swap mechanics:
-    /// - First ERC20 transfer in the tx = maker sends input token (maker_token)
-    /// - Last ERC20 transfer in the tx = taker receives output token (taker_token)
-    /// - Transfers are ordered by log_index ASC from the database
-    fn extract_swap_details_from_transfers(
-        &self,
-        tx_hash: &str,
-    ) -> (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) {
-        // Get all transfers in this transaction from chain-specific database
-        let transfers = match self.chain_db.get_transfers_by_tx_hash(tx_hash) {
-            Ok(t) => t,
-            Err(_) => return (String::new(), None, None, None, None, None),
-        };
-
-        if transfers.is_empty() {
-            return (String::new(), None, None, None, None, None);
-        }
-
-        // First transfer = maker sends input token
-        let first = &transfers[0];
-        let maker = first.from_addr.clone();
-        let maker_token = first.token.clone();
-        let maker_amount = first.value.clone();
-
-        // Last transfer = taker receives output token
-        let last = &transfers[transfers.len() - 1];
-        let taker = last.to_addr.clone();
-        let taker_token = last.token.clone();
-        let taker_amount = last.value.clone();
-
-        (
-            maker,
-            Some(taker),
-            Some(maker_token),
-            Some(taker_token),
-            Some(maker_amount),
-            Some(taker_amount),
-        )
     }
 
     /// Get block timestamp with caching
@@ -762,14 +721,16 @@ impl ChainPoller {
         event.block_timestamp = timestamp;
         event.log_index = log.log_index_u32();
 
-        // Insert the event into shared database
-        self.shared_db
+        // Insert the event
+        self.db
             .insert_crypto2fiat_event(&event)
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Label all transfers in this tx as crypto_to_fiat (in chain-specific database)
-        self.chain_db
-            .label_transfers_as_fusion(&log.transaction_hash, "crypto_to_fiat")
+        // Label all transfers in this tx as crypto_to_fiat
+        self.db
+            .label_transfers_as_fusion(self.network.chain_id, &log.transaction_hash, "crypto_to_fiat")
+            .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         info!(

@@ -79,9 +79,9 @@ pub fn load_networks() -> Vec<NetworkConfig> {
     ]
 }
 
-/// Get SQLite database path from environment
-pub fn get_sqlite_path() -> String {
-    env::var("SQLITE_PATH").unwrap_or_else(|_| "data/transfers.db".to_string())
+/// Get PostgreSQL database URL from environment
+pub fn get_database_url() -> String {
+    env::var("DATABASE_URL").expect("DATABASE_URL must be set")
 }
 
 /// Get TTL in seconds from environment

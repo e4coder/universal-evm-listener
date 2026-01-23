@@ -250,7 +250,7 @@ impl Database {
              ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
             &[
                 &(chain_id as i32),
-                &transfer.tx_hash,
+                &transfer.tx_hash.to_lowercase(),
                 &(transfer.log_index as i32),
                 &transfer.token.to_lowercase(),
                 &transfer.from_addr.to_lowercase(),
@@ -290,7 +290,7 @@ impl Database {
                 &stmt,
                 &[
                     &(chain_id as i32),
-                    &transfer.tx_hash,
+                    &transfer.tx_hash.to_lowercase(),
                     &(transfer.log_index as i32),
                     &transfer.token.to_lowercase(),
                     &transfer.from_addr.to_lowercase(),

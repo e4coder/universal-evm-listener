@@ -37,8 +37,8 @@ impl Default for PollerConfig {
         Self {
             reorg_safety_blocks: 10,
             confirmation_blocks: 3,
-            poll_interval_ms: 2000,
-            max_blocks_per_query: 50,  // Reduced from 100 to limit memory usage per query
+            poll_interval_ms: 500,   // Reduced from 2000 for real-time sync
+            max_blocks_per_query: 500, // Increased from 50 for faster catch-up
             max_backfill_blocks: 500,
         }
     }

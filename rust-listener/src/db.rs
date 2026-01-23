@@ -42,7 +42,7 @@ impl ChainDatabase {
         let manager = SqliteConnectionManager::file(&path);
 
         let pool = Pool::builder()
-            .max_size(3) // Each chain only needs a few connections
+            .max_size(5) // Increased from 3 for better concurrent write handling
             .min_idle(Some(1))
             .connection_timeout(Duration::from_secs(10))
             .build(manager)?;

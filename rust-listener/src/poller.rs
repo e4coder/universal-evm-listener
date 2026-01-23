@@ -587,8 +587,30 @@ impl ChainPoller {
         let remaining_hex = data.remaining.trim_start_matches("0x");
         let is_partial = !remaining_hex.chars().all(|c| c == '0');
 
-        // For now, we don't have transfer lookup since we'd need a sync query
-        // The maker address comes from the event data
+        // Get first and last transfers to populate maker/taker info
+        // First transfer = maker sends maker_token
+        // Last transfer = taker receives taker_token
+        let (taker, maker_token, taker_token, maker_amount, taker_amount) =
+            match self.db.get_first_last_transfers(self.network.chain_id, &log.transaction_hash).await {
+                Ok(Some((first, last))) => {
+                    (
+                        Some(last.to_addr.clone()),      // taker = recipient of last transfer
+                        Some(first.token.clone()),       // maker_token = token of first transfer
+                        Some(last.token.clone()),        // taker_token = token of last transfer
+                        Some(first.value.clone()),       // maker_amount = value of first transfer
+                        Some(last.value.clone()),        // taker_amount = value of last transfer
+                    )
+                }
+                Ok(None) => {
+                    // No transfers found for this tx (shouldn't happen normally)
+                    (None, None, None, None, None)
+                }
+                Err(e) => {
+                    warn!("[{}] Failed to get transfers for fusion swap: {}", self.network.name, e);
+                    (None, None, None, None, None)
+                }
+            };
+
         let swap = FusionSwap {
             order_hash: data.order_hash.clone(),
             chain_id: self.network.chain_id,
@@ -597,11 +619,11 @@ impl ChainPoller {
             block_timestamp: timestamp,
             log_index: log.log_index_u32(),
             maker: data.maker.clone(),
-            taker: None,
-            maker_token: None,
-            taker_token: None,
-            maker_amount: None,
-            taker_amount: None,
+            taker,
+            maker_token,
+            taker_token,
+            maker_amount,
+            taker_amount,
             remaining: data.remaining.clone(),
             is_partial_fill: is_partial,
             status: status.to_string(),
@@ -620,8 +642,8 @@ impl ChainPoller {
             .map_err(|e| format!("DB error: {}", e))?;
 
         info!(
-            "[{}] Fusion {} order: order_hash={} maker={} tx={}",
-            self.network.name, status, data.order_hash, swap.maker, log.transaction_hash
+            "[{}] Fusion {} order: order_hash={} maker={} taker={:?} tx={}",
+            self.network.name, status, data.order_hash, swap.maker, swap.taker, log.transaction_hash
         );
 
         Ok(())

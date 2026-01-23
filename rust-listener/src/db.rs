@@ -392,6 +392,62 @@ impl Database {
         Ok(result as usize)
     }
 
+    /// Get first and last transfers for a transaction (by log_index)
+    /// Returns (first_transfer, last_transfer) for populating swap maker/taker info
+    pub async fn get_first_last_transfers(&self, chain_id: u32, tx_hash: &str) -> Result<Option<(Transfer, Transfer)>, DbError> {
+        let client = self.pool.get().await?;
+        let tx_hash_lower = tx_hash.to_lowercase();
+
+        // Get first transfer (lowest log_index)
+        let first_row = client.query_opt(
+            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp
+             FROM transfers
+             WHERE chain_id = $1 AND tx_hash = $2
+             ORDER BY log_index ASC
+             LIMIT 1",
+            &[&(chain_id as i32), &tx_hash_lower],
+        ).await?;
+
+        // Get last transfer (highest log_index)
+        let last_row = client.query_opt(
+            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp
+             FROM transfers
+             WHERE chain_id = $1 AND tx_hash = $2
+             ORDER BY log_index DESC
+             LIMIT 1",
+            &[&(chain_id as i32), &tx_hash_lower],
+        ).await?;
+
+        match (first_row, last_row) {
+            (Some(first), Some(last)) => {
+                let first_transfer = Transfer {
+                    chain_id,
+                    tx_hash: first.get(0),
+                    log_index: first.get::<_, i32>(1) as u32,
+                    token: first.get(2),
+                    from_addr: first.get(3),
+                    to_addr: first.get(4),
+                    value: first.get(5),
+                    block_number: first.get::<_, i64>(6) as u64,
+                    block_timestamp: first.get::<_, i64>(7) as u64,
+                };
+                let last_transfer = Transfer {
+                    chain_id,
+                    tx_hash: last.get(0),
+                    log_index: last.get::<_, i32>(1) as u32,
+                    token: last.get(2),
+                    from_addr: last.get(3),
+                    to_addr: last.get(4),
+                    value: last.get(5),
+                    block_number: last.get::<_, i64>(6) as u64,
+                    block_timestamp: last.get::<_, i64>(7) as u64,
+                };
+                Ok(Some((first_transfer, last_transfer)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     // =========================================================================
     // Fusion+ Methods
     // =========================================================================

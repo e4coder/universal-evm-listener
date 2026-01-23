@@ -588,12 +588,13 @@ impl ChainPoller {
         let is_partial = !remaining_hex.chars().all(|c| c == '0');
 
         // Get first and last transfers to populate maker/taker info
-        // First transfer = maker sends maker_token
-        // Last transfer = taker receives taker_token
-        let (taker, maker_token, taker_token, maker_amount, taker_amount) =
+        // First transfer = maker sends maker_token (maker = from_addr of first transfer)
+        // Last transfer = taker receives taker_token (taker = to_addr of last transfer)
+        let (maker, taker, maker_token, taker_token, maker_amount, taker_amount) =
             match self.db.get_first_last_transfers(self.network.chain_id, &log.transaction_hash).await {
                 Ok(Some((first, last))) => {
                     (
+                        first.from_addr.clone(),         // maker = sender of first transfer
                         Some(last.to_addr.clone()),      // taker = recipient of last transfer
                         Some(first.token.clone()),       // maker_token = token of first transfer
                         Some(last.token.clone()),        // taker_token = token of last transfer
@@ -603,11 +604,11 @@ impl ChainPoller {
                 }
                 Ok(None) => {
                     // No transfers found for this tx (shouldn't happen normally)
-                    (None, None, None, None, None)
+                    (String::new(), None, None, None, None, None)
                 }
                 Err(e) => {
                     warn!("[{}] Failed to get transfers for fusion swap: {}", self.network.name, e);
-                    (None, None, None, None, None)
+                    (String::new(), None, None, None, None, None)
                 }
             };
 
@@ -618,7 +619,7 @@ impl ChainPoller {
             block_number: log.block_number_u64(),
             block_timestamp: timestamp,
             log_index: log.log_index_u32(),
-            maker: data.maker.clone(),
+            maker,
             taker,
             maker_token,
             taker_token,

@@ -14,6 +14,55 @@ interface APIResponse {
   error?: string;
 }
 
+// Parse JSON body from POST request
+async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk: Buffer) => body += chunk.toString());
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+// Validate batch request
+function validateBatchRequest(body: any): { valid: boolean; error?: string } {
+  if (!body.addresses || !Array.isArray(body.addresses)) {
+    return { valid: false, error: 'addresses array is required' };
+  }
+  if (body.addresses.length > 500) {
+    return { valid: false, error: 'Maximum 500 addresses allowed per request' };
+  }
+  if (body.addresses.length === 0) {
+    return { valid: false, error: 'At least one address is required' };
+  }
+
+  const addressRegex = /^0x[a-fA-F0-9]{40}$/;
+  for (const item of body.addresses) {
+    if (!item.address || !addressRegex.test(item.address)) {
+      return { valid: false, error: `Invalid address format: ${item.address}` };
+    }
+    if (item.sinceId !== undefined && (typeof item.sinceId !== 'number' || item.sinceId < 0)) {
+      return { valid: false, error: `Invalid sinceId for ${item.address}` };
+    }
+  }
+
+  if (body.limit !== undefined && (typeof body.limit !== 'number' || body.limit < 1 || body.limit > 100)) {
+    return { valid: false, error: 'limit must be between 1 and 100' };
+  }
+
+  if (body.direction !== undefined && !['from', 'to', 'both'].includes(body.direction)) {
+    return { valid: false, error: 'direction must be "from", "to", or "both"' };
+  }
+
+  return { valid: true };
+}
+
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -287,6 +336,65 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return sendResponse(res, 200, { success: true, data: transfers });
     }
 
+    // =========================================================================
+    // Streaming/Batch Endpoints (since_id pagination)
+    // =========================================================================
+
+    // OPTIONS - CORS preflight for POST requests
+    if (req.method === 'OPTIONS') {
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    // GET /erc20/stream/:chainId/:address - Stream transfers with since_id
+    if (req.method === 'GET' && path.match(/^\/erc20\/stream\/\d+\/0x[a-fA-F0-9]{40}$/)) {
+      const [, , , chainIdStr, address] = path.split('/');
+      const chainId = parseInt(chainIdStr);
+
+      const sinceId = parseInt(url.searchParams.get('since_id') || '0') || 0;
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '100') || 100, 1000);
+      const direction = (url.searchParams.get('direction') || 'both') as 'from' | 'to' | 'both';
+
+      const result = cache.getERC20TransfersStream(chainId, address, { sinceId, limit, direction });
+      return sendResponse(res, 200, { success: true, data: result });
+    }
+
+    // POST /erc20/batch/:chainId - Batch address fetching
+    if (req.method === 'POST' && path.match(/^\/erc20\/batch\/\d+$/)) {
+      const chainId = parseInt(path.split('/')[3]);
+
+      try {
+        const body = await parseJsonBody(req);
+        const validation = validateBatchRequest(body);
+
+        if (!validation.valid) {
+          return sendResponse(res, 400, { success: false, error: validation.error });
+        }
+
+        const queries = body.addresses.map((item: any) => ({
+          address: item.address,
+          sinceId: item.sinceId || 0
+        }));
+
+        const results = cache.getERC20TransfersBatch(
+          chainId,
+          queries,
+          body.limit || 50,
+          body.direction || 'both'
+        );
+
+        return sendResponse(res, 200, {
+          success: true,
+          data: { results, timestamp: Math.floor(Date.now() / 1000) }
+        });
+      } catch (error: any) {
+        return sendResponse(res, 400, { success: false, error: error.message });
+      }
+    }
+
     // 404 Not Found
     return sendResponse(res, 404, { success: false, error: 'Endpoint not found' });
   } catch (error: any) {
@@ -348,6 +456,9 @@ function startServer(): void {
     console.log('  GET /crypto2fiat/token/:token');
     console.log('  GET /crypto2fiat/recent');
     console.log('  GET /erc20/crypto2fiat/:chainId/:address');
+    console.log('\n  Streaming/Batch (since_id pagination):');
+    console.log('  GET  /erc20/stream/:chainId/:address?since_id=X&limit=Y&direction=both');
+    console.log('  POST /erc20/batch/:chainId  (body: {addresses: [{address, sinceId}], limit, direction})');
   });
 
   // Graceful shutdown

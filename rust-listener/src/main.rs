@@ -6,7 +6,7 @@ mod rpc;
 mod types;
 
 use crate::config::{get_sqlite_path, get_ttl_secs, load_networks};
-use crate::db::Database;
+use crate::db::DatabaseManager;
 use crate::poller::ChainPoller;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,32 +41,49 @@ async fn main() {
     let ttl_secs = get_ttl_secs();
     let networks = load_networks();
 
-    info!("SQLite path: {}", sqlite_path);
+    info!("SQLite data directory: {}", sqlite_path);
     info!("TTL: {} seconds ({} minutes)", ttl_secs, ttl_secs / 60);
     info!("Networks: {} chains configured", networks.len());
 
-    // Open SQLite database
-    let db = match Database::open(&sqlite_path) {
+    // Get chain IDs from networks
+    let chain_ids: Vec<u32> = networks.iter().map(|n| n.chain_id).collect();
+    info!("Chain IDs: {:?}", chain_ids);
+
+    // Open DatabaseManager (creates per-chain SQLite databases + shared database)
+    let db_manager = match DatabaseManager::open(&sqlite_path, &chain_ids) {
         Ok(db) => Arc::new(db),
         Err(e) => {
-            error!("Failed to open database: {}", e);
+            error!("Failed to open databases: {}", e);
             std::process::exit(1);
         }
     };
 
-    info!("Database initialized");
+    info!(
+        "Database initialized: {} chain databases + 1 shared database",
+        chain_ids.len()
+    );
 
     // Spawn cleanup task
-    let db_cleanup = Arc::clone(&db);
+    let db_cleanup = Arc::clone(&db_manager);
     let cleanup_handle = tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(60)).await;
 
-            // Clean up old transfers
-            match db_cleanup.cleanup_old(ttl_secs) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        info!("Cleanup: removed {} old transfers", deleted);
+            // Clean up old data from all databases
+            match db_cleanup.cleanup_all(ttl_secs) {
+                Ok(stats) => {
+                    let total_deleted = stats.transfers_deleted
+                        + stats.fusion_plus_deleted
+                        + stats.fusion_deleted
+                        + stats.crypto2fiat_deleted;
+                    if total_deleted > 0 {
+                        info!(
+                            "Cleanup: removed {} transfers, {} Fusion+ swaps, {} Fusion swaps, {} Crypto2Fiat events",
+                            stats.transfers_deleted,
+                            stats.fusion_plus_deleted,
+                            stats.fusion_deleted,
+                            stats.crypto2fiat_deleted
+                        );
                     }
                 }
                 Err(e) => {
@@ -74,29 +91,19 @@ async fn main() {
                 }
             }
 
-            // Clean up old Fusion+ swaps
-            match db_cleanup.cleanup_old_fusion_plus(ttl_secs) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        info!("Cleanup: removed {} old Fusion+ swaps", deleted);
-                    }
-                }
-                Err(e) => {
-                    warn!("Fusion+ cleanup error: {}", e);
-                }
-            }
-
-            // Force WAL checkpoint to release memory after cleanup
-            if let Err(e) = db_cleanup.checkpoint() {
+            // Force WAL checkpoint on all databases to release memory
+            if let Err(e) = db_cleanup.checkpoint_all() {
                 warn!("WAL checkpoint error: {}", e);
             }
 
             // Log stats every cleanup cycle
-            let transfer_count = db_cleanup.get_transfer_count().unwrap_or(0);
-            let fusion_count = db_cleanup.get_fusion_plus_count().unwrap_or(0);
+            let transfer_count = db_cleanup.get_total_transfer_count().unwrap_or(0);
+            let fusion_plus_count = db_cleanup.shared().get_fusion_plus_count().unwrap_or(0);
+            let fusion_count = db_cleanup.shared().get_fusion_swap_count().unwrap_or(0);
+            let crypto2fiat_count = db_cleanup.shared().get_crypto2fiat_count().unwrap_or(0);
             info!(
-                "Database stats: {} transfers, {} Fusion+ swaps stored",
-                transfer_count, fusion_count
+                "Database stats: {} transfers, {} Fusion+ swaps, {} Fusion swaps, {} Crypto2Fiat events",
+                transfer_count, fusion_plus_count, fusion_count, crypto2fiat_count
             );
         }
     });
@@ -105,11 +112,21 @@ async fn main() {
     let mut poller_handles = Vec::new();
 
     for network in networks {
-        let db_clone = Arc::clone(&db);
+        // Get chain-specific database
+        let chain_db = match db_manager.chain(network.chain_id) {
+            Some(db) => db,
+            None => {
+                error!("No database for chain {}", network.chain_id);
+                continue;
+            }
+        };
+
+        // Get shared database for cross-chain data
+        let shared_db = db_manager.shared();
         let chain_name = network.name.to_string();
 
         let handle = tokio::spawn(async move {
-            let mut poller = ChainPoller::new(network, db_clone);
+            let mut poller = ChainPoller::new(network, chain_db, shared_db);
             poller.run().await;
         });
 

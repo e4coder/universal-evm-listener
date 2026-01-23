@@ -14,7 +14,7 @@ module.exports = {
       max_memory_restart: '500M',
       env: {
         ALCHEMY_API_KEY: process.env.ALCHEMY_API_KEY,
-        SQLITE_PATH: path.join(baseDir, 'data', 'transfers.db'),
+        DATABASE_URL: process.env.DATABASE_URL || 'postgres://erc20cache:erc20cache_pass@localhost:5433/erc20cache',
         TTL_SECS: '600',
         LOG_LEVEL: 'info',
       },
@@ -36,7 +36,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         API_PORT: 5459,
-        SQLITE_PATH: path.join(baseDir, 'data', 'transfers.db'),
+        DATABASE_URL: process.env.DATABASE_URL || 'postgres://erc20cache:erc20cache_pass@localhost:5433/erc20cache',
       },
       error_file: path.join(baseDir, 'logs', 'api-error.log'),
       out_file: path.join(baseDir, 'logs', 'api-out.log'),

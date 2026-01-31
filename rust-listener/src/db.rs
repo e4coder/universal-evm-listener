@@ -39,6 +39,13 @@ impl Database {
         cfg.password = config.get_password().map(|s| String::from_utf8_lossy(s).to_string());
         cfg.dbname = config.get_dbname().map(|s| s.to_string());
 
+        // Limit pool size to prevent unbounded connection growth
+        // 13 chains + 1 cleanup task = 14 concurrent users; pool size 24 gives headroom
+        cfg.pool = Some(deadpool_postgres::PoolConfig {
+            max_size: 24,
+            ..Default::default()
+        });
+
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| DbError::Config(e.to_string()))?;

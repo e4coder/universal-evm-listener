@@ -211,29 +211,29 @@ impl ChainPoller {
         // =========================================================================
         // PHASE 1: Fetch fusion/crypto2fiat logs and build swap_type map
         // =========================================================================
-        let mut swap_type_map: HashMap<String, String> = HashMap::new();
+        let mut swap_type_map: HashMap<String, &'static str> = HashMap::new();
 
         // Fetch Fusion+ logs (factory + escrow events)
         let (fusion_plus_factory_logs, fusion_plus_escrow_logs) =
             self.fetch_fusion_plus_logs(from_block, actual_to_block).await?;
 
         for log in &fusion_plus_factory_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus".to_string());
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
         }
         for log in &fusion_plus_escrow_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus".to_string());
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
         }
 
         // Fetch Fusion (single-chain) logs
         let fusion_logs = self.fetch_fusion_logs(from_block, actual_to_block).await?;
         for log in &fusion_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion".to_string());
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion");
         }
 
         // Fetch Crypto2Fiat logs
         let crypto2fiat_logs = self.fetch_crypto2fiat_logs(from_block, actual_to_block).await?;
         for log in &crypto2fiat_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "crypto_to_fiat".to_string());
+            swap_type_map.insert(log.transaction_hash.to_lowercase(), "crypto_to_fiat");
         }
 
         // =========================================================================
@@ -268,7 +268,7 @@ impl ChainPoller {
             let timestamp = self.get_block_timestamp(block_number).await?;
 
             // Look up swap_type from the map
-            let swap_type = swap_type_map.get(&log.transaction_hash.to_lowercase()).cloned();
+            let swap_type = swap_type_map.get(&log.transaction_hash.to_lowercase()).map(|s| s.to_string());
 
             let transfer = Transfer {
                 chain_id: self.network.chain_id,
@@ -747,10 +747,14 @@ impl ChainPoller {
 
     /// Clean up old entries from timestamp cache
     fn cleanup_timestamp_cache(&mut self, current_block: u64) {
-        // Keep only blocks within the last 200 blocks
         let cutoff = current_block.saturating_sub(200);
+        let before = self.block_timestamp_cache.len();
         self.block_timestamp_cache
             .retain(|&block, _| block >= cutoff);
+        // Reclaim memory if we removed entries
+        if self.block_timestamp_cache.len() < before {
+            self.block_timestamp_cache.shrink_to_fit();
+        }
     }
 
     // =========================================================================

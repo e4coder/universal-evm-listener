@@ -54,6 +54,7 @@ impl RpcClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))  // Increased from 30s for large getLogs queries
             .pool_max_idle_per_host(2)         // Reduced from 5 to save memory
+            .pool_idle_timeout(Duration::from_secs(30)) // Release idle connections after 30s
             .build()
             .expect("Failed to create HTTP client");
 

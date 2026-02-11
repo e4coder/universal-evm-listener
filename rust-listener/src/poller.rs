@@ -12,11 +12,12 @@ use crate::types::{
     ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC,
     CRYPTO2FIAT_TOPIC,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio::time::{sleep, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the chain poller
@@ -31,6 +32,10 @@ pub struct PollerConfig {
     pub max_blocks_per_query: u64,
     /// Maximum blocks to backfill on startup
     pub max_backfill_blocks: u64,
+    /// Maximum number of concurrent in-flight fetches
+    pub max_concurrent_fetches: usize,
+    /// Bounded channel capacity for fetcher->processor communication
+    pub channel_capacity: usize,
 }
 
 impl Default for PollerConfig {
@@ -38,11 +43,21 @@ impl Default for PollerConfig {
         Self {
             reorg_safety_blocks: 10,
             confirmation_blocks: 3,
-            poll_interval_ms: 500,   // Reduced from 2000 for real-time sync
-            max_blocks_per_query: 500, // Increased from 50 for faster catch-up
+            poll_interval_ms: 500,
+            max_blocks_per_query: 500,
             max_backfill_blocks: 500,
+            max_concurrent_fetches: 3,
+            channel_capacity: 6,
         }
     }
+}
+
+/// Config subset passed to the standalone fetcher_loop
+struct FetcherConfig {
+    max_blocks_per_query: u64,
+    confirmation_blocks: u64,
+    max_concurrent_fetches: usize,
+    poll_interval_ms: u64,
 }
 
 /// Data fetched from RPC for a block range (all owned, Send-safe for tokio::spawn)
@@ -54,6 +69,13 @@ struct FetchedData {
     fusion_logs: Vec<Log>,
     crypto2fiat_logs: Vec<Log>,
     transfer_logs: Vec<Log>,
+}
+
+/// Check if an error string indicates a response-too-large or timeout error
+fn is_adaptive_step_error(err: &str) -> bool {
+    let err_lower = err.to_lowercase();
+    err_lower.contains("too big") || err_lower.contains("too large") || err.contains("-32008")
+        || err_lower.contains("timed out") || err_lower.contains("timeout")
 }
 
 /// Fetch all logs for a block range with all 5 RPC calls in parallel.
@@ -113,15 +135,148 @@ async fn fetch_all_logs(
     })
 }
 
+// =============================================================================
+// Fetcher Loop (Producer) - standalone function, spawned as independent task
+// =============================================================================
+
+/// Continuously fetches block ranges and sends results to the processor via channel.
+/// Manages its own adaptive block step and concurrent in-flight fetches.
+async fn fetcher_loop(
+    rpc: Arc<RpcClient>,
+    chain_id: u32,
+    chain_name: &'static str,
+    start_from: u64,
+    config: FetcherConfig,
+    tx: mpsc::Sender<FetchedData>,
+) {
+    let mut next_from = start_from + 1;
+    let mut step = config.max_blocks_per_query;
+    let mut join_set: JoinSet<(u64, u64, Result<FetchedData, String>)> = JoinSet::new();
+    let mut pending_ranges: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut cached_safe_tip: u64 = 0;
+    let mut tip_fetched_at = Instant::now() - Duration::from_secs(10); // force initial refresh
+    let poll_interval = Duration::from_millis(config.poll_interval_ms);
+
+    info!("[{}] Fetcher started, initial step: {}", chain_name, step);
+
+    loop {
+        // 1. Refresh chain tip if stale (>2s) or caught up with no work
+        let caught_up = next_from > cached_safe_tip
+            && pending_ranges.is_empty()
+            && join_set.is_empty();
+        let stale = tip_fetched_at.elapsed() > Duration::from_secs(2);
+
+        if stale || caught_up {
+            match rpc.get_block_number().await {
+                Ok(tip) => {
+                    cached_safe_tip = tip.saturating_sub(config.confirmation_blocks);
+                    tip_fetched_at = Instant::now();
+                }
+                Err(e) => {
+                    error!("[{}] Fetcher: failed to get block number: {}", chain_name, e);
+                    sleep(poll_interval).await;
+                    continue;
+                }
+            }
+        }
+
+        // 2. Fill JoinSet to max_concurrent from pending_ranges or new ranges
+        while join_set.len() < config.max_concurrent_fetches {
+            let range = if let Some(range) = pending_ranges.pop_front() {
+                // Retry range from failed fetch (already sized to reduced step)
+                Some(range)
+            } else if next_from <= cached_safe_tip {
+                // Generate new range
+                let to = (next_from + step - 1).min(cached_safe_tip);
+                let range = (next_from, to);
+                next_from = to + 1;
+                Some(range)
+            } else {
+                None // caught up
+            };
+
+            match range {
+                Some((from, to)) => {
+                    let rpc_clone = Arc::clone(&rpc);
+                    join_set.spawn(async move {
+                        let result = fetch_all_logs(rpc_clone, chain_id, chain_name, from, to).await;
+                        (from, to, result)
+                    });
+                }
+                None => break,
+            }
+        }
+
+        // 3. If nothing in-flight, we're caught up - sleep and retry
+        if join_set.is_empty() {
+            sleep(poll_interval).await;
+            continue;
+        }
+
+        // 4. Wait for any fetch to complete
+        let Some(join_result) = join_set.join_next().await else {
+            continue;
+        };
+
+        match join_result {
+            Ok((from, to, Ok(data))) => {
+                debug!(
+                    "[{}] Fetcher: completed blocks {}-{} ({} transfer logs)",
+                    chain_name, from, to, data.transfer_logs.len()
+                );
+                // Success: send to processor (blocks if channel full = backpressure)
+                if tx.send(data).await.is_err() {
+                    info!("[{}] Fetcher: processor channel closed, shutting down", chain_name);
+                    return;
+                }
+                // Increase step toward max on success
+                if step < config.max_blocks_per_query {
+                    step = (step * 2).min(config.max_blocks_per_query);
+                    info!("[{}] Fetcher: increased step to {}", chain_name, step);
+                }
+            }
+            Ok((from, to, Err(e))) => {
+                // Fetch failed
+                if is_adaptive_step_error(&e) {
+                    let old_step = step;
+                    step = (step / 2).max(1);
+                    warn!(
+                        "[{}] Fetcher: reducing step {} -> {} for blocks {}-{}: {}",
+                        chain_name, old_step, step, from, to, e
+                    );
+                } else {
+                    error!(
+                        "[{}] Fetcher: error for blocks {}-{}: {}",
+                        chain_name, from, to, e
+                    );
+                }
+
+                // Re-split the failed range with the new (potentially smaller) step
+                let mut f = from;
+                while f <= to {
+                    let t = (f + step - 1).min(to);
+                    pending_ranges.push_back((f, t));
+                    f = t + 1;
+                }
+            }
+            Err(join_err) => {
+                error!("[{}] Fetcher: task panicked: {}", chain_name, join_err);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ChainPoller - owns DB, RPC, config; runs processor loop
+// =============================================================================
+
 /// Per-chain poller that fetches Transfer events and stores them in PostgreSQL
 pub struct ChainPoller {
     network: NetworkConfig,
     rpc: Arc<RpcClient>,
-    db: Arc<Database>,  // Shared PostgreSQL database
+    db: Arc<Database>,
     config: PollerConfig,
     block_timestamp_cache: HashMap<u64, u64>,
-    /// Adaptive block step: starts at max_blocks_per_query, halves on "too big" errors
-    current_block_step: u64,
 }
 
 impl ChainPoller {
@@ -136,35 +291,25 @@ impl ChainPoller {
     ) -> Self {
         let rpc = Arc::new(RpcClient::new(&network.rpc_url, network.name));
 
-        let initial_block_step = config.max_blocks_per_query;
         Self {
             network,
             rpc,
             db,
             config,
             block_timestamp_cache: HashMap::new(),
-            current_block_step: initial_block_step,
         }
     }
 
-    /// Check if an error string indicates a response-too-large or timeout error
-    fn is_adaptive_step_error(err: &str) -> bool {
-        let err_lower = err.to_lowercase();
-        err_lower.contains("too big") || err_lower.contains("too large") || err.contains("-32008")
-            || err_lower.contains("timed out") || err_lower.contains("timeout")
-    }
-
-    /// Run the poller loop with pipeline architecture:
-    /// While processing cycle N (DB insert + fusion + checkpoint),
-    /// concurrently prefetch cycle N+1's RPC data.
+    /// Run the poller with decoupled producer-consumer architecture.
+    /// Spawns a fetcher task (producer) and runs a processor loop (consumer).
     pub async fn run(&mut self) {
         info!(
             "[{}] Starting poller (chain_id: {})",
             self.network.name, self.network.chain_id
         );
 
-        // Get starting block
-        let mut last_processed_block = match self.initialize_checkpoint().await {
+        // Get starting block from checkpoint
+        let last_processed_block = match self.initialize_checkpoint().await {
             Ok(block) => block,
             Err(e) => {
                 error!("[{}] Failed to initialize: {}", self.network.name, e);
@@ -177,171 +322,185 @@ impl ChainPoller {
             self.network.name, last_processed_block
         );
 
-        // Prefetch handle for pipeline: holds the next cycle's RPC data
-        let mut prefetch_handle: Option<JoinHandle<Result<FetchedData, String>>> = None;
+        // Create bounded channel (backpressure)
+        let (tx, rx) = mpsc::channel::<FetchedData>(self.config.channel_capacity);
 
-        // Main polling loop
+        // Build fetcher config
+        let fetcher_config = FetcherConfig {
+            max_blocks_per_query: self.config.max_blocks_per_query,
+            confirmation_blocks: self.config.confirmation_blocks,
+            max_concurrent_fetches: self.config.max_concurrent_fetches,
+            poll_interval_ms: self.config.poll_interval_ms,
+        };
+
+        // Spawn fetcher as independent task
+        let rpc_clone = Arc::clone(&self.rpc);
+        let chain_id = self.network.chain_id;
+        let chain_name = self.network.name;
+        let fetcher_handle = tokio::spawn(async move {
+            fetcher_loop(
+                rpc_clone, chain_id, chain_name,
+                last_processed_block, fetcher_config, tx,
+            ).await;
+        });
+
+        // Run processor on current task (needs &mut self for timestamp cache)
+        self.processor_loop(rx, last_processed_block).await;
+
+        // If processor exits, abort fetcher
+        fetcher_handle.abort();
+        info!("[{}] Poller stopped", self.network.name);
+    }
+
+    // =========================================================================
+    // Processor Loop (Consumer)
+    // =========================================================================
+
+    /// Receives fetched data from channel, buffers in BTreeMap, processes in
+    /// contiguous block order, and advances checkpoint only when there are no gaps.
+    async fn processor_loop(
+        &mut self,
+        mut rx: mpsc::Receiver<FetchedData>,
+        start_from: u64,
+    ) {
+        let mut buffer: BTreeMap<u64, FetchedData> = BTreeMap::new();
+        let mut expected_from: u64 = start_from + 1;
+        let mut retry_counts: HashMap<u64, u32> = HashMap::new();
+
+        info!(
+            "[{}] Processor started, expecting blocks from {}",
+            self.network.name, expected_from
+        );
+
         loop {
-            // ===== STEP 1: Get chain tip and compute block range =====
-            let current_block = match self.rpc.get_block_number().await {
-                Ok(b) => b,
-                Err(e) => {
-                    error!("[{}] Failed to get block number: {}", self.network.name, e);
-                    // Discard stale prefetch
-                    if let Some(handle) = prefetch_handle.take() {
-                        handle.abort();
+            // 1. Drain all immediately available items from channel into buffer
+            let mut channel_disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(data) => {
+                        buffer.insert(data.from_block, data);
                     }
-                    sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
-                    continue;
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        channel_disconnected = true;
+                        break;
+                    }
                 }
-            };
-
-            let safe_to_block = current_block.saturating_sub(self.config.confirmation_blocks);
-            let from_block = (last_processed_block + 1).max(
-                last_processed_block
-                    .saturating_sub(self.config.reorg_safety_blocks)
-                    + 1,
-            );
-
-            // Skip if no new blocks
-            if from_block > safe_to_block {
-                // Discard stale prefetch
-                if let Some(handle) = prefetch_handle.take() {
-                    handle.abort();
-                }
-                sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
-                continue;
             }
 
-            let actual_to_block = (from_block + self.current_block_step - 1).min(safe_to_block);
+            // 2. Process contiguous ranges from buffer
+            let mut processed_any = false;
+            loop {
+                let data = match buffer.remove(&expected_from) {
+                    Some(d) => d,
+                    None => break, // no contiguous data available
+                };
 
-            debug!(
-                "[{}] Polling blocks {} to {} (current: {})",
-                self.network.name, from_block, actual_to_block, current_block
-            );
+                match self.process_fetched_data(&data).await {
+                    Ok(events) => {
+                        // Set checkpoint after successful processing
+                        match self.db.set_checkpoint(self.network.chain_id, data.to_block).await {
+                            Ok(_) => {
+                                if events > 0 {
+                                    debug!(
+                                        "[{}] Processed {} events, checkpoint: {}",
+                                        self.network.name, events, data.to_block
+                                    );
+                                }
+                                expected_from = data.to_block + 1;
+                                processed_any = true;
+                                retry_counts.remove(&data.from_block);
+                                self.cleanup_timestamp_cache(data.to_block);
+                                // data is dropped here (success)
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[{}] Failed to set checkpoint at {}: {}",
+                                    self.network.name, data.to_block, e
+                                );
+                                // Re-insert data for retry
+                                buffer.insert(data.from_block, data);
+                                sleep(Duration::from_secs(1)).await;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let from = data.from_block;
+                        let to = data.to_block;
+                        let attempts = retry_counts.entry(from).or_insert(0);
+                        *attempts += 1;
 
-            // ===== STEP 2: Get fetch result (from prefetch or fresh fetch) =====
-            let fetch_result = if let Some(handle) = prefetch_handle.take() {
-                match handle.await {
-                    Ok(Ok(data)) if data.from_block == from_block => {
-                        // Prefetch matches expected range, use it
-                        debug!(
-                            "[{}] Using prefetched data for blocks {}-{}",
-                            self.network.name, data.from_block, data.to_block
-                        );
-                        Ok(data)
-                    }
-                    Ok(Ok(_)) => {
-                        // Range mismatch (step changed or error recovery), fetch fresh
-                        debug!(
-                            "[{}] Prefetch range mismatch, fetching fresh",
-                            self.network.name
-                        );
-                        fetch_all_logs(
-                            Arc::clone(&self.rpc), self.network.chain_id,
-                            self.network.name, from_block, actual_to_block,
-                        ).await
-                    }
-                    Ok(Err(e)) => {
-                        // Prefetch failed, try fresh fetch
-                        debug!(
-                            "[{}] Prefetch failed ({}), fetching fresh",
-                            self.network.name, e
-                        );
-                        fetch_all_logs(
-                            Arc::clone(&self.rpc), self.network.chain_id,
-                            self.network.name, from_block, actual_to_block,
-                        ).await
-                    }
-                    Err(_join_err) => {
-                        // Task panicked or was cancelled, fetch fresh
-                        fetch_all_logs(
-                            Arc::clone(&self.rpc), self.network.chain_id,
-                            self.network.name, from_block, actual_to_block,
-                        ).await
+                        if *attempts > 10 {
+                            // Give up on this range after 10 retries
+                            error!(
+                                "[{}] GIVING UP on blocks {}-{} after {} attempts: {}",
+                                self.network.name, from, to, attempts, e
+                            );
+                            expected_from = to + 1;
+                            retry_counts.remove(&from);
+                            // Update checkpoint to skip past this range
+                            let _ = self.db.set_checkpoint(self.network.chain_id, to).await;
+                            // data is dropped (skipped)
+                        } else {
+                            error!(
+                                "[{}] Process error for blocks {}-{} (attempt {}): {}",
+                                self.network.name, from, to, attempts, e
+                            );
+                            // Re-insert data for retry
+                            buffer.insert(data.from_block, data);
+                            sleep(Duration::from_secs(1)).await;
+                            break;
+                        }
                     }
                 }
-            } else {
-                // No prefetch available, fetch synchronously
-                fetch_all_logs(
-                    Arc::clone(&self.rpc), self.network.chain_id,
-                    self.network.name, from_block, actual_to_block,
-                ).await
-            };
+            }
 
-            // ===== STEP 3: Process fetch result =====
-            match fetch_result {
-                Ok(data) => {
-                    let data_to_block = data.to_block;
-
-                    // Spawn prefetch for NEXT range (overlaps with process_fetched_data)
-                    let next_from = data_to_block + 1;
-                    let next_to = (next_from + self.current_block_step - 1).min(safe_to_block);
-                    if next_from <= safe_to_block {
-                        let rpc_clone = Arc::clone(&self.rpc);
-                        let chain_id = self.network.chain_id;
-                        let chain_name = self.network.name;
-                        prefetch_handle = Some(tokio::spawn(async move {
-                            fetch_all_logs(rpc_clone, chain_id, chain_name, next_from, next_to).await
-                        }));
-                    }
-
-                    // Process current data (sequential: insert → fusion → checkpoint)
-                    match self.process_fetched_data(data, &mut last_processed_block).await {
-                        Ok(events_processed) => {
-                            if events_processed > 0 {
-                                debug!(
-                                    "[{}] Processed {} events, checkpoint: {}",
-                                    self.network.name, events_processed, last_processed_block
-                                );
-                            }
-                            // Gradually restore block step toward max after success
-                            if self.current_block_step < self.config.max_blocks_per_query {
-                                self.current_block_step = (self.current_block_step * 2).min(self.config.max_blocks_per_query);
-                                info!(
-                                    "[{}] Increased block step to {}",
-                                    self.network.name, self.current_block_step
-                                );
-                            }
+            // 3. If channel disconnected and buffer is drained, exit
+            if channel_disconnected {
+                // Process any remaining contiguous buffer entries
+                while let Some(data) = buffer.remove(&expected_from) {
+                    match self.process_fetched_data(&data).await {
+                        Ok(_) => {
+                            let _ = self.db.set_checkpoint(self.network.chain_id, data.to_block).await;
+                            expected_from = data.to_block + 1;
                         }
                         Err(e) => {
-                            // ABORT prefetch on process error (step may change, range invalid)
-                            if let Some(handle) = prefetch_handle.take() {
-                                handle.abort();
-                            }
-                            // Adaptive step reduction
-                            if Self::is_adaptive_step_error(&e) {
-                                let old_step = self.current_block_step;
-                                self.current_block_step = (self.current_block_step / 2).max(1);
-                                warn!(
-                                    "[{}] Response too large, reducing block step from {} to {}",
-                                    self.network.name, old_step, self.current_block_step
-                                );
-                            }
-                            error!("[{}] Process error: {}", self.network.name, e);
+                            error!("[{}] Final process error: {}", self.network.name, e);
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    // Fetch failed - adaptive step reduction
-                    if Self::is_adaptive_step_error(&e) {
-                        let old_step = self.current_block_step;
-                        self.current_block_step = (self.current_block_step / 2).max(1);
-                        warn!(
-                            "[{}] Response too large, reducing block step from {} to {}",
-                            self.network.name, old_step, self.current_block_step
-                        );
-                    }
-                    error!("[{}] Fetch error: {}", self.network.name, e);
-                }
+                info!(
+                    "[{}] Fetcher disconnected, processor exiting (buffer: {} remaining)",
+                    self.network.name, buffer.len()
+                );
+                return;
             }
 
-            // Clean up old cached timestamps
-            self.cleanup_timestamp_cache(last_processed_block);
-
-            sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+            // 4. If nothing was processed and buffer doesn't have expected_from,
+            //    do a blocking recv to wait for new data
+            if !processed_any {
+                match rx.recv().await {
+                    Some(data) => {
+                        buffer.insert(data.from_block, data);
+                    }
+                    None => {
+                        // Channel closed permanently
+                        info!(
+                            "[{}] Fetcher channel closed, processor exiting",
+                            self.network.name
+                        );
+                        return;
+                    }
+                }
+            }
         }
     }
+
+    // =========================================================================
+    // Checkpoint Initialization
+    // =========================================================================
 
     /// Initialize checkpoint - get starting block
     async fn initialize_checkpoint(&self) -> Result<u64, String> {
@@ -403,16 +562,14 @@ impl ChainPoller {
     }
 
     // =========================================================================
-    // Data Processing (DB insert + fusion processing + checkpoint)
+    // Data Processing (DB insert + fusion processing)
     // =========================================================================
 
     /// Process previously fetched data: build transfers, insert to DB,
-    /// process fusion/c2f events, set checkpoint.
-    /// This runs sequentially on &mut self (never spawned to a separate task).
+    /// process fusion/c2f events. Checkpoint is handled by the caller.
     async fn process_fetched_data(
         &mut self,
-        data: FetchedData,
-        last_processed_block: &mut u64,
+        data: &FetchedData,
     ) -> Result<usize, String> {
         // =====================================================================
         // Build swap_type map from fusion/c2f logs
@@ -494,15 +651,6 @@ impl ChainPoller {
         ).await?;
         let fusion_events = self.process_fusion_logs(&data.fusion_logs).await?;
         let crypto2fiat_events = self.process_crypto2fiat_logs(&data.crypto2fiat_logs).await?;
-
-        // =====================================================================
-        // Update checkpoint (ONLY after all DB work completes)
-        // =====================================================================
-        *last_processed_block = data.to_block;
-        self.db
-            .set_checkpoint(self.network.chain_id, data.to_block)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
 
         Ok(inserted + fusion_plus_events + fusion_events + crypto2fiat_events)
     }

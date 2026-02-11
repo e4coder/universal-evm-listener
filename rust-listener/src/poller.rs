@@ -15,6 +15,7 @@ use crate::types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -44,10 +45,78 @@ impl Default for PollerConfig {
     }
 }
 
+/// Data fetched from RPC for a block range (all owned, Send-safe for tokio::spawn)
+struct FetchedData {
+    from_block: u64,
+    to_block: u64,
+    fusion_plus_factory_logs: Vec<Log>,
+    fusion_plus_escrow_logs: Vec<Log>,
+    fusion_logs: Vec<Log>,
+    crypto2fiat_logs: Vec<Log>,
+    transfer_logs: Vec<Log>,
+}
+
+/// Fetch all logs for a block range with all 5 RPC calls in parallel.
+/// Standalone function compatible with tokio::spawn (no &self, only owned/'static params).
+async fn fetch_all_logs(
+    rpc: Arc<RpcClient>,
+    chain_id: u32,
+    chain_name: &'static str,
+    from_block: u64,
+    to_block: u64,
+) -> Result<FetchedData, String> {
+    debug!(
+        "[{}] Fetching all logs for blocks {} to {}",
+        chain_name, from_block, to_block
+    );
+
+    // Determine router address based on chain
+    let router_address = if chain_id == 324 {
+        AGGREGATION_ROUTER_ZKSYNC
+    } else {
+        AGGREGATION_ROUTER_V6
+    };
+
+    // Fire ALL 5 RPC calls in parallel, wait for ALL to complete
+    let (fp_factory_result, fp_escrow_result, fusion_result, c2f_result, transfer_result) = tokio::join!(
+        // Fusion+ factory events (SrcEscrowCreated + DstEscrowCreated)
+        rpc.get_logs_multi_topics(
+            from_block, to_block, ESCROW_FACTORY,
+            vec![SRC_ESCROW_CREATED_TOPIC.to_string(), DST_ESCROW_CREATED_TOPIC.to_string()],
+        ),
+        // Fusion+ escrow events (Withdrawal + Cancelled) from any address
+        rpc.get_logs_multi_topics_any_address(
+            from_block, to_block,
+            vec![ESCROW_WITHDRAWAL_TOPIC.to_string(), ESCROW_CANCELLED_TOPIC.to_string()],
+        ),
+        // Fusion single-chain events (OrderFilled + OrderCancelled)
+        rpc.get_logs_multi_topics(
+            from_block, to_block, router_address,
+            vec![ORDER_FILLED_TOPIC.to_string(), ORDER_CANCELLED_TOPIC.to_string()],
+        ),
+        // Crypto2Fiat events from any address
+        rpc.get_logs_by_topic_any_address(from_block, to_block, CRYPTO2FIAT_TOPIC),
+        // ERC20 Transfer events (the main data)
+        rpc.get_transfer_logs(from_block, to_block),
+    );
+
+    // Fusion/c2f logs default to empty on error (non-critical)
+    // Transfer logs propagate errors (critical - triggers adaptive step)
+    Ok(FetchedData {
+        from_block,
+        to_block,
+        fusion_plus_factory_logs: fp_factory_result.unwrap_or_default(),
+        fusion_plus_escrow_logs: fp_escrow_result.unwrap_or_default(),
+        fusion_logs: fusion_result.unwrap_or_default(),
+        crypto2fiat_logs: c2f_result.unwrap_or_default(),
+        transfer_logs: transfer_result.map_err(|e| format!("Failed to get transfer logs: {}", e))?,
+    })
+}
+
 /// Per-chain poller that fetches Transfer events and stores them in PostgreSQL
 pub struct ChainPoller {
     network: NetworkConfig,
-    rpc: RpcClient,
+    rpc: Arc<RpcClient>,
     db: Arc<Database>,  // Shared PostgreSQL database
     config: PollerConfig,
     block_timestamp_cache: HashMap<u64, u64>,
@@ -65,7 +134,7 @@ impl ChainPoller {
         db: Arc<Database>,
         config: PollerConfig,
     ) -> Self {
-        let rpc = RpcClient::new(&network.rpc_url, network.name);
+        let rpc = Arc::new(RpcClient::new(&network.rpc_url, network.name));
 
         let initial_block_step = config.max_blocks_per_query;
         Self {
@@ -78,7 +147,16 @@ impl ChainPoller {
         }
     }
 
-    /// Run the poller loop
+    /// Check if an error string indicates a response-too-large or timeout error
+    fn is_adaptive_step_error(err: &str) -> bool {
+        let err_lower = err.to_lowercase();
+        err_lower.contains("too big") || err_lower.contains("too large") || err.contains("-32008")
+            || err_lower.contains("timed out") || err_lower.contains("timeout")
+    }
+
+    /// Run the poller loop with pipeline architecture:
+    /// While processing cycle N (DB insert + fusion + checkpoint),
+    /// concurrently prefetch cycle N+1's RPC data.
     pub async fn run(&mut self) {
         info!(
             "[{}] Starting poller (chain_id: {})",
@@ -99,30 +177,154 @@ impl ChainPoller {
             self.network.name, last_processed_block
         );
 
+        // Prefetch handle for pipeline: holds the next cycle's RPC data
+        let mut prefetch_handle: Option<JoinHandle<Result<FetchedData, String>>> = None;
+
         // Main polling loop
         loop {
-            match self.poll_once(&mut last_processed_block).await {
-                Ok(events_processed) => {
-                    if events_processed > 0 {
-                        debug!(
-                            "[{}] Processed {} events, checkpoint: {}",
-                            self.network.name, events_processed, last_processed_block
-                        );
+            // ===== STEP 1: Get chain tip and compute block range =====
+            let current_block = match self.rpc.get_block_number().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("[{}] Failed to get block number: {}", self.network.name, e);
+                    // Discard stale prefetch
+                    if let Some(handle) = prefetch_handle.take() {
+                        handle.abort();
                     }
-                    // Gradually restore block step toward max after success
-                    if self.current_block_step < self.config.max_blocks_per_query {
-                        self.current_block_step = (self.current_block_step * 2).min(self.config.max_blocks_per_query);
-                        info!(
-                            "[{}] Increased block step to {}",
-                            self.network.name, self.current_block_step
+                    sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+                    continue;
+                }
+            };
+
+            let safe_to_block = current_block.saturating_sub(self.config.confirmation_blocks);
+            let from_block = (last_processed_block + 1).max(
+                last_processed_block
+                    .saturating_sub(self.config.reorg_safety_blocks)
+                    + 1,
+            );
+
+            // Skip if no new blocks
+            if from_block > safe_to_block {
+                // Discard stale prefetch
+                if let Some(handle) = prefetch_handle.take() {
+                    handle.abort();
+                }
+                sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+                continue;
+            }
+
+            let actual_to_block = (from_block + self.current_block_step - 1).min(safe_to_block);
+
+            debug!(
+                "[{}] Polling blocks {} to {} (current: {})",
+                self.network.name, from_block, actual_to_block, current_block
+            );
+
+            // ===== STEP 2: Get fetch result (from prefetch or fresh fetch) =====
+            let fetch_result = if let Some(handle) = prefetch_handle.take() {
+                match handle.await {
+                    Ok(Ok(data)) if data.from_block == from_block => {
+                        // Prefetch matches expected range, use it
+                        debug!(
+                            "[{}] Using prefetched data for blocks {}-{}",
+                            self.network.name, data.from_block, data.to_block
                         );
+                        Ok(data)
+                    }
+                    Ok(Ok(_)) => {
+                        // Range mismatch (step changed or error recovery), fetch fresh
+                        debug!(
+                            "[{}] Prefetch range mismatch, fetching fresh",
+                            self.network.name
+                        );
+                        fetch_all_logs(
+                            Arc::clone(&self.rpc), self.network.chain_id,
+                            self.network.name, from_block, actual_to_block,
+                        ).await
+                    }
+                    Ok(Err(e)) => {
+                        // Prefetch failed, try fresh fetch
+                        debug!(
+                            "[{}] Prefetch failed ({}), fetching fresh",
+                            self.network.name, e
+                        );
+                        fetch_all_logs(
+                            Arc::clone(&self.rpc), self.network.chain_id,
+                            self.network.name, from_block, actual_to_block,
+                        ).await
+                    }
+                    Err(_join_err) => {
+                        // Task panicked or was cancelled, fetch fresh
+                        fetch_all_logs(
+                            Arc::clone(&self.rpc), self.network.chain_id,
+                            self.network.name, from_block, actual_to_block,
+                        ).await
+                    }
+                }
+            } else {
+                // No prefetch available, fetch synchronously
+                fetch_all_logs(
+                    Arc::clone(&self.rpc), self.network.chain_id,
+                    self.network.name, from_block, actual_to_block,
+                ).await
+            };
+
+            // ===== STEP 3: Process fetch result =====
+            match fetch_result {
+                Ok(data) => {
+                    let data_to_block = data.to_block;
+
+                    // Spawn prefetch for NEXT range (overlaps with process_fetched_data)
+                    let next_from = data_to_block + 1;
+                    let next_to = (next_from + self.current_block_step - 1).min(safe_to_block);
+                    if next_from <= safe_to_block {
+                        let rpc_clone = Arc::clone(&self.rpc);
+                        let chain_id = self.network.chain_id;
+                        let chain_name = self.network.name;
+                        prefetch_handle = Some(tokio::spawn(async move {
+                            fetch_all_logs(rpc_clone, chain_id, chain_name, next_from, next_to).await
+                        }));
+                    }
+
+                    // Process current data (sequential: insert → fusion → checkpoint)
+                    match self.process_fetched_data(data, &mut last_processed_block).await {
+                        Ok(events_processed) => {
+                            if events_processed > 0 {
+                                debug!(
+                                    "[{}] Processed {} events, checkpoint: {}",
+                                    self.network.name, events_processed, last_processed_block
+                                );
+                            }
+                            // Gradually restore block step toward max after success
+                            if self.current_block_step < self.config.max_blocks_per_query {
+                                self.current_block_step = (self.current_block_step * 2).min(self.config.max_blocks_per_query);
+                                info!(
+                                    "[{}] Increased block step to {}",
+                                    self.network.name, self.current_block_step
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // ABORT prefetch on process error (step may change, range invalid)
+                            if let Some(handle) = prefetch_handle.take() {
+                                handle.abort();
+                            }
+                            // Adaptive step reduction
+                            if Self::is_adaptive_step_error(&e) {
+                                let old_step = self.current_block_step;
+                                self.current_block_step = (self.current_block_step / 2).max(1);
+                                warn!(
+                                    "[{}] Response too large, reducing block step from {} to {}",
+                                    self.network.name, old_step, self.current_block_step
+                                );
+                            }
+                            error!("[{}] Process error: {}", self.network.name, e);
+                        }
                     }
                 }
                 Err(e) => {
-                    // Reduce block step on response-too-large errors
-                    let err_lower = e.to_lowercase();
-                    if err_lower.contains("too big") || err_lower.contains("too large") || e.contains("-32008")
-                        || err_lower.contains("timed out") || err_lower.contains("timeout") {
+                    // Fetch failed - adaptive step reduction
+                    if Self::is_adaptive_step_error(&e) {
                         let old_step = self.current_block_step;
                         self.current_block_step = (self.current_block_step / 2).max(1);
                         warn!(
@@ -130,8 +332,7 @@ impl ChainPoller {
                             self.network.name, old_step, self.current_block_step
                         );
                     }
-                    error!("[{}] Poll error: {}", self.network.name, e);
-                    // Continue polling after error, don't crash
+                    error!("[{}] Fetch error: {}", self.network.name, e);
                 }
             }
 
@@ -201,87 +402,52 @@ impl ChainPoller {
         Ok(start_block)
     }
 
-    /// Poll for new events once
-    async fn poll_once(&mut self, last_processed_block: &mut u64) -> Result<usize, String> {
-        // Get current block
-        let current_block = self
-            .rpc
-            .get_block_number()
-            .await
-            .map_err(|e| format!("Failed to get block number: {}", e))?;
+    // =========================================================================
+    // Data Processing (DB insert + fusion processing + checkpoint)
+    // =========================================================================
 
-        // Calculate safe block range
-        let to_block = current_block.saturating_sub(self.config.confirmation_blocks);
-        let from_block = (*last_processed_block + 1).max(
-            last_processed_block
-                .saturating_sub(self.config.reorg_safety_blocks)
-                + 1,
-        );
-
-        // Skip if no new blocks
-        if from_block > to_block {
-            return Ok(0);
-        }
-
-        // Limit query size (uses adaptive block step)
-        let actual_to_block = (from_block + self.current_block_step - 1).min(to_block);
-
-        debug!(
-            "[{}] Polling blocks {} to {} (current: {})",
-            self.network.name, from_block, actual_to_block, current_block
-        );
-
-        // =========================================================================
-        // PHASE 1: Fetch ALL logs in parallel (fusion+, fusion, c2f, transfers)
-        // tokio::join! fires all 4 concurrently, waits for ALL to complete
-        // =========================================================================
-        let (fp_result, fusion_result, c2f_result, transfer_result) = tokio::join!(
-            self.fetch_fusion_plus_logs(from_block, actual_to_block),
-            self.fetch_fusion_logs(from_block, actual_to_block),
-            self.fetch_crypto2fiat_logs(from_block, actual_to_block),
-            self.rpc.get_transfer_logs(from_block, actual_to_block),
-        );
-
-        // Unwrap all results (all calls have completed at this point)
-        let (fusion_plus_factory_logs, fusion_plus_escrow_logs) = fp_result?;
-        let fusion_logs = fusion_result?;
-        let crypto2fiat_logs = c2f_result?;
-        let transfer_logs = transfer_result.map_err(|e| format!("Failed to get logs: {}", e))?;
-
+    /// Process previously fetched data: build transfers, insert to DB,
+    /// process fusion/c2f events, set checkpoint.
+    /// This runs sequentially on &mut self (never spawned to a separate task).
+    async fn process_fetched_data(
+        &mut self,
+        data: FetchedData,
+        last_processed_block: &mut u64,
+    ) -> Result<usize, String> {
+        // =====================================================================
         // Build swap_type map from fusion/c2f logs
+        // =====================================================================
         let mut swap_type_map: HashMap<String, &'static str> = HashMap::new();
 
-        for log in &fusion_plus_factory_logs {
+        for log in &data.fusion_plus_factory_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
         }
-        for log in &fusion_plus_escrow_logs {
+        for log in &data.fusion_plus_escrow_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
         }
-        for log in &fusion_logs {
+        for log in &data.fusion_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion");
         }
-        for log in &crypto2fiat_logs {
+        for log in &data.crypto2fiat_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "crypto_to_fiat");
         }
 
-        // =========================================================================
-        // PHASE 2: Process transfers and insert with swap_type from map
-        // =========================================================================
-
-        if !transfer_logs.is_empty() {
+        // =====================================================================
+        // Process transfers and insert with swap_type from map
+        // =====================================================================
+        if !data.transfer_logs.is_empty() {
             info!(
                 "[{}] Found {} Transfer events in blocks {}-{}",
                 self.network.name,
-                transfer_logs.len(),
-                from_block,
-                actual_to_block
+                data.transfer_logs.len(),
+                data.from_block,
+                data.to_block
             );
         }
 
-        // Process logs into transfers with swap_type
-        let mut transfers = Vec::with_capacity(transfer_logs.len());
+        let mut transfers = Vec::with_capacity(data.transfer_logs.len());
 
-        for log in &transfer_logs {
+        for log in &data.transfer_logs {
             // Validate Transfer event structure
             if log.topics.len() < 3 {
                 continue; // Invalid Transfer event
@@ -319,100 +485,26 @@ impl ChainPoller {
             0
         };
 
-        // =========================================================================
-        // PHASE 3: Process fusion events (insert swap records, no UPDATE needed)
-        // =========================================================================
-        let fusion_plus_events = self.process_fusion_plus_logs(&fusion_plus_factory_logs, &fusion_plus_escrow_logs).await?;
-        let fusion_events = self.process_fusion_logs(&fusion_logs).await?;
-        let crypto2fiat_events = self.process_crypto2fiat_logs(&crypto2fiat_logs).await?;
+        // =====================================================================
+        // Process fusion events (insert swap records, no UPDATE needed)
+        // Must run AFTER insert_transfers_batch (fusion needs transfers in DB)
+        // =====================================================================
+        let fusion_plus_events = self.process_fusion_plus_logs(
+            &data.fusion_plus_factory_logs, &data.fusion_plus_escrow_logs
+        ).await?;
+        let fusion_events = self.process_fusion_logs(&data.fusion_logs).await?;
+        let crypto2fiat_events = self.process_crypto2fiat_logs(&data.crypto2fiat_logs).await?;
 
-        // Update checkpoint
-        *last_processed_block = actual_to_block;
+        // =====================================================================
+        // Update checkpoint (ONLY after all DB work completes)
+        // =====================================================================
+        *last_processed_block = data.to_block;
         self.db
-            .set_checkpoint(self.network.chain_id, actual_to_block)
+            .set_checkpoint(self.network.chain_id, data.to_block)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
         Ok(inserted + fusion_plus_events + fusion_events + crypto2fiat_events)
-    }
-
-    // =========================================================================
-    // Log Fetching Methods (return logs without processing)
-    // =========================================================================
-
-    /// Fetch Fusion+ logs (factory and escrow events)
-    async fn fetch_fusion_plus_logs(
-        &self,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<(Vec<Log>, Vec<Log>), String> {
-        // Fetch SrcEscrowCreated and DstEscrowCreated events from EscrowFactory
-        let factory_topics = vec![
-            SRC_ESCROW_CREATED_TOPIC.to_string(),
-            DST_ESCROW_CREATED_TOPIC.to_string(),
-        ];
-
-        let factory_logs = self
-            .rpc
-            .get_logs_multi_topics(from_block, to_block, ESCROW_FACTORY, factory_topics)
-            .await
-            .unwrap_or_default();
-
-        // Fetch EscrowWithdrawal and EscrowCancelled events (from any escrow contract)
-        let escrow_topics = vec![
-            ESCROW_WITHDRAWAL_TOPIC.to_string(),
-            ESCROW_CANCELLED_TOPIC.to_string(),
-        ];
-
-        let escrow_logs = self
-            .rpc
-            .get_logs_multi_topics_any_address(from_block, to_block, escrow_topics)
-            .await
-            .unwrap_or_default();
-
-        Ok((factory_logs, escrow_logs))
-    }
-
-    /// Fetch Fusion (single-chain) logs from Aggregation Router
-    async fn fetch_fusion_logs(
-        &self,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<Vec<Log>, String> {
-        // Determine contract address based on chain
-        let router_address = if self.network.chain_id == 324 {
-            AGGREGATION_ROUTER_ZKSYNC
-        } else {
-            AGGREGATION_ROUTER_V6
-        };
-
-        let topics = vec![
-            ORDER_FILLED_TOPIC.to_string(),
-            ORDER_CANCELLED_TOPIC.to_string(),
-        ];
-
-        let logs = self
-            .rpc
-            .get_logs_multi_topics(from_block, to_block, router_address, topics)
-            .await
-            .unwrap_or_default();
-
-        Ok(logs)
-    }
-
-    /// Fetch Crypto2Fiat logs from any address
-    async fn fetch_crypto2fiat_logs(
-        &self,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<Vec<Log>, String> {
-        let logs = self
-            .rpc
-            .get_logs_by_topic_any_address(from_block, to_block, CRYPTO2FIAT_TOPIC)
-            .await
-            .unwrap_or_default();
-
-        Ok(logs)
     }
 
     // =========================================================================
@@ -567,8 +659,6 @@ impl ChainPoller {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
-
         info!(
             "[{}] Fusion+ SrcEscrow created: order_hash={} dst_chain={}",
             self.network.name, data.order_hash, data.dst_chain_id
@@ -596,8 +686,6 @@ impl ChainPoller {
             )
             .await
             .map_err(|e| format!("DB error: {}", e))?;
-
-        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         if updated {
             info!(
@@ -652,8 +740,6 @@ impl ChainPoller {
             }
         }
 
-        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
-
         debug!(
             "[{}] Fusion+ withdrawal from escrow {} with hashlock {}",
             self.network.name, log.address, hashlock
@@ -664,8 +750,6 @@ impl ChainPoller {
 
     /// Process EscrowCancelled event
     async fn process_escrow_cancelled(&self, log: &Log, _timestamp: u64) -> Result<(), String> {
-        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
-
         debug!(
             "[{}] Fusion+ escrow cancelled: {}",
             self.network.name, log.address
@@ -736,8 +820,6 @@ impl ChainPoller {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
-
         info!(
             "[{}] Fusion {} order: order_hash={} maker={} taker={:?} tx={}",
             self.network.name, status, data.order_hash, swap.maker, swap.taker, log.transaction_hash
@@ -801,8 +883,6 @@ impl ChainPoller {
             .insert_crypto2fiat_event(&event)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
-
-        // Note: swap_type is already set during transfer INSERT (no UPDATE needed)
 
         info!(
             "[{}] Crypto2Fiat: order_id={} token={} amount={} recipient={} tx={}",

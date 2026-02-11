@@ -121,7 +121,8 @@ impl ChainPoller {
                 Err(e) => {
                     // Reduce block step on response-too-large errors
                     let err_lower = e.to_lowercase();
-                    if err_lower.contains("too big") || err_lower.contains("too large") || e.contains("-32008") {
+                    if err_lower.contains("too big") || err_lower.contains("too large") || e.contains("-32008")
+                        || err_lower.contains("timed out") || err_lower.contains("timeout") {
                         let old_step = self.current_block_step;
                         self.current_block_step = (self.current_block_step / 2).max(1);
                         warn!(
@@ -231,13 +232,24 @@ impl ChainPoller {
         );
 
         // =========================================================================
-        // PHASE 1: Fetch fusion/crypto2fiat logs and build swap_type map
+        // PHASE 1: Fetch ALL logs in parallel (fusion+, fusion, c2f, transfers)
+        // tokio::join! fires all 4 concurrently, waits for ALL to complete
         // =========================================================================
-        let mut swap_type_map: HashMap<String, &'static str> = HashMap::new();
+        let (fp_result, fusion_result, c2f_result, transfer_result) = tokio::join!(
+            self.fetch_fusion_plus_logs(from_block, actual_to_block),
+            self.fetch_fusion_logs(from_block, actual_to_block),
+            self.fetch_crypto2fiat_logs(from_block, actual_to_block),
+            self.rpc.get_transfer_logs(from_block, actual_to_block),
+        );
 
-        // Fetch Fusion+ logs (factory + escrow events)
-        let (fusion_plus_factory_logs, fusion_plus_escrow_logs) =
-            self.fetch_fusion_plus_logs(from_block, actual_to_block).await?;
+        // Unwrap all results (all calls have completed at this point)
+        let (fusion_plus_factory_logs, fusion_plus_escrow_logs) = fp_result?;
+        let fusion_logs = fusion_result?;
+        let crypto2fiat_logs = c2f_result?;
+        let transfer_logs = transfer_result.map_err(|e| format!("Failed to get logs: {}", e))?;
+
+        // Build swap_type map from fusion/c2f logs
+        let mut swap_type_map: HashMap<String, &'static str> = HashMap::new();
 
         for log in &fusion_plus_factory_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
@@ -245,27 +257,16 @@ impl ChainPoller {
         for log in &fusion_plus_escrow_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
         }
-
-        // Fetch Fusion (single-chain) logs
-        let fusion_logs = self.fetch_fusion_logs(from_block, actual_to_block).await?;
         for log in &fusion_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion");
         }
-
-        // Fetch Crypto2Fiat logs
-        let crypto2fiat_logs = self.fetch_crypto2fiat_logs(from_block, actual_to_block).await?;
         for log in &crypto2fiat_logs {
             swap_type_map.insert(log.transaction_hash.to_lowercase(), "crypto_to_fiat");
         }
 
         // =========================================================================
-        // PHASE 2: Fetch transfers and insert with swap_type from map
+        // PHASE 2: Process transfers and insert with swap_type from map
         // =========================================================================
-        let transfer_logs = self
-            .rpc
-            .get_transfer_logs(from_block, actual_to_block)
-            .await
-            .map_err(|e| format!("Failed to get logs: {}", e))?;
 
         if !transfer_logs.is_empty() {
             info!(

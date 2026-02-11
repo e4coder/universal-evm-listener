@@ -51,6 +51,8 @@ pub struct ChainPoller {
     db: Arc<Database>,  // Shared PostgreSQL database
     config: PollerConfig,
     block_timestamp_cache: HashMap<u64, u64>,
+    /// Adaptive block step: starts at max_blocks_per_query, halves on "too big" errors
+    current_block_step: u64,
 }
 
 impl ChainPoller {
@@ -65,12 +67,14 @@ impl ChainPoller {
     ) -> Self {
         let rpc = RpcClient::new(&network.rpc_url, network.name);
 
+        let initial_block_step = config.max_blocks_per_query;
         Self {
             network,
             rpc,
             db,
             config,
             block_timestamp_cache: HashMap::new(),
+            current_block_step: initial_block_step,
         }
     }
 
@@ -105,8 +109,26 @@ impl ChainPoller {
                             self.network.name, events_processed, last_processed_block
                         );
                     }
+                    // Gradually restore block step toward max after success
+                    if self.current_block_step < self.config.max_blocks_per_query {
+                        self.current_block_step = (self.current_block_step * 2).min(self.config.max_blocks_per_query);
+                        info!(
+                            "[{}] Increased block step to {}",
+                            self.network.name, self.current_block_step
+                        );
+                    }
                 }
                 Err(e) => {
+                    // Reduce block step on response-too-large errors
+                    let err_lower = e.to_lowercase();
+                    if err_lower.contains("too big") || err_lower.contains("too large") || e.contains("-32008") {
+                        let old_step = self.current_block_step;
+                        self.current_block_step = (self.current_block_step / 2).max(1);
+                        warn!(
+                            "[{}] Response too large, reducing block step from {} to {}",
+                            self.network.name, old_step, self.current_block_step
+                        );
+                    }
                     error!("[{}] Poll error: {}", self.network.name, e);
                     // Continue polling after error, don't crash
                 }
@@ -200,8 +222,8 @@ impl ChainPoller {
             return Ok(0);
         }
 
-        // Limit query size
-        let actual_to_block = (from_block + self.config.max_blocks_per_query - 1).min(to_block);
+        // Limit query size (uses adaptive block step)
+        let actual_to_block = (from_block + self.current_block_step - 1).min(to_block);
 
         debug!(
             "[{}] Polling blocks {} to {} (current: {})",

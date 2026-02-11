@@ -2,7 +2,7 @@ use crate::types::{Crypto2FiatEvent, DstEscrowCreatedData, FusionPlusSwap, Fusio
 use deadpool_postgres::{Config, Pool, Runtime, PoolError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio_postgres::{NoTls, Row};
+use tokio_postgres::{NoTls, Row, types::ToSql};
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -273,7 +273,8 @@ impl Database {
         Ok(result > 0)
     }
 
-    /// Insert multiple transfers in a batch
+    /// Insert multiple transfers using multi-row INSERT for efficiency
+    /// Instead of N individual queries, this sends 1 query per 500 rows
     pub async fn insert_transfers_batch(&self, chain_id: u32, transfers: &[Transfer]) -> Result<usize, DbError> {
         if transfers.is_empty() {
             return Ok(0);
@@ -285,37 +286,63 @@ impl Database {
             .unwrap()
             .as_secs() as i64;
 
-        let stmt = client.prepare(
-            "INSERT INTO transfers
-             (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING"
-        ).await?;
+        let chain_id_i32 = chain_id as i32;
+        let mut total_inserted = 0;
 
-        let mut inserted = 0;
-        for transfer in transfers {
-            let result = client.execute(
-                &stmt,
-                &[
-                    &(chain_id as i32),
-                    &transfer.tx_hash.to_lowercase(),
-                    &(transfer.log_index as i32),
-                    &transfer.token.to_lowercase(),
-                    &transfer.from_addr.to_lowercase(),
-                    &transfer.to_addr.to_lowercase(),
-                    &transfer.value,
-                    &(transfer.block_number as i64),
-                    &(transfer.block_timestamp as i64),
-                    &transfer.swap_type,
-                    &now,
-                ],
-            ).await?;
-            if result > 0 {
-                inserted += 1;
+        // Multi-row INSERT: 11 params per row, PostgreSQL max ~65535 params
+        // Chunk at 500 rows (5500 params) for efficiency
+        for chunk in transfers.chunks(500) {
+            // Pre-compute owned values so references stay valid
+            let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, i64)> =
+                chunk.iter().map(|t| (
+                    chain_id_i32,
+                    t.tx_hash.to_lowercase(),
+                    t.log_index as i32,
+                    t.token.to_lowercase(),
+                    t.from_addr.to_lowercase(),
+                    t.to_addr.to_lowercase(),
+                    t.value.clone(),
+                    t.block_number as i64,
+                    t.block_timestamp as i64,
+                    t.swap_type.clone(),
+                    now,
+                )).collect();
+
+            let mut values_parts = Vec::with_capacity(chunk.len());
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * 11);
+
+            for (i, row) in rows.iter().enumerate() {
+                let b = i * 11;
+                values_parts.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11
+                ));
+                params.push(&row.0);
+                params.push(&row.1);
+                params.push(&row.2);
+                params.push(&row.3);
+                params.push(&row.4);
+                params.push(&row.5);
+                params.push(&row.6);
+                params.push(&row.7);
+                params.push(&row.8);
+                params.push(&row.9);
+                params.push(&row.10);
             }
+
+            let sql = format!(
+                "INSERT INTO transfers \
+                 (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
+                 VALUES {} \
+                 ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+                values_parts.join(", ")
+            );
+
+            let result = client.execute(sql.as_str(), &params).await?;
+            total_inserted += result as usize;
         }
 
-        Ok(inserted)
+        Ok(total_inserted)
     }
 
     /// Get checkpoint block number for a chain

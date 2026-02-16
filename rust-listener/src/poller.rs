@@ -157,18 +157,26 @@ async fn fetcher_loop(
     info!("[{}] Fetcher started, step: {}, concurrency: {}", chain_name, step, config.max_concurrent_fetches);
 
     loop {
-        // 1. Refresh chain tip if stale (>2s) or caught up with no work
+        // 1. Refresh chain tip if stale or caught up with no pending work.
         let caught_up = next_from > cached_safe_tip
             && pending_ranges.is_empty()
+            && last_chance_ranges.is_empty()
             && join_set.is_empty();
         let stale = tip_fetched_at.elapsed() > Duration::from_secs(2);
 
         if stale || caught_up {
             match rpc.get_block_number().await {
                 Ok(tip) => {
-                    cached_safe_tip = tip.saturating_sub(config.confirmation_blocks);
-                    tip_fetched_at = Instant::now();
+                    let new_safe_tip = tip.saturating_sub(config.confirmation_blocks);
                     stats.current_block.store(tip, Relaxed);
+
+                    if caught_up && new_safe_tip <= cached_safe_tip {
+                        // No new blocks since last check — sleep before re-polling
+                        sleep(poll_interval).await;
+                    }
+
+                    cached_safe_tip = new_safe_tip;
+                    tip_fetched_at = Instant::now();
                 }
                 Err(e) => {
                     error!("[{}] Fetcher: failed to get block number: {}", chain_name, e);
@@ -226,9 +234,8 @@ async fn fetcher_loop(
         stats.last_chance_count.store(last_chance_ranges.len() as u64, Relaxed);
         stats.inflight_fetches.store(join_set.len() as u64, Relaxed);
 
-        // 3. If nothing in-flight, we're caught up - sleep and retry
+        // 3. If nothing in-flight, we're caught up - loop back (sleep happens in step 1)
         if join_set.is_empty() {
-            sleep(poll_interval).await;
             continue;
         }
 

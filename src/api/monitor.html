@@ -71,9 +71,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monos
 <div id="app"></div>
 
 <script type="module">
-import { h, render } from 'https://unpkg.com/preact@10.25.4/dist/preact.module.js';
-import { useState, useEffect, useRef, useCallback } from 'https://unpkg.com/preact@10.25.4/hooks/dist/hooks.module.js';
-import htm from 'https://unpkg.com/htm@3.1.1/dist/htm.module.js';
+import { h, render } from 'https://esm.sh/preact@10.25.4';
+import { useState, useEffect, useRef, useCallback } from 'https://esm.sh/preact@10.25.4/hooks';
+import htm from 'https://esm.sh/htm@3.1.1';
 const html = htm.bind(h);
 
 const CHAIN_NAMES = {

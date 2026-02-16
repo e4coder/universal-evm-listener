@@ -34,18 +34,19 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 20,
             concurrent_fetches: 10,
         },
+        // Dense tier — 10 blocks × 10 concurrent = 100 blocks/batch
         NetworkConfig {
             chain_id: 137,
             name: "Polygon",
             rpc_url: alchemy_url("polygon-mainnet", &api_key),
-            blocks_per_request: 20,
+            blocks_per_request: 10,
             concurrent_fetches: 10,
         },
         NetworkConfig {
             chain_id: 56,
             name: "BNB Smart Chain",
             rpc_url: alchemy_url("bnb-mainnet", &api_key),
-            blocks_per_request: 20,
+            blocks_per_request: 10,
             concurrent_fetches: 10,
         },
         // Medium tier — 50 blocks × 5 concurrent = 250 blocks/batch

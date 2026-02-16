@@ -146,7 +146,6 @@ async fn fetcher_loop(
     let step = config.max_blocks_per_query; // fixed step (50 blocks), no adaptive sizing
     let mut join_set: JoinSet<(u64, u64, Result<FetchedData, String>)> = JoinSet::new();
     let mut pending_ranges: VecDeque<(u64, u64)> = VecDeque::new();
-    let mut retry_counts: HashMap<(u64, u64), u32> = HashMap::new();
     let mut cached_safe_tip: u64 = 0;
     let mut tip_fetched_at = Instant::now() - Duration::from_secs(10); // force initial refresh
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
@@ -174,17 +173,35 @@ async fn fetcher_loop(
             }
         }
 
-        // 2. Fill JoinSet to max_concurrent from pending_ranges or new ranges
-        while join_set.len() < config.max_concurrent_fetches {
-            let range = if let Some(range) = pending_ranges.pop_front() {
-                Some(range)
-            } else if next_from <= cached_safe_tip {
+        // 2. Fill JoinSet: retry slots first, then forward slots
+        let max_retry_slots = config.max_concurrent_fetches; // same as forward
+        let max_total = config.max_concurrent_fetches * 2;   // forward + retry
+        let mut retry_filled = 0;
+
+        // 2a. Fill retry slots (up to max_concurrent_fetches)
+        while retry_filled < max_retry_slots && join_set.len() < max_total {
+            match pending_ranges.pop_front() {
+                Some((from, to)) => {
+                    retry_filled += 1;
+                    let rpc_clone = Arc::clone(&rpc);
+                    join_set.spawn(async move {
+                        let result = fetch_all_logs(rpc_clone, chain_id, chain_name, from, to).await;
+                        (from, to, result)
+                    });
+                }
+                None => break,
+            }
+        }
+
+        // 2b. Fill forward slots; if caught up, give remaining to retries
+        while join_set.len() < max_total {
+            let range = if next_from <= cached_safe_tip {
                 let to = (next_from + step - 1).min(cached_safe_tip);
-                let range = (next_from, to);
+                let r = (next_from, to);
                 next_from = to + 1;
-                Some(range)
+                Some(r)
             } else {
-                None // caught up
+                pending_ranges.pop_front() // caught up: retries can use forward slots
             };
 
             match range {
@@ -216,24 +233,18 @@ async fn fetcher_loop(
                     "[{}] Fetcher: completed blocks {}-{} ({} transfer logs)",
                     chain_name, from, to, data.transfer_logs.len()
                 );
-                retry_counts.remove(&(from, to));
                 if tx.send(data).await.is_err() {
                     info!("[{}] Fetcher: processor channel closed, shutting down", chain_name);
                     return;
                 }
             }
             Ok((from, to, Err(e))) => {
-                let attempts = retry_counts.entry((from, to)).or_insert(0);
-                *attempts += 1;
-
-                if *attempts >= 5 {
-                    // Give up after 5 failed attempts — send empty data so processor can advance
+                if from == to {
+                    // Single block — can't split further, give up
                     error!(
-                        "[{}] Fetcher: GIVING UP on blocks {}-{} after {} attempts: {}",
-                        chain_name, from, to, attempts, e
+                        "[{}] Fetcher: GIVING UP on block {} (cannot split): {}",
+                        chain_name, from, e
                     );
-                    retry_counts.remove(&(from, to));
-
                     let empty_data = FetchedData {
                         from_block: from,
                         to_block: to,
@@ -248,11 +259,37 @@ async fn fetcher_loop(
                         return;
                     }
                 } else {
+                    // Split range in half and retry both halves
+                    let mid = from + (to - from) / 2;
                     warn!(
-                        "[{}] Fetcher: error for blocks {}-{} (attempt {}), retrying: {}",
-                        chain_name, from, to, attempts, e
+                        "[{}] Fetcher: error for blocks {}-{}, splitting into {}-{} and {}-{}: {}",
+                        chain_name, from, to, from, mid, mid + 1, to, e
                     );
-                    pending_ranges.push_back((from, to));
+                    pending_ranges.push_back((from, mid));
+                    pending_ranges.push_back((mid + 1, to));
+
+                    // Backpressure: cap pending at 10, drain oldest as empty
+                    while pending_ranges.len() > 10 {
+                        if let Some((f, t)) = pending_ranges.pop_front() {
+                            error!(
+                                "[{}] Fetcher: pending overflow, giving up on blocks {}-{}",
+                                chain_name, f, t
+                            );
+                            let empty_data = FetchedData {
+                                from_block: f,
+                                to_block: t,
+                                transfer_logs: vec![],
+                                fusion_plus_factory_logs: vec![],
+                                fusion_plus_escrow_logs: vec![],
+                                fusion_logs: vec![],
+                                crypto2fiat_logs: vec![],
+                            };
+                            if tx.send(empty_data).await.is_err() {
+                                info!("[{}] Fetcher: processor channel closed, shutting down", chain_name);
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             Err(join_err) => {
@@ -280,7 +317,7 @@ impl ChainPoller {
         let mut config = PollerConfig::default();
         config.max_blocks_per_query = network.blocks_per_request;
         config.max_concurrent_fetches = network.concurrent_fetches;
-        config.channel_capacity = network.concurrent_fetches * 2;
+        config.channel_capacity = network.concurrent_fetches * 4;
         Self::with_config(network, db, config)
     }
 

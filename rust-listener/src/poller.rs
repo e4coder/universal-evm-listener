@@ -12,7 +12,7 @@ use crate::types::{
     ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC,
     CRYPTO2FIAT_TOPIC,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -136,6 +136,7 @@ async fn fetch_all_logs(
 /// Manages its own adaptive block step and concurrent in-flight fetches.
 async fn fetcher_loop(
     rpc: Arc<RpcClient>,
+    slow_rpc: Arc<RpcClient>,
     chain_id: u32,
     chain_name: &'static str,
     start_from: u64,
@@ -143,9 +144,10 @@ async fn fetcher_loop(
     tx: mpsc::Sender<FetchedData>,
 ) {
     let mut next_from = start_from + 1;
-    let step = config.max_blocks_per_query; // fixed step (50 blocks), no adaptive sizing
+    let step = config.max_blocks_per_query; // fixed step, no adaptive sizing
     let mut join_set: JoinSet<(u64, u64, Result<FetchedData, String>)> = JoinSet::new();
     let mut pending_ranges: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut last_chance_ranges: HashSet<(u64, u64)> = HashSet::new();
     let mut cached_safe_tip: u64 = 0;
     let mut tip_fetched_at = Instant::now() - Duration::from_secs(10); // force initial refresh
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
@@ -239,11 +241,11 @@ async fn fetcher_loop(
                 }
             }
             Ok((from, to, Err(e))) => {
-                if from == to {
-                    // Single block — can't split further, give up
+                if last_chance_ranges.remove(&(from, to)) {
+                    // Last chance with 2x timeout also failed — truly give up
                     error!(
-                        "[{}] Fetcher: GIVING UP on block {} (cannot split): {}",
-                        chain_name, from, e
+                        "[{}] Fetcher: GIVING UP on blocks {}-{} (last chance failed): {}",
+                        chain_name, from, to, e
                     );
                     let empty_data = FetchedData {
                         from_block: from,
@@ -258,6 +260,18 @@ async fn fetcher_loop(
                         info!("[{}] Fetcher: processor channel closed, shutting down", chain_name);
                         return;
                     }
+                } else if from == to {
+                    // Single block — can't split, try last chance with 2x timeout
+                    warn!(
+                        "[{}] Fetcher: single block {} failed, retrying with 2x timeout: {}",
+                        chain_name, from, e
+                    );
+                    last_chance_ranges.insert((from, to));
+                    let rpc_clone = Arc::clone(&slow_rpc);
+                    join_set.spawn(async move {
+                        let result = fetch_all_logs(rpc_clone, chain_id, chain_name, from, to).await;
+                        (from, to, result)
+                    });
                 } else {
                     // Split range in half and retry both halves
                     let mid = from + (to - from) / 2;
@@ -268,26 +282,19 @@ async fn fetcher_loop(
                     pending_ranges.push_back((from, mid));
                     pending_ranges.push_back((mid + 1, to));
 
-                    // Backpressure: cap pending at 10, drain oldest as empty
+                    // Backpressure: cap pending at 10, overflow gets last chance with 2x timeout
                     while pending_ranges.len() > 10 {
                         if let Some((f, t)) = pending_ranges.pop_front() {
-                            error!(
-                                "[{}] Fetcher: pending overflow, giving up on blocks {}-{}",
+                            warn!(
+                                "[{}] Fetcher: pending overflow for blocks {}-{}, retrying with 2x timeout",
                                 chain_name, f, t
                             );
-                            let empty_data = FetchedData {
-                                from_block: f,
-                                to_block: t,
-                                transfer_logs: vec![],
-                                fusion_plus_factory_logs: vec![],
-                                fusion_plus_escrow_logs: vec![],
-                                fusion_logs: vec![],
-                                crypto2fiat_logs: vec![],
-                            };
-                            if tx.send(empty_data).await.is_err() {
-                                info!("[{}] Fetcher: processor channel closed, shutting down", chain_name);
-                                return;
-                            }
+                            last_chance_ranges.insert((f, t));
+                            let rpc_clone = Arc::clone(&slow_rpc);
+                            join_set.spawn(async move {
+                                let result = fetch_all_logs(rpc_clone, chain_id, chain_name, f, t).await;
+                                (f, t, result)
+                            });
                         }
                     }
                 }
@@ -307,6 +314,7 @@ async fn fetcher_loop(
 pub struct ChainPoller {
     network: NetworkConfig,
     rpc: Arc<RpcClient>,
+    slow_rpc: Arc<RpcClient>,
     db: Arc<Database>,
     config: PollerConfig,
     block_timestamp_cache: HashMap<u64, u64>,
@@ -327,10 +335,12 @@ impl ChainPoller {
         config: PollerConfig,
     ) -> Self {
         let rpc = Arc::new(RpcClient::new(&network.rpc_url, network.name));
+        let slow_rpc = Arc::new(RpcClient::with_config(&network.rpc_url, network.name, 3, 100, 60));
 
         Self {
             network,
             rpc,
+            slow_rpc,
             db,
             config,
             block_timestamp_cache: HashMap::new(),
@@ -372,11 +382,12 @@ impl ChainPoller {
 
         // Spawn fetcher as independent task
         let rpc_clone = Arc::clone(&self.rpc);
+        let slow_rpc_clone = Arc::clone(&self.slow_rpc);
         let chain_id = self.network.chain_id;
         let chain_name = self.network.name;
         let fetcher_handle = tokio::spawn(async move {
             fetcher_loop(
-                rpc_clone, chain_id, chain_name,
+                rpc_clone, slow_rpc_clone, chain_id, chain_name,
                 last_processed_block, fetcher_config, tx,
             ).await;
         });

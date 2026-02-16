@@ -35,7 +35,7 @@ impl RpcClient {
     /// * `url` - Any Ethereum JSON-RPC endpoint URL (Alchemy, Infura, QuickNode, public RPC, etc.)
     /// * `chain_name` - Human-readable chain name for logging
     pub fn new(url: &str, chain_name: &str) -> Self {
-        Self::with_config(url, chain_name, 3, 100)
+        Self::with_config(url, chain_name, 3, 100, 30)
     }
 
     /// Create a new RPC client with custom retry configuration
@@ -45,14 +45,16 @@ impl RpcClient {
     /// * `chain_name` - Human-readable chain name for logging
     /// * `max_retries` - Maximum number of retries on rate limit or transient errors
     /// * `retry_base_delay_ms` - Base delay in milliseconds for exponential backoff
+    /// * `timeout_secs` - HTTP request timeout in seconds
     pub fn with_config(
         url: &str,
         chain_name: &str,
         max_retries: u32,
         retry_base_delay_ms: u64,
+        timeout_secs: u64,
     ) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))  // 30s timeout; adaptive step handles large ranges
+            .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(2)         // Reduced from 5 to save memory
             .pool_idle_timeout(Duration::from_secs(30)) // Release idle connections after 30s
             .build()

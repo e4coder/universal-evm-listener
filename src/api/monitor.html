@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Universal Listener Monitor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #0a0a0f; color: #e0e0e0; }
+.header { background: #12121a; border-bottom: 1px solid #2a2a3a; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+.header .status { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+.dot.disconnected { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+.tabs { display: flex; background: #12121a; border-bottom: 1px solid #2a2a3a; padding: 0 24px; }
+.tab { padding: 10px 20px; cursor: pointer; font-size: 13px; color: #888; border-bottom: 2px solid transparent; transition: all 0.2s; }
+.tab:hover { color: #ccc; }
+.tab.active { color: #60a5fa; border-bottom-color: #60a5fa; }
+.container { padding: 20px 24px; }
+
+/* Summary bar */
+.summary { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+.summary-card { background: #16161f; border: 1px solid #2a2a3a; border-radius: 8px; padding: 12px 18px; min-width: 150px; }
+.summary-card .label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+.summary-card .value { font-size: 22px; font-weight: 700; color: #fff; margin-top: 2px; }
+.summary-card .value.green { color: #22c55e; }
+.summary-card .value.yellow { color: #eab308; }
+.summary-card .value.red { color: #ef4444; }
+
+/* Chain grid */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.chain-card { background: #16161f; border: 1px solid #2a2a3a; border-radius: 8px; padding: 14px; transition: border-color 0.3s; }
+.chain-card.healthy { border-left: 3px solid #22c55e; }
+.chain-card.warning { border-left: 3px solid #eab308; }
+.chain-card.stale { border-left: 3px solid #ef4444; }
+.chain-card .name { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 8px; display: flex; justify-content: space-between; }
+.chain-card .name .chain-id { font-size: 11px; color: #666; font-weight: 400; }
+.chain-card .row { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
+.chain-card .row .k { color: #888; }
+.chain-card .row .v { color: #ccc; font-family: monospace; }
+.chain-card .row .v.warn { color: #eab308; }
+.chain-card .row .v.err { color: #ef4444; }
+.chain-card .divider { border-top: 1px solid #222; margin: 6px 0; }
+
+/* API Tester */
+.api-section { max-width: 900px; }
+.api-tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+.api-tab { padding: 6px 14px; cursor: pointer; font-size: 12px; border-radius: 6px; background: #1a1a25; color: #888; border: 1px solid #2a2a3a; transition: all 0.2s; }
+.api-tab:hover { color: #ccc; border-color: #444; }
+.api-tab.active { color: #60a5fa; border-color: #60a5fa; background: #1a1a2e; }
+.endpoint-list { display: flex; flex-direction: column; gap: 6px; }
+.endpoint { background: #16161f; border: 1px solid #2a2a3a; border-radius: 6px; padding: 10px 14px; }
+.endpoint .top { display: flex; align-items: center; gap: 10px; }
+.endpoint .method { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
+.endpoint .method.get { background: #1a3a1a; color: #22c55e; }
+.endpoint .method.post { background: #3a3a1a; color: #eab308; }
+.endpoint .path { font-size: 13px; font-family: monospace; color: #ccc; flex: 1; }
+.endpoint .send-btn { padding: 4px 14px; font-size: 12px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+.endpoint .send-btn:hover { background: #3b82f6; }
+.endpoint .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.endpoint .inputs { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.endpoint .inputs input, .endpoint .inputs textarea { background: #0f0f18; border: 1px solid #333; color: #ccc; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; }
+.endpoint .inputs input { width: 140px; }
+.endpoint .inputs textarea { width: 100%; min-height: 60px; }
+.response-box { margin-top: 8px; background: #0a0a12; border: 1px solid #222; border-radius: 4px; padding: 8px; max-height: 300px; overflow: auto; font-size: 12px; font-family: monospace; white-space: pre-wrap; color: #a0a0a0; }
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script type="module">
+import { h, render } from 'https://unpkg.com/preact@10.25.4/dist/preact.module.js';
+import { useState, useEffect, useRef, useCallback } from 'https://unpkg.com/preact@10.25.4/hooks/dist/hooks.module.js';
+import htm from 'https://unpkg.com/htm@3.1.1/dist/htm.module.js';
+const html = htm.bind(h);
+
+const CHAIN_NAMES = {
+  1: 'Ethereum', 8453: 'Base', 42161: 'Arbitrum One', 137: 'Polygon',
+  56: 'BNB Chain', 10: 'OP Mainnet', 43114: 'Avalanche', 100: 'Gnosis',
+  1868: 'Soneium', 59144: 'Linea', 130: 'Unichain', 146: 'Sonic', 57073: 'Ink'
+};
+
+// =========================================================================
+// WebSocket Hook
+// =========================================================================
+function useWebSocket(url) {
+  const [data, setData] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const wsRef = useRef(null);
+
+  useEffect(() => {
+    let ws;
+    let retryTimeout;
+    function connect() {
+      ws = new WebSocket(url);
+      wsRef.current = ws;
+      ws.onopen = () => setConnected(true);
+      ws.onmessage = (e) => {
+        try { setData(JSON.parse(e.data)); } catch {}
+      };
+      ws.onclose = () => {
+        setConnected(false);
+        retryTimeout = setTimeout(connect, 2000);
+      };
+      ws.onerror = () => ws.close();
+    }
+    connect();
+    return () => {
+      clearTimeout(retryTimeout);
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [url]);
+
+  return { data, connected };
+}
+
+// =========================================================================
+// Summary Bar
+// =========================================================================
+function SummaryBar({ chains }) {
+  if (!chains || chains.length === 0) return html`<div class="summary"><div class="summary-card"><div class="label">Status</div><div class="value">Waiting...</div></div></div>`;
+
+  const now = Math.floor(Date.now() / 1000);
+  const totalTransfers = chains.reduce((s, c) => s + Number(c.total_transfers || 0), 0);
+  const totalSuccess = chains.reduce((s, c) => s + Number(c.successful_fetches || 0), 0);
+  const totalFailed = chains.reduce((s, c) => s + Number(c.failed_fetches || 0), 0);
+  const totalTimedOut = chains.reduce((s, c) => s + Number(c.timed_out_fetches || 0), 0);
+  const activeChains = chains.filter(c => (now - Number(c.updated_at || 0)) < 10).length;
+  const staleChains = chains.length - activeChains;
+
+  return html`
+    <div class="summary">
+      <div class="summary-card"><div class="label">Active Chains</div><div class="value ${staleChains > 0 ? 'yellow' : 'green'}">${activeChains}/${chains.length}</div></div>
+      <div class="summary-card"><div class="label">Total Events</div><div class="value">${totalTransfers.toLocaleString()}</div></div>
+      <div class="summary-card"><div class="label">Successful Fetches</div><div class="value green">${totalSuccess.toLocaleString()}</div></div>
+      <div class="summary-card"><div class="label">Failed Fetches</div><div class="value ${totalFailed > 0 ? 'red' : ''}">${totalFailed.toLocaleString()}</div></div>
+      <div class="summary-card"><div class="label">Timed Out</div><div class="value ${totalTimedOut > 0 ? 'red' : ''}">${totalTimedOut.toLocaleString()}</div></div>
+    </div>
+  `;
+}
+
+// =========================================================================
+// Chain Card
+// =========================================================================
+function ChainCard({ chain }) {
+  const now = Math.floor(Date.now() / 1000);
+  const age = now - Number(chain.updated_at || 0);
+  const status = age > 10 ? 'stale' : (Number(chain.pending_ranges) > 0 || Number(chain.last_chance_count) > 0) ? 'warning' : 'healthy';
+  const behind = Number(chain.current_block || 0) - Number(chain.checkpoint_block || 0);
+
+  return html`
+    <div class="chain-card ${status}">
+      <div class="name">${chain.chain_name || CHAIN_NAMES[chain.chain_id] || 'Chain ' + chain.chain_id} <span class="chain-id">#${chain.chain_id}</span></div>
+      <div class="row"><span class="k">Current Block</span><span class="v">${Number(chain.current_block).toLocaleString()}</span></div>
+      <div class="row"><span class="k">Checkpoint</span><span class="v">${Number(chain.checkpoint_block).toLocaleString()}</span></div>
+      <div class="row"><span class="k">Blocks Behind</span><span class="v ${behind > 100 ? 'err' : behind > 20 ? 'warn' : ''}">${behind}</span></div>
+      <div class="divider"></div>
+      <div class="row"><span class="k">Pending Ranges</span><span class="v ${Number(chain.pending_ranges) > 0 ? 'warn' : ''}">${chain.pending_ranges}</span></div>
+      <div class="row"><span class="k">Last Chance</span><span class="v ${Number(chain.last_chance_count) > 0 ? 'warn' : ''}">${chain.last_chance_count}</span></div>
+      <div class="row"><span class="k">In-Flight</span><span class="v">${chain.inflight_fetches}</span></div>
+      <div class="divider"></div>
+      <div class="row"><span class="k">Success / Fail / Timeout</span><span class="v">${Number(chain.successful_fetches).toLocaleString()} / <span class="${Number(chain.failed_fetches) > 0 ? 'err' : ''}">${chain.failed_fetches}</span> / <span class="${Number(chain.timed_out_fetches) > 0 ? 'err' : ''}">${chain.timed_out_fetches}</span></span></div>
+      <div class="row"><span class="k">Events Processed</span><span class="v">${Number(chain.total_transfers).toLocaleString()}</span></div>
+      <div class="row"><span class="k">Blocks Processed</span><span class="v">${Number(chain.blocks_processed).toLocaleString()}</span></div>
+      <div class="row"><span class="k">Buffer Size</span><span class="v">${chain.buffer_size}</span></div>
+      <div class="row"><span class="k">Updated</span><span class="v ${age > 10 ? 'err' : ''}">${age}s ago</span></div>
+    </div>
+  `;
+}
+
+// =========================================================================
+// API Tester
+// =========================================================================
+const ENDPOINTS = {
+  'System': [
+    { method: 'GET', path: '/networks', params: [] },
+    { method: 'GET', path: '/stats', params: [] },
+    { method: 'GET', path: '/monitor/stats', params: [] },
+  ],
+  'ERC20': [
+    { method: 'GET', path: '/erc20/from/{chainId}/{address}', params: ['chainId', 'address'] },
+    { method: 'GET', path: '/erc20/to/{chainId}/{address}', params: ['chainId', 'address'] },
+    { method: 'GET', path: '/erc20/both/{chainId}/{from}/{to}', params: ['chainId', 'from', 'to'] },
+    { method: 'GET', path: '/erc20/address/{chainId}/{address}', params: ['chainId', 'address'] },
+    { method: 'GET', path: '/erc20/fusion-plus/{chainId}/{address}', params: ['chainId', 'address'] },
+    { method: 'GET', path: '/erc20/fusion-single/{chainId}/{address}', params: ['chainId', 'address'] },
+    { method: 'GET', path: '/erc20/crypto2fiat/{chainId}/{address}', params: ['chainId', 'address'] },
+  ],
+  'Fusion+': [
+    { method: 'GET', path: '/fusion-plus/swap/{orderHash}', params: ['orderHash'] },
+    { method: 'GET', path: '/fusion-plus/address/{address}', params: ['address'] },
+    { method: 'GET', path: '/fusion-plus/pending', params: [] },
+    { method: 'GET', path: '/fusion-plus/completed', params: [] },
+    { method: 'GET', path: '/fusion-plus/src-chain/{chainId}', params: ['chainId'] },
+    { method: 'GET', path: '/fusion-plus/dst-chain/{chainId}', params: ['chainId'] },
+    { method: 'GET', path: '/transfer/swap/{chainId}/{txHash}', params: ['chainId', 'txHash'] },
+  ],
+  'Fusion': [
+    { method: 'GET', path: '/fusion/swap/{orderHash}', params: ['orderHash'] },
+    { method: 'GET', path: '/fusion/maker/{address}', params: ['address'] },
+    { method: 'GET', path: '/fusion/taker/{address}', params: ['address'] },
+    { method: 'GET', path: '/fusion/chain/{chainId}', params: ['chainId'] },
+    { method: 'GET', path: '/fusion/filled', params: [] },
+    { method: 'GET', path: '/fusion/cancelled', params: [] },
+    { method: 'GET', path: '/fusion/recent', params: [] },
+  ],
+  'Crypto2Fiat': [
+    { method: 'GET', path: '/crypto2fiat/order/{orderId}', params: ['orderId'] },
+    { method: 'GET', path: '/crypto2fiat/recipient/{address}', params: ['address'] },
+    { method: 'GET', path: '/crypto2fiat/chain/{chainId}', params: ['chainId'] },
+    { method: 'GET', path: '/crypto2fiat/token/{token}', params: ['token'] },
+    { method: 'GET', path: '/crypto2fiat/recent', params: [] },
+    { method: 'GET', path: '/crypto2fiat/tx/{chainId}/{txHash}', params: ['chainId', 'txHash'] },
+  ],
+  'Streaming': [
+    { method: 'GET', path: '/erc20/stream/{chainId}/{address}?since_id=0&limit=100&direction=both', params: ['chainId', 'address'] },
+    { method: 'POST', path: '/erc20/batch/{chainId}', params: ['chainId'], body: true, bodyTemplate: '{"addresses":[{"address":"0x...","sinceId":0}],"limit":50,"direction":"both"}' },
+  ],
+};
+
+function EndpointRow({ ep }) {
+  const [values, setValues] = useState({});
+  const [body, setBody] = useState(ep.bodyTemplate || '');
+  const [response, setResponse] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const send = useCallback(async () => {
+    setLoading(true);
+    setResponse(null);
+    try {
+      let url = ep.path;
+      for (const p of ep.params) {
+        url = url.replace('{' + p + '}', values[p] || '');
+      }
+      const opts = { method: ep.method };
+      if (ep.body && ep.method === 'POST') {
+        opts.headers = { 'Content-Type': 'application/json' };
+        opts.body = body;
+      }
+      const start = performance.now();
+      const res = await fetch(url, opts);
+      const elapsed = Math.round(performance.now() - start);
+      const text = await res.text();
+      let formatted;
+      try { formatted = JSON.stringify(JSON.parse(text), null, 2); } catch { formatted = text; }
+      setResponse({ status: res.status, elapsed, body: formatted });
+    } catch (err) {
+      setResponse({ status: 0, elapsed: 0, body: 'Error: ' + err.message });
+    }
+    setLoading(false);
+  }, [ep, values, body]);
+
+  return html`
+    <div class="endpoint">
+      <div class="top">
+        <span class="method ${ep.method.toLowerCase()}">${ep.method}</span>
+        <span class="path">${ep.path}</span>
+        <button class="send-btn" onClick=${send} disabled=${loading}>${loading ? '...' : 'Send'}</button>
+      </div>
+      ${ep.params.length > 0 && html`
+        <div class="inputs">
+          ${ep.params.map(p => html`<input key=${p} placeholder=${p} value=${values[p] || ''} onInput=${(e) => setValues({...values, [p]: e.target.value})} />`)}
+        </div>
+      `}
+      ${ep.body && html`
+        <div class="inputs">
+          <textarea value=${body} onInput=${(e) => setBody(e.target.value)} />
+        </div>
+      `}
+      ${response && html`
+        <div class="response-box">
+          <span style="color: ${response.status >= 200 && response.status < 300 ? '#22c55e' : '#ef4444'}">${response.status}</span> (${response.elapsed}ms)\n${response.body}
+        </div>
+      `}
+    </div>
+  `;
+}
+
+function ApiTester() {
+  const categories = Object.keys(ENDPOINTS);
+  const [activeCategory, setActiveCategory] = useState(categories[0]);
+
+  return html`
+    <div class="api-section">
+      <div class="api-tabs">
+        ${categories.map(cat => html`
+          <div class="api-tab ${activeCategory === cat ? 'active' : ''}" onClick=${() => setActiveCategory(cat)}>${cat}</div>
+        `)}
+      </div>
+      <div class="endpoint-list">
+        ${(ENDPOINTS[activeCategory] || []).map((ep, i) => html`<${EndpointRow} key=${activeCategory + '-' + i} ep=${ep} />`)}
+      </div>
+    </div>
+  `;
+}
+
+// =========================================================================
+// App
+// =========================================================================
+function App() {
+  const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/monitor/ws';
+  const { data, connected } = useWebSocket(wsUrl);
+  const [activeTab, setActiveTab] = useState('monitor');
+
+  const chains = data?.chains || [];
+
+  return html`
+    <div class="header">
+      <h1>Universal Listener Monitor</h1>
+      <div class="status">
+        <div class="dot ${connected ? 'connected' : 'disconnected'}"></div>
+        ${connected ? 'Live' : 'Reconnecting...'}
+      </div>
+    </div>
+    <div class="tabs">
+      <div class="tab ${activeTab === 'monitor' ? 'active' : ''}" onClick=${() => setActiveTab('monitor')}>Network Status</div>
+      <div class="tab ${activeTab === 'api' ? 'active' : ''}" onClick=${() => setActiveTab('api')}>API Tester</div>
+    </div>
+    <div class="container">
+      ${activeTab === 'monitor' && html`
+        <${SummaryBar} chains=${chains} />
+        <div class="grid">
+          ${chains.map(c => html`<${ChainCard} key=${c.chain_id} chain=${c} />`)}
+        </div>
+      `}
+      ${activeTab === 'api' && html`<${ApiTester} />`}
+    </div>
+  `;
+}
+
+render(html`<${App} />`, document.getElementById('app'));
+</script>
+</body>
+</html>

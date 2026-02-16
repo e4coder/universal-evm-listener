@@ -5,13 +5,14 @@ use crate::fusion::{
 };
 use crate::rpc::RpcClient;
 use crate::types::{
-    FusionPlusSwap, FusionSwap, Log, NetworkConfig, Transfer,
+    ChainStats, FusionPlusSwap, FusionSwap, Log, NetworkConfig, Transfer,
     ESCROW_FACTORY, SRC_ESCROW_CREATED_TOPIC, DST_ESCROW_CREATED_TOPIC,
     ESCROW_WITHDRAWAL_TOPIC, ESCROW_CANCELLED_TOPIC,
     AGGREGATION_ROUTER_V6, AGGREGATION_ROUTER_ZKSYNC,
     ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC,
     CRYPTO2FIAT_TOPIC,
 };
+use std::sync::atomic::Ordering::Relaxed;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,6 +143,7 @@ async fn fetcher_loop(
     start_from: u64,
     config: FetcherConfig,
     tx: mpsc::Sender<FetchedData>,
+    stats: Arc<ChainStats>,
 ) {
     let mut next_from = start_from + 1;
     let step = config.max_blocks_per_query; // fixed step, no adaptive sizing
@@ -166,6 +168,7 @@ async fn fetcher_loop(
                 Ok(tip) => {
                     cached_safe_tip = tip.saturating_sub(config.confirmation_blocks);
                     tip_fetched_at = Instant::now();
+                    stats.current_block.store(tip, Relaxed);
                 }
                 Err(e) => {
                     error!("[{}] Fetcher: failed to get block number: {}", chain_name, e);
@@ -218,6 +221,11 @@ async fn fetcher_loop(
             }
         }
 
+        // Update stats after fill
+        stats.pending_ranges.store(pending_ranges.len() as u64, Relaxed);
+        stats.last_chance_count.store(last_chance_ranges.len() as u64, Relaxed);
+        stats.inflight_fetches.store(join_set.len() as u64, Relaxed);
+
         // 3. If nothing in-flight, we're caught up - sleep and retry
         if join_set.is_empty() {
             sleep(poll_interval).await;
@@ -231,6 +239,7 @@ async fn fetcher_loop(
 
         match join_result {
             Ok((from, to, Ok(data))) => {
+                stats.successful_fetches.fetch_add(1, Relaxed);
                 debug!(
                     "[{}] Fetcher: completed blocks {}-{} ({} transfer logs)",
                     chain_name, from, to, data.transfer_logs.len()
@@ -241,8 +250,10 @@ async fn fetcher_loop(
                 }
             }
             Ok((from, to, Err(e))) => {
+                stats.failed_fetches.fetch_add(1, Relaxed);
                 if last_chance_ranges.remove(&(from, to)) {
                     // Last chance with 2x timeout also failed — truly give up
+                    stats.timed_out_fetches.fetch_add(1, Relaxed);
                     error!(
                         "[{}] Fetcher: GIVING UP on blocks {}-{} (last chance failed): {}",
                         chain_name, from, to, e
@@ -316,22 +327,24 @@ pub struct ChainPoller {
     rpc: Arc<RpcClient>,
     slow_rpc: Arc<RpcClient>,
     db: Arc<Database>,
+    stats: Arc<ChainStats>,
     config: PollerConfig,
     block_timestamp_cache: HashMap<u64, u64>,
 }
 
 impl ChainPoller {
-    pub fn new(network: NetworkConfig, db: Arc<Database>) -> Self {
+    pub fn new(network: NetworkConfig, db: Arc<Database>, stats: Arc<ChainStats>) -> Self {
         let mut config = PollerConfig::default();
         config.max_blocks_per_query = network.blocks_per_request;
         config.max_concurrent_fetches = network.concurrent_fetches;
         config.channel_capacity = network.concurrent_fetches * 4;
-        Self::with_config(network, db, config)
+        Self::with_config(network, db, stats, config)
     }
 
     pub fn with_config(
         network: NetworkConfig,
         db: Arc<Database>,
+        stats: Arc<ChainStats>,
         config: PollerConfig,
     ) -> Self {
         let rpc = Arc::new(RpcClient::new(&network.rpc_url, network.name));
@@ -342,6 +355,7 @@ impl ChainPoller {
             rpc,
             slow_rpc,
             db,
+            stats,
             config,
             block_timestamp_cache: HashMap::new(),
         }
@@ -383,12 +397,13 @@ impl ChainPoller {
         // Spawn fetcher as independent task
         let rpc_clone = Arc::clone(&self.rpc);
         let slow_rpc_clone = Arc::clone(&self.slow_rpc);
+        let stats_clone = Arc::clone(&self.stats);
         let chain_id = self.network.chain_id;
         let chain_name = self.network.name;
         let fetcher_handle = tokio::spawn(async move {
             fetcher_loop(
                 rpc_clone, slow_rpc_clone, chain_id, chain_name,
-                last_processed_block, fetcher_config, tx,
+                last_processed_block, fetcher_config, tx, stats_clone,
             ).await;
         });
 
@@ -455,6 +470,11 @@ impl ChainPoller {
                                         self.network.name, events, data.to_block
                                     );
                                 }
+                                let blocks_in_range = data.to_block - data.from_block + 1;
+                                self.stats.checkpoint_block.store(data.to_block, Relaxed);
+                                self.stats.blocks_processed.fetch_add(blocks_in_range, Relaxed);
+                                self.stats.total_transfers.fetch_add(events as u64, Relaxed);
+                                self.stats.buffer_size.store(buffer.len() as u64, Relaxed);
                                 expected_from = data.to_block + 1;
                                 processed_any = true;
                                 retry_counts.remove(&data.from_block);

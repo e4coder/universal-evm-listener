@@ -208,6 +208,19 @@ export class PostgresCache {
     }
   }
 
+  // Listener Stats (Monitoring Dashboard)
+
+  async getListenerStats(): Promise<any[]> {
+    try {
+      const result = await this.pool.query(
+        'SELECT * FROM listener_stats ORDER BY chain_id'
+      );
+      return result.rows;
+    } catch {
+      return [];
+    }
+  }
+
   // =========================================================================
   // Fusion+ Query Methods
   // =========================================================================

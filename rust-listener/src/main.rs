@@ -11,6 +11,8 @@ mod types;
 use crate::config::{get_database_url, get_ttl_secs, load_networks};
 use crate::db::Database;
 use crate::poller::ChainPoller;
+use crate::types::ChainStats;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -106,21 +108,51 @@ async fn main() {
         }
     });
 
-    // Spawn poller for each chain
+    // Spawn poller for each chain (with per-chain stats)
     let mut poller_handles = Vec::new();
+    let mut all_stats: Vec<Arc<ChainStats>> = Vec::new();
 
     for network in networks {
         let db_clone = Arc::clone(&db);
         let chain_name = network.name.to_string();
+        let stats = Arc::new(ChainStats::new(network.chain_id, network.name));
+        all_stats.push(Arc::clone(&stats));
 
         let handle = tokio::spawn(async move {
-            let mut poller = ChainPoller::new(network, db_clone);
+            let mut poller = ChainPoller::new(network, db_clone, stats);
             poller.run().await;
         });
 
         info!("Spawned poller for {}", chain_name);
         poller_handles.push(handle);
     }
+
+    // Spawn stats writer task (every 1 second, writes all chain stats to DB)
+    let db_stats = Arc::clone(&db);
+    let stats_handle = tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            for stats in &all_stats {
+                if let Err(e) = db_stats.upsert_listener_stats(
+                    stats.chain_id,
+                    stats.chain_name,
+                    stats.current_block.load(Relaxed),
+                    stats.checkpoint_block.load(Relaxed),
+                    stats.pending_ranges.load(Relaxed),
+                    stats.last_chance_count.load(Relaxed),
+                    stats.inflight_fetches.load(Relaxed),
+                    stats.successful_fetches.load(Relaxed),
+                    stats.failed_fetches.load(Relaxed),
+                    stats.timed_out_fetches.load(Relaxed),
+                    stats.blocks_processed.load(Relaxed),
+                    stats.total_transfers.load(Relaxed),
+                    stats.buffer_size.load(Relaxed),
+                ).await {
+                    warn!("Failed to write stats for chain {}: {}", stats.chain_id, e);
+                }
+            }
+        }
+    });
 
     info!("All {} pollers started", poller_handles.len());
     info!("Press Ctrl+C to stop");
@@ -143,6 +175,7 @@ async fn main() {
         handle.abort();
     }
     cleanup_handle.abort();
+    stats_handle.abort();
 
     info!("Shutdown complete");
 }

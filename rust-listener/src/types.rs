@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU64;
 
 /// ERC20 Transfer event topic (keccak256 of "Transfer(address,address,uint256)")
 pub const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -275,6 +276,53 @@ pub struct FusionSwap {
     pub remaining: String,
     pub is_partial_fill: bool,
     pub status: String,
+}
+
+// ============================================================================
+// Crypto2Fiat Data Structures
+// ============================================================================
+
+// ============================================================================
+// Monitoring / Stats
+// ============================================================================
+
+/// Per-chain live statistics (lock-free AtomicU64 counters)
+pub struct ChainStats {
+    pub chain_id: u32,
+    pub chain_name: &'static str,
+    // Fetcher counters
+    pub current_block: AtomicU64,
+    pub pending_ranges: AtomicU64,
+    pub last_chance_count: AtomicU64,
+    pub inflight_fetches: AtomicU64,
+    pub successful_fetches: AtomicU64,
+    pub failed_fetches: AtomicU64,
+    pub timed_out_fetches: AtomicU64,
+    // Processor counters
+    pub checkpoint_block: AtomicU64,
+    pub blocks_processed: AtomicU64,
+    pub total_transfers: AtomicU64,
+    pub buffer_size: AtomicU64,
+}
+
+impl ChainStats {
+    pub fn new(chain_id: u32, chain_name: &'static str) -> Self {
+        Self {
+            chain_id,
+            chain_name,
+            current_block: AtomicU64::new(0),
+            pending_ranges: AtomicU64::new(0),
+            last_chance_count: AtomicU64::new(0),
+            inflight_fetches: AtomicU64::new(0),
+            successful_fetches: AtomicU64::new(0),
+            failed_fetches: AtomicU64::new(0),
+            timed_out_fetches: AtomicU64::new(0),
+            checkpoint_block: AtomicU64::new(0),
+            blocks_processed: AtomicU64::new(0),
+            total_transfers: AtomicU64::new(0),
+            buffer_size: AtomicU64::new(0),
+        }
+    }
 }
 
 // ============================================================================

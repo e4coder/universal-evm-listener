@@ -1,5 +1,8 @@
 import 'dotenv/config';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import WebSocket from 'ws';
 import { PostgresCache } from '../cache/postgres';
 import { QueryService } from '../services/queryService';
 import { getNetworkConfig } from '../config/networks';
@@ -406,6 +409,30 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
     }
 
+    // =========================================================================
+    // Monitoring Dashboard
+    // =========================================================================
+
+    // GET /monitor - Serve monitoring dashboard HTML
+    if (path === '/monitor') {
+      try {
+        const filePath = __filename.replace(/server\.[jt]s$/, 'monitor.html');
+        const html = fs.readFileSync(filePath, 'utf-8');
+        res.setHeader('Content-Type', 'text/html');
+        res.statusCode = 200;
+        res.end(html);
+        return;
+      } catch (err: any) {
+        return sendResponse(res, 500, { success: false, error: 'Failed to load monitor page: ' + err.message });
+      }
+    }
+
+    // GET /monitor/stats - JSON endpoint for listener stats
+    if (path === '/monitor/stats') {
+      const stats = await cache.getListenerStats();
+      return sendResponse(res, 200, { success: true, data: stats });
+    }
+
     // 404 Not Found
     return sendResponse(res, 404, { success: false, error: 'Endpoint not found' });
   } catch (error: any) {
@@ -479,9 +506,40 @@ async function startServer(): Promise<void> {
     console.log('  POST /erc20/batch/:chainId  (body: {addresses: [{address, sinceId}], limit, direction})');
   });
 
+  // WebSocket server for live monitoring stats
+  const wss = new WebSocket.Server({ noServer: true });
+
+  server.on('upgrade', (req: http.IncomingMessage, socket: any, head: Buffer) => {
+    const { pathname } = new URL(req.url || '/', `http://${req.headers.host}`);
+    if (pathname === '/monitor/ws') {
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws));
+    } else {
+      socket.destroy();
+    }
+  });
+
+  // Broadcast stats every 1 second (only when clients connected)
+  const statsInterval = setInterval(async () => {
+    if (wss.clients.size === 0) return;
+    try {
+      const stats = await cache.getListenerStats();
+      const msg = JSON.stringify({ type: 'stats', timestamp: Date.now(), chains: stats });
+      wss.clients.forEach((c) => {
+        if (c.readyState === WebSocket.OPEN) c.send(msg);
+      });
+    } catch (err) {
+      // ignore broadcast errors
+    }
+  }, 1000);
+
+  console.log('  WebSocket: ws://localhost:' + PORT + '/monitor/ws');
+  console.log('  Dashboard: http://localhost:' + PORT + '/monitor');
+
   // Graceful shutdown
   process.on('SIGINT', async () => {
     console.log('\nShutting down API server...');
+    clearInterval(statsInterval);
+    wss.close();
     server.close();
     await cache.close();
     console.log('Shutdown complete');

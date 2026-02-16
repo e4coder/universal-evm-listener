@@ -40,9 +40,9 @@ impl Database {
         cfg.dbname = config.get_dbname().map(|s| s.to_string());
 
         // Limit pool size to prevent unbounded connection growth
-        // 13 chains + 1 cleanup task = 14 concurrent users; pool size 24 gives headroom
+        // 13 chains + 1 cleanup task + 1 stats writer = 15 concurrent users; pool size 28 gives headroom
         cfg.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: 24,
+            max_size: 28,
             ..Default::default()
         });
 
@@ -172,6 +172,27 @@ impl Database {
                 log_index INTEGER NOT NULL,
                 created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
                 UNIQUE(chain_id, tx_hash, log_index)
+            )",
+            &[],
+        ).await?;
+
+        // Listener stats table (monitoring dashboard)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS listener_stats (
+                chain_id INTEGER PRIMARY KEY,
+                chain_name VARCHAR(30) NOT NULL,
+                current_block BIGINT DEFAULT 0,
+                checkpoint_block BIGINT DEFAULT 0,
+                pending_ranges INTEGER DEFAULT 0,
+                last_chance_count INTEGER DEFAULT 0,
+                inflight_fetches INTEGER DEFAULT 0,
+                successful_fetches BIGINT DEFAULT 0,
+                failed_fetches BIGINT DEFAULT 0,
+                timed_out_fetches BIGINT DEFAULT 0,
+                blocks_processed BIGINT DEFAULT 0,
+                total_transfers BIGINT DEFAULT 0,
+                buffer_size INTEGER DEFAULT 0,
+                updated_at BIGINT DEFAULT 0
             )",
             &[],
         ).await?;
@@ -1006,6 +1027,75 @@ impl Database {
         ).await?;
 
         Ok(deleted as usize)
+    }
+
+    // =========================================================================
+    // Listener Stats Methods (Monitoring)
+    // =========================================================================
+
+    /// Upsert listener stats for a single chain
+    pub async fn upsert_listener_stats(
+        &self,
+        chain_id: u32,
+        chain_name: &str,
+        current_block: u64,
+        checkpoint_block: u64,
+        pending_ranges: u64,
+        last_chance_count: u64,
+        inflight_fetches: u64,
+        successful_fetches: u64,
+        failed_fetches: u64,
+        timed_out_fetches: u64,
+        blocks_processed: u64,
+        total_transfers: u64,
+        buffer_size: u64,
+    ) -> Result<(), DbError> {
+        let client = self.pool.get().await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        client.execute(
+            "INSERT INTO listener_stats (
+                chain_id, chain_name, current_block, checkpoint_block,
+                pending_ranges, last_chance_count, inflight_fetches,
+                successful_fetches, failed_fetches, timed_out_fetches,
+                blocks_processed, total_transfers, buffer_size, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (chain_id) DO UPDATE SET
+                chain_name = EXCLUDED.chain_name,
+                current_block = EXCLUDED.current_block,
+                checkpoint_block = EXCLUDED.checkpoint_block,
+                pending_ranges = EXCLUDED.pending_ranges,
+                last_chance_count = EXCLUDED.last_chance_count,
+                inflight_fetches = EXCLUDED.inflight_fetches,
+                successful_fetches = EXCLUDED.successful_fetches,
+                failed_fetches = EXCLUDED.failed_fetches,
+                timed_out_fetches = EXCLUDED.timed_out_fetches,
+                blocks_processed = EXCLUDED.blocks_processed,
+                total_transfers = EXCLUDED.total_transfers,
+                buffer_size = EXCLUDED.buffer_size,
+                updated_at = EXCLUDED.updated_at",
+            &[
+                &(chain_id as i32),
+                &chain_name,
+                &(current_block as i64),
+                &(checkpoint_block as i64),
+                &(pending_ranges as i32),
+                &(last_chance_count as i32),
+                &(inflight_fetches as i32),
+                &(successful_fetches as i64),
+                &(failed_fetches as i64),
+                &(timed_out_fetches as i64),
+                &(blocks_processed as i64),
+                &(total_transfers as i64),
+                &(buffer_size as i32),
+                &now,
+            ],
+        ).await?;
+
+        Ok(())
     }
 
     // =========================================================================

@@ -26,13 +26,14 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 10,
             concurrent_fetches: 10,
         },
-        // Dense tier — 20 blocks × 10 concurrent = 200 blocks/batch
+        // Dense tier — 50 blocks × 15 concurrent = 750 blocks/batch
+        // Arbitrum ~250ms block time (~240 blocks/min) needs high throughput
         NetworkConfig {
             chain_id: 42161,
             name: "Arbitrum One",
             rpc_url: alchemy_url("arb-mainnet", &api_key),
-            blocks_per_request: 20,
-            concurrent_fetches: 10,
+            blocks_per_request: 50,
+            concurrent_fetches: 15,
         },
         // Dense tier — 10 blocks × 10 concurrent = 100 blocks/batch
         NetworkConfig {

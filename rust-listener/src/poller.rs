@@ -648,6 +648,59 @@ impl ChainPoller {
         data: &FetchedData,
     ) -> Result<usize, String> {
         // =====================================================================
+        // Pre-fetch all unique block timestamps in parallel
+        // =====================================================================
+        {
+            let mut needed_blocks: HashSet<u64> = HashSet::new();
+            for log in &data.transfer_logs {
+                needed_blocks.insert(log.block_number_u64());
+            }
+            for log in &data.fusion_plus_factory_logs {
+                needed_blocks.insert(log.block_number_u64());
+            }
+            for log in &data.fusion_plus_escrow_logs {
+                needed_blocks.insert(log.block_number_u64());
+            }
+            for log in &data.fusion_logs {
+                needed_blocks.insert(log.block_number_u64());
+            }
+            for log in &data.crypto2fiat_logs {
+                needed_blocks.insert(log.block_number_u64());
+            }
+
+            // Filter out already-cached block numbers
+            let uncached: Vec<u64> = needed_blocks
+                .into_iter()
+                .filter(|b| !self.block_timestamp_cache.contains_key(b))
+                .collect();
+
+            if !uncached.is_empty() {
+                let mut futs = Vec::with_capacity(uncached.len());
+                for block_num in &uncached {
+                    let rpc = Arc::clone(&self.rpc);
+                    let bn = *block_num;
+                    futs.push(async move {
+                        let result = rpc.get_block(bn).await;
+                        (bn, result)
+                    });
+                }
+
+                let results = futures::future::join_all(futs).await;
+
+                for (block_num, result) in results {
+                    match result {
+                        Ok(block) => {
+                            self.block_timestamp_cache.insert(block_num, block.timestamp_u64());
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to get block {}: {}", block_num, e));
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
         // Build swap_type map from fusion/c2f logs
         // =====================================================================
         let mut swap_type_map: HashMap<String, &'static str> = HashMap::new();

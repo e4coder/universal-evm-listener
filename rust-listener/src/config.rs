@@ -18,6 +18,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("eth-mainnet", &api_key),
             blocks_per_request: 10,
             concurrent_fetches: 10,
+            poll_interval_ms: 500,
         },
         NetworkConfig {
             chain_id: 8453,
@@ -25,15 +26,17 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("base-mainnet", &api_key),
             blocks_per_request: 10,
             concurrent_fetches: 10,
+            poll_interval_ms: 500,
         },
         // Dense tier — 50 blocks × 15 concurrent = 750 blocks/batch
-        // Arbitrum ~250ms block time (~240 blocks/min) needs high throughput
+        // Arbitrum ~250ms block time (~240 blocks/min) needs fast polling
         NetworkConfig {
             chain_id: 42161,
             name: "Arbitrum One",
             rpc_url: alchemy_url("arb-mainnet", &api_key),
             blocks_per_request: 50,
             concurrent_fetches: 15,
+            poll_interval_ms: 100,
         },
         // Dense tier — 10 blocks × 10 concurrent = 100 blocks/batch
         NetworkConfig {
@@ -42,6 +45,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("polygon-mainnet", &api_key),
             blocks_per_request: 10,
             concurrent_fetches: 10,
+            poll_interval_ms: 500,
         },
         NetworkConfig {
             chain_id: 56,
@@ -49,6 +53,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("bnb-mainnet", &api_key),
             blocks_per_request: 10,
             concurrent_fetches: 10,
+            poll_interval_ms: 500,
         },
         // Medium tier — 50 blocks × 5 concurrent = 250 blocks/batch
         NetworkConfig {
@@ -57,6 +62,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("opt-mainnet", &api_key),
             blocks_per_request: 50,
             concurrent_fetches: 5,
+            poll_interval_ms: 500,
         },
         NetworkConfig {
             chain_id: 43114,
@@ -64,6 +70,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("avax-mainnet", &api_key),
             blocks_per_request: 50,
             concurrent_fetches: 5,
+            poll_interval_ms: 500,
         },
         NetworkConfig {
             chain_id: 100,
@@ -71,6 +78,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("gnosis-mainnet", &api_key),
             blocks_per_request: 50,
             concurrent_fetches: 5,
+            poll_interval_ms: 500,
         },
         NetworkConfig {
             chain_id: 1868,
@@ -78,6 +86,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("soneium-mainnet", &api_key),
             blocks_per_request: 50,
             concurrent_fetches: 5,
+            poll_interval_ms: 500,
         },
         // Sparse tier — 200 blocks × 3 concurrent = 600 blocks/batch
         NetworkConfig {
@@ -86,6 +95,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("linea-mainnet", &api_key),
             blocks_per_request: 200,
             concurrent_fetches: 3,
+            poll_interval_ms: 1000,
         },
         NetworkConfig {
             chain_id: 130,
@@ -93,6 +103,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("unichain-mainnet", &api_key),
             blocks_per_request: 200,
             concurrent_fetches: 3,
+            poll_interval_ms: 1000,
         },
         NetworkConfig {
             chain_id: 146,
@@ -100,6 +111,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("sonic-mainnet", &api_key),
             blocks_per_request: 200,
             concurrent_fetches: 3,
+            poll_interval_ms: 1000,
         },
         NetworkConfig {
             chain_id: 57073,
@@ -107,6 +119,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             rpc_url: alchemy_url("ink-mainnet", &api_key),
             blocks_per_request: 200,
             concurrent_fetches: 3,
+            poll_interval_ms: 1000,
         },
     ]
 }

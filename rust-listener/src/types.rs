@@ -60,6 +60,8 @@ pub struct NetworkConfig {
     pub rpc_url: String,
     pub blocks_per_request: u64,
     pub concurrent_fetches: usize,
+    /// Polling interval when caught up to tip (ms). Lower = faster for high-throughput chains.
+    pub poll_interval_ms: u64,
 }
 
 /// Transfer event data to store in PostgreSQL

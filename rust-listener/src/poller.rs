@@ -44,10 +44,10 @@ impl Default for PollerConfig {
             reorg_safety_blocks: 10,
             confirmation_blocks: 3,
             poll_interval_ms: 500,
-            max_blocks_per_query: 500,
+            max_blocks_per_query: 50,
             max_backfill_blocks: 500,
-            max_concurrent_fetches: 3,
-            channel_capacity: 6,
+            max_concurrent_fetches: 10,
+            channel_capacity: 15,
         }
     }
 }
@@ -69,13 +69,6 @@ struct FetchedData {
     fusion_logs: Vec<Log>,
     crypto2fiat_logs: Vec<Log>,
     transfer_logs: Vec<Log>,
-}
-
-/// Check if an error string indicates a response-too-large or timeout error
-fn is_adaptive_step_error(err: &str) -> bool {
-    let err_lower = err.to_lowercase();
-    err_lower.contains("too big") || err_lower.contains("too large") || err.contains("-32008")
-        || err_lower.contains("timed out") || err_lower.contains("timeout")
 }
 
 /// Fetch all logs for a block range with all 5 RPC calls in parallel.
@@ -150,14 +143,15 @@ async fn fetcher_loop(
     tx: mpsc::Sender<FetchedData>,
 ) {
     let mut next_from = start_from + 1;
-    let mut step = config.max_blocks_per_query;
+    let step = config.max_blocks_per_query; // fixed step (50 blocks), no adaptive sizing
     let mut join_set: JoinSet<(u64, u64, Result<FetchedData, String>)> = JoinSet::new();
     let mut pending_ranges: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut retry_counts: HashMap<(u64, u64), u32> = HashMap::new();
     let mut cached_safe_tip: u64 = 0;
     let mut tip_fetched_at = Instant::now() - Duration::from_secs(10); // force initial refresh
     let poll_interval = Duration::from_millis(config.poll_interval_ms);
 
-    info!("[{}] Fetcher started, initial step: {}", chain_name, step);
+    info!("[{}] Fetcher started, step: {}, concurrency: {}", chain_name, step, config.max_concurrent_fetches);
 
     loop {
         // 1. Refresh chain tip if stale (>2s) or caught up with no work
@@ -183,10 +177,8 @@ async fn fetcher_loop(
         // 2. Fill JoinSet to max_concurrent from pending_ranges or new ranges
         while join_set.len() < config.max_concurrent_fetches {
             let range = if let Some(range) = pending_ranges.pop_front() {
-                // Retry range from failed fetch (already sized to reduced step)
                 Some(range)
             } else if next_from <= cached_safe_tip {
-                // Generate new range
                 let to = (next_from + step - 1).min(cached_safe_tip);
                 let range = (next_from, to);
                 next_from = to + 1;
@@ -224,39 +216,43 @@ async fn fetcher_loop(
                     "[{}] Fetcher: completed blocks {}-{} ({} transfer logs)",
                     chain_name, from, to, data.transfer_logs.len()
                 );
-                // Success: send to processor (blocks if channel full = backpressure)
+                retry_counts.remove(&(from, to));
                 if tx.send(data).await.is_err() {
                     info!("[{}] Fetcher: processor channel closed, shutting down", chain_name);
                     return;
                 }
-                // Increase step toward max on success
-                if step < config.max_blocks_per_query {
-                    step = (step * 2).min(config.max_blocks_per_query);
-                    info!("[{}] Fetcher: increased step to {}", chain_name, step);
-                }
             }
             Ok((from, to, Err(e))) => {
-                // Fetch failed
-                if is_adaptive_step_error(&e) {
-                    let old_step = step;
-                    step = (step / 2).max(1);
-                    warn!(
-                        "[{}] Fetcher: reducing step {} -> {} for blocks {}-{}: {}",
-                        chain_name, old_step, step, from, to, e
-                    );
-                } else {
-                    error!(
-                        "[{}] Fetcher: error for blocks {}-{}: {}",
-                        chain_name, from, to, e
-                    );
-                }
+                let attempts = retry_counts.entry((from, to)).or_insert(0);
+                *attempts += 1;
 
-                // Re-split the failed range with the new (potentially smaller) step
-                let mut f = from;
-                while f <= to {
-                    let t = (f + step - 1).min(to);
-                    pending_ranges.push_back((f, t));
-                    f = t + 1;
+                if *attempts >= 5 {
+                    // Give up after 5 failed attempts — send empty data so processor can advance
+                    error!(
+                        "[{}] Fetcher: GIVING UP on blocks {}-{} after {} attempts: {}",
+                        chain_name, from, to, attempts, e
+                    );
+                    retry_counts.remove(&(from, to));
+
+                    let empty_data = FetchedData {
+                        from_block: from,
+                        to_block: to,
+                        transfer_logs: vec![],
+                        fusion_plus_factory_logs: vec![],
+                        fusion_plus_escrow_logs: vec![],
+                        fusion_logs: vec![],
+                        crypto2fiat_logs: vec![],
+                    };
+                    if tx.send(empty_data).await.is_err() {
+                        info!("[{}] Fetcher: processor channel closed, shutting down", chain_name);
+                        return;
+                    }
+                } else {
+                    warn!(
+                        "[{}] Fetcher: error for blocks {}-{} (attempt {}), retrying: {}",
+                        chain_name, from, to, attempts, e
+                    );
+                    pending_ranges.push_back((from, to));
                 }
             }
             Err(join_err) => {

@@ -277,7 +277,11 @@ pub struct ChainPoller {
 
 impl ChainPoller {
     pub fn new(network: NetworkConfig, db: Arc<Database>) -> Self {
-        Self::with_config(network, db, PollerConfig::default())
+        let mut config = PollerConfig::default();
+        config.max_blocks_per_query = network.blocks_per_request;
+        config.max_concurrent_fetches = network.concurrent_fetches;
+        config.channel_capacity = network.concurrent_fetches * 2;
+        Self::with_config(network, db, config)
     }
 
     pub fn with_config(

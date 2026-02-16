@@ -57,6 +57,8 @@ pub struct NetworkConfig {
     pub chain_id: u32,
     pub name: &'static str,
     pub rpc_url: String,
+    pub blocks_per_request: u64,
+    pub concurrent_fetches: usize,
 }
 
 /// Transfer event data to store in PostgreSQL

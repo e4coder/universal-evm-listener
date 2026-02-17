@@ -1,15 +1,18 @@
 version: '3.8'
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: universal-listener-redis
+  postgres:
+    image: postgres:16-alpine
+    container_name: universal-listener-postgres
     ports:
-      - "6379:6379"
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: listener
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: universal_listener
     volumes:
-      - redis-data:/data
-    command: redis-server --appendonly yes
+      - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
 
 volumes:
-  redis-data:
+  pgdata:

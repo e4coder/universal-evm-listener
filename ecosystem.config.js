@@ -15,7 +15,7 @@ module.exports = {
       env: {
         ALCHEMY_API_KEY: process.env.ALCHEMY_API_KEY,
         DATABASE_URL: process.env.DATABASE_URL || 'postgres://erc20cache:erc20cache_pass@localhost:5433/erc20cache',
-        TTL_SECS: '600',
+        TTL_SECS: '3600',
         LOG_LEVEL: 'info',
       },
       error_file: path.join(baseDir, 'logs', 'rust-listener-error.log'),

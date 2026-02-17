@@ -62,6 +62,8 @@ pub struct NetworkConfig {
     pub concurrent_fetches: usize,
     /// Polling interval when caught up to tip (ms). Lower = faster for high-throughput chains.
     pub poll_interval_ms: u64,
+    /// Number of confirmations before processing a block. Higher = safer against reorgs.
+    pub confirmation_blocks: u64,
 }
 
 /// Transfer event data to store in PostgreSQL

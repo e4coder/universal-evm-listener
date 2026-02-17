@@ -5,11 +5,11 @@ services:
     image: postgres:16-alpine
     container_name: universal-listener-postgres
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
-      POSTGRES_USER: listener
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
-      POSTGRES_DB: universal_listener
+      POSTGRES_USER: erc20cache
+      POSTGRES_PASSWORD: erc20cache_pass
+      POSTGRES_DB: erc20cache
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped

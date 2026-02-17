@@ -19,6 +19,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 10,
             concurrent_fetches: 10,
             poll_interval_ms: 500,
+            confirmation_blocks: 12,
         },
         NetworkConfig {
             chain_id: 8453,
@@ -27,6 +28,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 10,
             concurrent_fetches: 10,
             poll_interval_ms: 500,
+            confirmation_blocks: 1,
         },
         // Dense tier — 50 blocks × 15 concurrent = 750 blocks/batch
         // Arbitrum ~250ms block time (~240 blocks/min) needs fast polling
@@ -37,6 +39,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 50,
             concurrent_fetches: 15,
             poll_interval_ms: 100,
+            confirmation_blocks: 1,
         },
         // Dense tier — 10 blocks × 10 concurrent = 100 blocks/batch
         NetworkConfig {
@@ -46,6 +49,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 10,
             concurrent_fetches: 10,
             poll_interval_ms: 500,
+            confirmation_blocks: 50,
         },
         NetworkConfig {
             chain_id: 56,
@@ -54,6 +58,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 10,
             concurrent_fetches: 10,
             poll_interval_ms: 500,
+            confirmation_blocks: 3,
         },
         // Medium tier — 50 blocks × 5 concurrent = 250 blocks/batch
         NetworkConfig {
@@ -63,6 +68,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 50,
             concurrent_fetches: 5,
             poll_interval_ms: 500,
+            confirmation_blocks: 1,
         },
         NetworkConfig {
             chain_id: 43114,
@@ -71,6 +77,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 50,
             concurrent_fetches: 5,
             poll_interval_ms: 500,
+            confirmation_blocks: 1,
         },
         NetworkConfig {
             chain_id: 100,
@@ -79,6 +86,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 50,
             concurrent_fetches: 5,
             poll_interval_ms: 500,
+            confirmation_blocks: 12,
         },
         NetworkConfig {
             chain_id: 1868,
@@ -87,6 +95,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 50,
             concurrent_fetches: 5,
             poll_interval_ms: 500,
+            confirmation_blocks: 1,
         },
         // Sparse tier — 200 blocks × 3 concurrent = 600 blocks/batch
         NetworkConfig {
@@ -96,6 +105,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 200,
             concurrent_fetches: 3,
             poll_interval_ms: 1000,
+            confirmation_blocks: 1,
         },
         NetworkConfig {
             chain_id: 130,
@@ -104,6 +114,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 200,
             concurrent_fetches: 3,
             poll_interval_ms: 1000,
+            confirmation_blocks: 1,
         },
         NetworkConfig {
             chain_id: 146,
@@ -112,6 +123,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 200,
             concurrent_fetches: 3,
             poll_interval_ms: 1000,
+            confirmation_blocks: 1,
         },
         NetworkConfig {
             chain_id: 57073,
@@ -120,6 +132,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             blocks_per_request: 200,
             concurrent_fetches: 3,
             poll_interval_ms: 1000,
+            confirmation_blocks: 1,
         },
     ]
 }
@@ -134,5 +147,5 @@ pub fn get_ttl_secs() -> u64 {
     env::var("TTL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(600) // Default 10 minutes
+        .unwrap_or(3600) // Default 1 hour
 }

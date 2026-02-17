@@ -346,6 +346,7 @@ impl ChainPoller {
         config.max_concurrent_fetches = network.concurrent_fetches;
         config.channel_capacity = network.concurrent_fetches * 4;
         config.poll_interval_ms = network.poll_interval_ms;
+        config.confirmation_blocks = network.confirmation_blocks;
         Self::with_config(network, db, stats, config)
     }
 

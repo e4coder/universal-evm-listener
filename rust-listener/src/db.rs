@@ -311,8 +311,8 @@ impl Database {
         let mut total_inserted = 0;
 
         // Multi-row INSERT: 11 params per row, PostgreSQL max ~65535 params
-        // Chunk at 500 rows (5500 params) for efficiency
-        for chunk in transfers.chunks(500) {
+        // Chunk at 5000 rows (55000 params) for efficiency
+        for chunk in transfers.chunks(5000) {
             // Pre-compute owned values so references stay valid
             let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, i64)> =
                 chunk.iter().map(|t| (

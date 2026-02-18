@@ -21,13 +21,14 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             poll_interval_ms: 500,
             confirmation_blocks: 12,
         },
+        // Base: ~2s blocks, very dense (~400 transfers/block), keep block range small
         NetworkConfig {
             chain_id: 8453,
             name: "Base",
             rpc_url: alchemy_url("base-mainnet", &api_key),
             blocks_per_request: 10,
-            concurrent_fetches: 10,
-            poll_interval_ms: 500,
+            concurrent_fetches: 15,
+            poll_interval_ms: 300,
             confirmation_blocks: 1,
         },
         // Dense tier — 50 blocks × 15 concurrent = 750 blocks/batch
@@ -41,22 +42,23 @@ pub fn load_networks() -> Vec<NetworkConfig> {
             poll_interval_ms: 100,
             confirmation_blocks: 1,
         },
-        // Dense tier — 10 blocks × 10 concurrent = 100 blocks/batch
+        // Polygon: ~2s blocks, extremely dense (~600 transfers/block), keep block range small
         NetworkConfig {
             chain_id: 137,
             name: "Polygon",
             rpc_url: alchemy_url("polygon-mainnet", &api_key),
             blocks_per_request: 10,
-            concurrent_fetches: 10,
-            poll_interval_ms: 500,
+            concurrent_fetches: 15,
+            poll_interval_ms: 300,
             confirmation_blocks: 50,
         },
+        // BNB: ~3s blocks, moderate density (~120 transfers/block)
         NetworkConfig {
             chain_id: 56,
             name: "BNB Smart Chain",
             rpc_url: alchemy_url("bnb-mainnet", &api_key),
-            blocks_per_request: 10,
-            concurrent_fetches: 10,
+            blocks_per_request: 30,
+            concurrent_fetches: 15,
             poll_interval_ms: 500,
             confirmation_blocks: 3,
         },

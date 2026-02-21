@@ -3,6 +3,8 @@ use deadpool_postgres::{Config, Pool, Runtime, PoolError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio_postgres::{NoTls, Row, types::ToSql};
+use bytes::{BytesMut, BufMut};
+use futures::SinkExt;
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -300,13 +302,95 @@ impl Database {
         Ok(result > 0)
     }
 
-    /// Insert multiple transfers using multi-row INSERT for efficiency
-    /// Instead of N individual queries, this sends 1 query per 500 rows
+    /// Insert transfers using COPY protocol via staging table for high throughput.
+    /// Uses: CREATE TEMP TABLE → COPY FROM STDIN → INSERT...SELECT ON CONFLICT DO NOTHING
+    async fn insert_transfers_copy(&self, chain_id: u32, transfers: &[Transfer]) -> Result<usize, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let chain_id_i32 = chain_id as i32;
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+
+        // 1. Create temp staging table (auto-drops on commit/rollback)
+        tx.execute(
+            "CREATE TEMP TABLE _transfers_staging (LIKE transfers INCLUDING DEFAULTS) ON COMMIT DROP",
+            &[],
+        ).await?;
+
+        // 2. COPY data into staging table via text-format stream
+        let sink = tx.copy_in(
+            "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) FROM STDIN"
+        ).await?;
+        futures::pin_mut!(sink);
+
+        // Build tab-separated rows, flush every ~64KB
+        let mut buf = BytesMut::with_capacity(64 * 1024);
+        for t in transfers {
+            // All fields are integers, hex strings, or known enums — no escaping needed
+            buf.extend_from_slice(chain_id_i32.to_string().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.tx_hash.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice((t.log_index as i32).to_string().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.token.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.from_addr.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.to_addr.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.value.as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice((t.block_number as i64).to_string().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice((t.block_timestamp as i64).to_string().as_bytes());
+            buf.put_u8(b'\t');
+            match &t.swap_type {
+                Some(s) => buf.extend_from_slice(s.as_bytes()),
+                None => buf.extend_from_slice(b"\\N"),
+            }
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(now.to_string().as_bytes());
+            buf.put_u8(b'\n');
+
+            if buf.len() >= 64 * 1024 {
+                sink.send(buf.split().freeze()).await.map_err(DbError::Postgres)?;
+            }
+        }
+        if !buf.is_empty() {
+            sink.send(buf.freeze()).await.map_err(DbError::Postgres)?;
+        }
+        sink.finish().await?;
+
+        // 3. Move from staging → real table with ON CONFLICT
+        let result = tx.execute(
+            "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
+             SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at \
+             FROM _transfers_staging \
+             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+            &[],
+        ).await?;
+
+        tx.commit().await?;
+        Ok(result as usize)
+    }
+
+    /// Insert multiple transfers — dispatches to COPY (fast) or multi-row INSERT (fallback)
     pub async fn insert_transfers_batch(&self, chain_id: u32, transfers: &[Transfer]) -> Result<usize, DbError> {
         if transfers.is_empty() {
             return Ok(0);
         }
 
+        // Use COPY protocol for batches >= threshold (set to 1 for benchmarking)
+        const COPY_THRESHOLD: usize = 1;
+        if transfers.len() >= COPY_THRESHOLD {
+            return self.insert_transfers_copy(chain_id, transfers).await;
+        }
+
+        // Fallback: multi-row INSERT for small batches
         let client = self.pool.get().await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -316,10 +400,7 @@ impl Database {
         let chain_id_i32 = chain_id as i32;
         let mut total_inserted = 0;
 
-        // Multi-row INSERT: 11 params per row, PostgreSQL max ~65535 params
-        // Chunk at 1500 rows (16500 params) — balances round-trips vs query parse time
         for chunk in transfers.chunks(1500) {
-            // Pre-compute owned values so references stay valid
             let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, i64)> =
                 chunk.iter().map(|t| (
                     chain_id_i32,

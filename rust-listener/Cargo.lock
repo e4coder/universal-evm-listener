@@ -1061,6 +1061,7 @@ dependencies = [
 name = "rust-listener"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "deadpool-postgres",
  "dotenvy",
  "futures",

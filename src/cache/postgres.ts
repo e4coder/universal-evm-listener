@@ -128,6 +128,7 @@ export class PostgresCache {
               value, block_number as "blockNumber", block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND from_addr = $2
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT 1000`,
       [chainId, from.toLowerCase()]
@@ -141,6 +142,7 @@ export class PostgresCache {
               value, block_number as "blockNumber", block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND to_addr = $2
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT 1000`,
       [chainId, to.toLowerCase()]
@@ -154,6 +156,7 @@ export class PostgresCache {
               value, block_number as "blockNumber", block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND from_addr = $2 AND to_addr = $3
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT 1000`,
       [chainId, from.toLowerCase(), to.toLowerCase()]
@@ -297,7 +300,9 @@ export class PostgresCache {
   async getFusionPlusSwap(orderHash: string): Promise<FusionPlusSwap | null> {
     try {
       const result = await this.pool.query(
-        'SELECT * FROM fusion_plus_swaps WHERE order_hash = $1',
+        `SELECT * FROM fusion_plus_swaps
+         WHERE order_hash = $1
+           AND src_block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_plus_swaps.src_chain_id)`,
         [orderHash.toLowerCase()]
       );
       return result.rows[0] || null;
@@ -311,7 +316,8 @@ export class PostgresCache {
       const addr = address.toLowerCase();
       const result = await this.pool.query(
         `SELECT * FROM fusion_plus_swaps
-         WHERE src_maker = $1 OR dst_maker = $1 OR src_taker = $1 OR dst_taker = $1
+         WHERE (src_maker = $1 OR dst_maker = $1 OR src_taker = $1 OR dst_taker = $1)
+           AND src_block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_plus_swaps.src_chain_id)
          ORDER BY created_at DESC
          LIMIT $2`,
         [addr, limit]
@@ -327,6 +333,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM fusion_plus_swaps
          WHERE src_status = $1 AND dst_status = $2
+           AND src_block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_plus_swaps.src_chain_id)
          ORDER BY created_at DESC
          LIMIT $3`,
         [srcStatus, dstStatus, limit]
@@ -350,6 +357,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM fusion_plus_swaps
          WHERE src_chain_id = $1
+           AND src_block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
          ORDER BY src_block_timestamp DESC
          LIMIT $2`,
         [chainId, limit]
@@ -365,6 +373,8 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM fusion_plus_swaps
          WHERE dst_chain_id = $1
+           AND dst_block_number IS NOT NULL
+           AND dst_block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
          ORDER BY dst_block_timestamp DESC
          LIMIT $2`,
         [chainId, limit]
@@ -380,8 +390,10 @@ export class PostgresCache {
       const hash = txHash.toLowerCase();
       const result = await this.pool.query(
         `SELECT * FROM fusion_plus_swaps
-         WHERE (src_chain_id = $1 AND src_tx_hash = $2)
-            OR (dst_chain_id = $1 AND dst_tx_hash = $2)`,
+         WHERE (
+           (src_chain_id = $1 AND src_tx_hash = $2 AND src_block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1))
+           OR (dst_chain_id = $1 AND dst_tx_hash = $2 AND dst_block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1))
+         )`,
         [chainId, hash]
       );
       return result.rows[0] || null;
@@ -397,6 +409,7 @@ export class PostgresCache {
               block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND (from_addr = $2 OR to_addr = $2)
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT $3`,
       [chainId, address.toLowerCase(), limit]
@@ -411,6 +424,7 @@ export class PostgresCache {
               block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND swap_type = $2
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT $3`,
       [chainId, swapType, limit]
@@ -426,6 +440,7 @@ export class PostgresCache {
               block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND swap_type = 'fusion_plus' AND (from_addr = $2 OR to_addr = $2)
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT $3`,
       [chainId, addr, limit]
@@ -441,6 +456,7 @@ export class PostgresCache {
     try {
       const result = await this.pool.query(
         `SELECT * FROM fusion_swaps WHERE order_hash = $1
+           AND block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_swaps.chain_id)
          ORDER BY block_timestamp DESC LIMIT 1`,
         [orderHash.toLowerCase()]
       );
@@ -455,6 +471,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM fusion_swaps
          WHERE maker = $1
+           AND block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_swaps.chain_id)
          ORDER BY block_timestamp DESC
          LIMIT $2`,
         [maker.toLowerCase(), limit]
@@ -470,6 +487,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM fusion_swaps
          WHERE taker = $1
+           AND block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_swaps.chain_id)
          ORDER BY block_timestamp DESC
          LIMIT $2`,
         [taker.toLowerCase(), limit]
@@ -485,6 +503,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM fusion_swaps
          WHERE chain_id = $1
+           AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
          ORDER BY block_timestamp DESC
          LIMIT $2`,
         [chainId, limit]
@@ -500,6 +519,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM fusion_swaps
          WHERE status = $1
+           AND block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_swaps.chain_id)
          ORDER BY block_timestamp DESC
          LIMIT $2`,
         [status, limit]
@@ -514,6 +534,7 @@ export class PostgresCache {
     try {
       const result = await this.pool.query(
         `SELECT * FROM fusion_swaps
+         WHERE block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = fusion_swaps.chain_id)
          ORDER BY block_timestamp DESC
          LIMIT $1`,
         [limit]
@@ -532,6 +553,7 @@ export class PostgresCache {
               block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND swap_type = 'fusion' AND (from_addr = $2 OR to_addr = $2)
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT $3`,
       [chainId, addr, limit]
@@ -546,7 +568,8 @@ export class PostgresCache {
   async getCrypto2FiatByOrderId(orderId: string): Promise<Crypto2FiatEvent | null> {
     try {
       const result = await this.pool.query(
-        'SELECT * FROM crypto2fiat_events WHERE order_id = $1',
+        `SELECT * FROM crypto2fiat_events WHERE order_id = $1
+           AND block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = crypto2fiat_events.chain_id)`,
         [orderId.toLowerCase()]
       );
       return result.rows[0] || null;
@@ -560,6 +583,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM crypto2fiat_events
          WHERE recipient = $1
+           AND block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = crypto2fiat_events.chain_id)
          ORDER BY block_timestamp DESC
          LIMIT $2`,
         [recipient.toLowerCase(), limit]
@@ -575,6 +599,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM crypto2fiat_events
          WHERE chain_id = $1
+           AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
          ORDER BY block_timestamp DESC
          LIMIT $2`,
         [chainId, limit]
@@ -590,6 +615,7 @@ export class PostgresCache {
       const result = await this.pool.query(
         `SELECT * FROM crypto2fiat_events
          WHERE token = $1
+           AND block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = crypto2fiat_events.chain_id)
          ORDER BY block_timestamp DESC
          LIMIT $2`,
         [token.toLowerCase(), limit]
@@ -604,6 +630,7 @@ export class PostgresCache {
     try {
       const result = await this.pool.query(
         `SELECT * FROM crypto2fiat_events
+         WHERE block_number <= (SELECT c.block_number FROM checkpoints c WHERE c.chain_id = crypto2fiat_events.chain_id)
          ORDER BY block_timestamp DESC
          LIMIT $1`,
         [limit]
@@ -618,7 +645,8 @@ export class PostgresCache {
     try {
       const result = await this.pool.query(
         `SELECT * FROM crypto2fiat_events
-         WHERE chain_id = $1 AND tx_hash = $2`,
+         WHERE chain_id = $1 AND tx_hash = $2
+           AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)`,
         [chainId, txHash.toLowerCase()]
       );
       return result.rows[0] || null;
@@ -635,6 +663,7 @@ export class PostgresCache {
               block_timestamp as "timestamp", swap_type as "swapType"
        FROM transfers
        WHERE chain_id = $1 AND swap_type = 'crypto_to_fiat' AND (from_addr = $2 OR to_addr = $2)
+         AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
        ORDER BY block_timestamp DESC
        LIMIT $3`,
       [chainId, addr, limit]
@@ -666,6 +695,7 @@ export class PostgresCache {
                block_timestamp as "timestamp", swap_type as "swapType"
         FROM transfers
         WHERE chain_id = $1 AND from_addr = $2 AND id > $3
+          AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
         ORDER BY id ASC
         LIMIT $4
       `;
@@ -677,6 +707,7 @@ export class PostgresCache {
                block_timestamp as "timestamp", swap_type as "swapType"
         FROM transfers
         WHERE chain_id = $1 AND to_addr = $2 AND id > $3
+          AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
         ORDER BY id ASC
         LIMIT $4
       `;
@@ -688,6 +719,7 @@ export class PostgresCache {
                block_timestamp as "timestamp", swap_type as "swapType"
         FROM transfers
         WHERE chain_id = $1 AND (from_addr = $2 OR to_addr = $2) AND id > $3
+          AND block_number <= (SELECT block_number FROM checkpoints WHERE chain_id = $1)
         ORDER BY id ASC
         LIMIT $4
       `;

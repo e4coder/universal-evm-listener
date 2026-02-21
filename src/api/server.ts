@@ -354,10 +354,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // Streaming/Batch Endpoints (since_id pagination)
     // =========================================================================
 
-    // OPTIONS - CORS preflight for POST requests
+    // OPTIONS - CORS preflight
     if (req.method === 'OPTIONS') {
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Key');
       res.statusCode = 204;
       res.end();
       return;
@@ -407,6 +407,166 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       } catch (error: any) {
         return sendResponse(res, 400, { success: false, error: error.message });
       }
+    }
+
+    // =========================================================================
+    // Admin API (API key protected — runtime config tuning)
+    // =========================================================================
+
+    if (path.startsWith('/admin/')) {
+      const adminApiKey = process.env.ADMIN_API_KEY || '';
+      const requestKey = req.headers['x-api-key'] || '';
+      if (!adminApiKey || requestKey !== adminApiKey) {
+        return sendResponse(res, 401, { success: false, error: 'Unauthorized: invalid or missing X-API-Key header' });
+      }
+
+      // Rust-side default configs (must match config.rs)
+      const CHAIN_DEFAULTS: Record<number, { name: string, blocks_per_request: number, concurrent_fetches: number, poll_interval_ms: number, confirmation_blocks: number, copy_threshold: number }> = {
+        1:     { name: 'Ethereum',       blocks_per_request: 10,  concurrent_fetches: 10, poll_interval_ms: 500,  confirmation_blocks: 12, copy_threshold: 1 },
+        8453:  { name: 'Base',            blocks_per_request: 10,  concurrent_fetches: 15, poll_interval_ms: 300,  confirmation_blocks: 1,  copy_threshold: 1 },
+        42161: { name: 'Arbitrum One',    blocks_per_request: 50,  concurrent_fetches: 15, poll_interval_ms: 100,  confirmation_blocks: 1,  copy_threshold: 1 },
+        137:   { name: 'Polygon',         blocks_per_request: 10,  concurrent_fetches: 15, poll_interval_ms: 300,  confirmation_blocks: 50, copy_threshold: 1 },
+        56:    { name: 'BNB Smart Chain', blocks_per_request: 30,  concurrent_fetches: 15, poll_interval_ms: 500,  confirmation_blocks: 3,  copy_threshold: 1 },
+        10:    { name: 'OP Mainnet',      blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1 },
+        43114: { name: 'Avalanche',       blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1 },
+        100:   { name: 'Gnosis',          blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 12, copy_threshold: 1 },
+        1868:  { name: 'Soneium',         blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1 },
+        59144: { name: 'Linea',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
+        130:   { name: 'Unichain',        blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
+        146:   { name: 'Sonic',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
+        57073: { name: 'Ink',             blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
+      };
+
+      // GET /admin/config — list all chains with defaults + overrides
+      if (req.method === 'GET' && path === '/admin/config') {
+        const overrides = await cache.getConfigOverrides();
+        const overrideMap: Record<number, any> = {};
+        for (const ov of overrides) overrideMap[ov.chain_id] = ov;
+
+        const configs = Object.entries(CHAIN_DEFAULTS).map(([chainIdStr, defaults]) => {
+          const chainId = parseInt(chainIdStr);
+          const ov = overrideMap[chainId];
+          return {
+            chain_id: chainId,
+            name: defaults.name,
+            defaults,
+            overrides: ov || null,
+            effective: {
+              blocks_per_request: ov?.blocks_per_request ?? defaults.blocks_per_request,
+              concurrent_fetches: ov?.concurrent_fetches ?? defaults.concurrent_fetches,
+              poll_interval_ms: ov?.poll_interval_ms ?? defaults.poll_interval_ms,
+              confirmation_blocks: ov?.confirmation_blocks ?? defaults.confirmation_blocks,
+              copy_threshold: ov?.copy_threshold ?? defaults.copy_threshold,
+            }
+          };
+        });
+        return sendResponse(res, 200, { success: true, data: configs });
+      }
+
+      // GET /admin/config/:chainId
+      if (req.method === 'GET' && path.match(/^\/admin\/config\/\d+$/)) {
+        const chainId = parseInt(path.split('/')[3]);
+        const defaults = CHAIN_DEFAULTS[chainId];
+        if (!defaults) return sendResponse(res, 404, { success: false, error: `Unknown chain_id: ${chainId}` });
+
+        const override = await cache.getConfigOverride(chainId);
+        return sendResponse(res, 200, {
+          success: true,
+          data: {
+            chain_id: chainId,
+            name: defaults.name,
+            defaults,
+            overrides: override || null,
+            effective: {
+              blocks_per_request: override?.blocks_per_request ?? defaults.blocks_per_request,
+              concurrent_fetches: override?.concurrent_fetches ?? defaults.concurrent_fetches,
+              poll_interval_ms: override?.poll_interval_ms ?? defaults.poll_interval_ms,
+              confirmation_blocks: override?.confirmation_blocks ?? defaults.confirmation_blocks,
+              copy_threshold: override?.copy_threshold ?? defaults.copy_threshold,
+            }
+          }
+        });
+      }
+
+      // PUT /admin/config/:chainId — set override
+      if (req.method === 'PUT' && path.match(/^\/admin\/config\/\d+$/)) {
+        const chainId = parseInt(path.split('/')[3]);
+        const defaults = CHAIN_DEFAULTS[chainId];
+        if (!defaults) return sendResponse(res, 404, { success: false, error: `Unknown chain_id: ${chainId}` });
+
+        try {
+          const body = await parseJsonBody(req);
+
+          // Validate bounds
+          if (body.blocks_per_request !== undefined) {
+            const v = parseInt(body.blocks_per_request);
+            if (isNaN(v) || v < 1 || v > 1000) return sendResponse(res, 400, { success: false, error: 'blocks_per_request must be 1-1000' });
+            body.blocks_per_request = v;
+          }
+          if (body.concurrent_fetches !== undefined) {
+            const v = parseInt(body.concurrent_fetches);
+            if (isNaN(v) || v < 1 || v > 50) return sendResponse(res, 400, { success: false, error: 'concurrent_fetches must be 1-50' });
+            body.concurrent_fetches = v;
+          }
+          if (body.poll_interval_ms !== undefined) {
+            const v = parseInt(body.poll_interval_ms);
+            if (isNaN(v) || v < 50 || v > 10000) return sendResponse(res, 400, { success: false, error: 'poll_interval_ms must be 50-10000' });
+            body.poll_interval_ms = v;
+          }
+          if (body.confirmation_blocks !== undefined) {
+            const v = parseInt(body.confirmation_blocks);
+            if (isNaN(v) || v < 0 || v > 200) return sendResponse(res, 400, { success: false, error: 'confirmation_blocks must be 0-200' });
+            body.confirmation_blocks = v;
+          }
+          if (body.copy_threshold !== undefined) {
+            const v = parseInt(body.copy_threshold);
+            if (isNaN(v) || v < 1 || v > 100000) return sendResponse(res, 400, { success: false, error: 'copy_threshold must be 1-100000' });
+            body.copy_threshold = v;
+          }
+
+          await cache.upsertConfigOverride(chainId, body);
+          const updated = await cache.getConfigOverride(chainId);
+          return sendResponse(res, 200, {
+            success: true,
+            data: {
+              chain_id: chainId,
+              name: defaults.name,
+              overrides: updated,
+              effective: {
+                blocks_per_request: updated?.blocks_per_request ?? defaults.blocks_per_request,
+                concurrent_fetches: updated?.concurrent_fetches ?? defaults.concurrent_fetches,
+                poll_interval_ms: updated?.poll_interval_ms ?? defaults.poll_interval_ms,
+                confirmation_blocks: updated?.confirmation_blocks ?? defaults.confirmation_blocks,
+                copy_threshold: updated?.copy_threshold ?? defaults.copy_threshold,
+              },
+              note: 'Config watcher picks up changes within 5 seconds'
+            }
+          });
+        } catch (error: any) {
+          return sendResponse(res, 400, { success: false, error: error.message });
+        }
+      }
+
+      // DELETE /admin/config/:chainId — remove override (revert to defaults)
+      if (req.method === 'DELETE' && path.match(/^\/admin\/config\/\d+$/)) {
+        const chainId = parseInt(path.split('/')[3]);
+        const defaults = CHAIN_DEFAULTS[chainId];
+        if (!defaults) return sendResponse(res, 404, { success: false, error: `Unknown chain_id: ${chainId}` });
+
+        const deleted = await cache.deleteConfigOverride(chainId);
+        return sendResponse(res, 200, {
+          success: true,
+          data: {
+            chain_id: chainId,
+            name: defaults.name,
+            reverted_to_defaults: deleted,
+            effective: defaults,
+            note: 'Config watcher will revert to defaults within 5 seconds'
+          }
+        });
+      }
+
+      return sendResponse(res, 404, { success: false, error: 'Admin endpoint not found' });
     }
 
     // =========================================================================

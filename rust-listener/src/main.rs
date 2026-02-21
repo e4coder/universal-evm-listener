@@ -11,7 +11,8 @@ mod types;
 use crate::config::{get_database_url, get_ttl_secs, load_networks};
 use crate::db::Database;
 use crate::poller::ChainPoller;
-use crate::types::ChainStats;
+use crate::types::{ChainStats, LiveConfig};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,24 +111,80 @@ async fn main() {
         }
     });
 
-    // Spawn poller for each chain (with per-chain stats)
+    // Spawn poller for each chain (with per-chain stats + live config)
     let mut poller_handles = Vec::new();
     let mut all_stats: Vec<Arc<ChainStats>> = Vec::new();
+    let mut all_live_configs: Vec<(u32, Arc<LiveConfig>)> = Vec::new();
 
     for network in networks {
         let db_clone = Arc::clone(&db);
         let chain_name = network.name.to_string();
         let stats = Arc::new(ChainStats::new(network.chain_id, network.name));
+        let live_config = Arc::new(LiveConfig::from_network(&network));
         all_stats.push(Arc::clone(&stats));
+        all_live_configs.push((network.chain_id, Arc::clone(&live_config)));
 
         let handle = tokio::spawn(async move {
-            let mut poller = ChainPoller::new(network, db_clone, stats);
+            let mut poller = ChainPoller::new(network, db_clone, stats, live_config);
             poller.run().await;
         });
 
         info!("Spawned poller for {}", chain_name);
         poller_handles.push(handle);
     }
+
+    // Spawn config watcher task (reads DB overrides every 5s, updates LiveConfig atomics)
+    let db_config_watcher = Arc::clone(&db);
+    let configs_for_watcher = all_live_configs.clone();
+    let config_watcher_handle = tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(5)).await;
+            match db_config_watcher.get_all_config_overrides().await {
+                Ok(overrides) => {
+                    let override_map: HashMap<i32, _> =
+                        overrides.into_iter().map(|o| (o.chain_id, o)).collect();
+                    for (chain_id, live_config) in &configs_for_watcher {
+                        if let Some(ov) = override_map.get(&(*chain_id as i32)) {
+                            // Apply overrides (only non-NULL values)
+                            if let Some(v) = ov.blocks_per_request {
+                                live_config.max_blocks_per_query.store(v as u64, Relaxed);
+                            } else {
+                                live_config.max_blocks_per_query.store(live_config.default_blocks_per_query, Relaxed);
+                            }
+                            if let Some(v) = ov.concurrent_fetches {
+                                live_config.max_concurrent_fetches.store(v as usize, Relaxed);
+                            } else {
+                                live_config.max_concurrent_fetches.store(live_config.default_concurrent_fetches, Relaxed);
+                            }
+                            if let Some(v) = ov.poll_interval_ms {
+                                live_config.poll_interval_ms.store(v as u64, Relaxed);
+                            } else {
+                                live_config.poll_interval_ms.store(live_config.default_poll_interval_ms, Relaxed);
+                            }
+                            if let Some(v) = ov.confirmation_blocks {
+                                live_config.confirmation_blocks.store(v as u64, Relaxed);
+                            } else {
+                                live_config.confirmation_blocks.store(live_config.default_confirmation_blocks, Relaxed);
+                            }
+                            if let Some(v) = ov.copy_threshold {
+                                live_config.copy_threshold.store(v as u64, Relaxed);
+                            } else {
+                                live_config.copy_threshold.store(live_config.default_copy_threshold, Relaxed);
+                            }
+                        } else {
+                            // No override for this chain — reset to defaults
+                            live_config.max_blocks_per_query.store(live_config.default_blocks_per_query, Relaxed);
+                            live_config.max_concurrent_fetches.store(live_config.default_concurrent_fetches, Relaxed);
+                            live_config.poll_interval_ms.store(live_config.default_poll_interval_ms, Relaxed);
+                            live_config.confirmation_blocks.store(live_config.default_confirmation_blocks, Relaxed);
+                            live_config.copy_threshold.store(live_config.default_copy_threshold, Relaxed);
+                        }
+                    }
+                }
+                Err(e) => warn!("Config watcher error: {}", e),
+            }
+        }
+    });
 
     // Spawn stats writer task (every 1 second, writes all chain stats to DB + metrics history)
     let db_stats = Arc::clone(&db);
@@ -191,12 +248,13 @@ async fn main() {
     // Graceful shutdown
     info!("Shutting down...");
 
-    // Abort all poller tasks
+    // Abort all tasks
     for handle in poller_handles {
         handle.abort();
     }
     cleanup_handle.abort();
     stats_handle.abort();
+    config_watcher_handle.abort();
 
     info!("Shutdown complete");
 }

@@ -224,6 +224,20 @@ impl Database {
             &[],
         ).await?;
 
+        // Config overrides table (runtime-tunable per-chain config)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS config_overrides (
+                chain_id INTEGER PRIMARY KEY,
+                blocks_per_request INTEGER,
+                concurrent_fetches INTEGER,
+                poll_interval_ms BIGINT,
+                confirmation_blocks INTEGER,
+                copy_threshold INTEGER,
+                updated_at BIGINT NOT NULL
+            )",
+            &[],
+        ).await?;
+
         // Create indexes for transfers
         let transfer_indexes = [
             "CREATE INDEX IF NOT EXISTS idx_transfers_from ON transfers(chain_id, from_addr, block_timestamp DESC)",
@@ -398,14 +412,13 @@ impl Database {
     }
 
     /// Insert multiple transfers — dispatches to COPY (fast) or multi-row INSERT (fallback)
-    pub async fn insert_transfers_batch(&self, chain_id: u32, transfers: &[Transfer]) -> Result<usize, DbError> {
+    pub async fn insert_transfers_batch(&self, chain_id: u32, transfers: &[Transfer], copy_threshold: usize) -> Result<usize, DbError> {
         if transfers.is_empty() {
             return Ok(0);
         }
 
-        // Use COPY protocol for batches >= threshold (set to 1 for benchmarking)
-        const COPY_THRESHOLD: usize = 1;
-        if transfers.len() >= COPY_THRESHOLD {
+        // Use COPY protocol for batches >= threshold (runtime-configurable via admin API)
+        if transfers.len() >= copy_threshold {
             return self.insert_transfers_copy(chain_id, transfers).await;
         }
 
@@ -1250,6 +1263,28 @@ impl Database {
     // =========================================================================
 
     /// Clean up old metrics history based on TTL
+    // =========================================================================
+    // Config Overrides CRUD
+    // =========================================================================
+
+    /// Read all config overrides (for config watcher)
+    pub async fn get_all_config_overrides(&self) -> Result<Vec<ConfigOverrideRow>, DbError> {
+        let client = self.pool.get().await?;
+        let rows = client.query(
+            "SELECT chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold FROM config_overrides",
+            &[],
+        ).await?;
+
+        Ok(rows.iter().map(|row| ConfigOverrideRow {
+            chain_id: row.get(0),
+            blocks_per_request: row.get(1),
+            concurrent_fetches: row.get(2),
+            poll_interval_ms: row.get(3),
+            confirmation_blocks: row.get(4),
+            copy_threshold: row.get(5),
+        }).collect())
+    }
+
     pub async fn cleanup_metrics_history(&self, ttl_secs: u64) -> Result<usize, DbError> {
         let client = self.pool.get().await?;
         let cutoff = SystemTime::now()
@@ -1290,4 +1325,14 @@ pub struct CleanupStats {
     pub fusion_deleted: usize,
     pub crypto2fiat_deleted: usize,
     pub metrics_deleted: usize,
+}
+
+/// Config override row from database (all fields optional — NULL = use default)
+pub struct ConfigOverrideRow {
+    pub chain_id: i32,
+    pub blocks_per_request: Option<i32>,
+    pub concurrent_fetches: Option<i32>,
+    pub poll_interval_ms: Option<i64>,
+    pub confirmation_blocks: Option<i32>,
+    pub copy_threshold: Option<i32>,
 }

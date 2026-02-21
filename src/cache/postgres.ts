@@ -236,6 +236,61 @@ export class PostgresCache {
   }
 
   // =========================================================================
+  // Config Override Methods (for admin API)
+  // =========================================================================
+
+  async getConfigOverrides(): Promise<any[]> {
+    try {
+      const result = await this.pool.query('SELECT * FROM config_overrides ORDER BY chain_id');
+      return result.rows;
+    } catch {
+      return [];
+    }
+  }
+
+  async getConfigOverride(chainId: number): Promise<any | null> {
+    try {
+      const result = await this.pool.query(
+        'SELECT * FROM config_overrides WHERE chain_id = $1', [chainId]
+      );
+      return result.rows[0] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async upsertConfigOverride(chainId: number, config: {
+    blocks_per_request?: number | null,
+    concurrent_fetches?: number | null,
+    poll_interval_ms?: number | null,
+    confirmation_blocks?: number | null,
+    copy_threshold?: number | null,
+  }): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    await this.pool.query(
+      `INSERT INTO config_overrides (chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (chain_id) DO UPDATE SET
+         blocks_per_request = COALESCE($2, config_overrides.blocks_per_request),
+         concurrent_fetches = COALESCE($3, config_overrides.concurrent_fetches),
+         poll_interval_ms = COALESCE($4, config_overrides.poll_interval_ms),
+         confirmation_blocks = COALESCE($5, config_overrides.confirmation_blocks),
+         copy_threshold = COALESCE($6, config_overrides.copy_threshold),
+         updated_at = $7`,
+      [chainId, config.blocks_per_request ?? null, config.concurrent_fetches ?? null,
+       config.poll_interval_ms ?? null, config.confirmation_blocks ?? null,
+       config.copy_threshold ?? null, now]
+    );
+  }
+
+  async deleteConfigOverride(chainId: number): Promise<boolean> {
+    const result = await this.pool.query(
+      'DELETE FROM config_overrides WHERE chain_id = $1', [chainId]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  // =========================================================================
   // Fusion+ Query Methods
   // =========================================================================
 

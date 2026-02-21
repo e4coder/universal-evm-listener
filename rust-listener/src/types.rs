@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// ERC20 Transfer event topic (keccak256 of "Transfer(address,address,uint256)")
 pub const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -337,6 +337,39 @@ impl ChainStats {
 // ============================================================================
 // Crypto2Fiat Data Structures
 // ============================================================================
+
+/// Runtime-tunable config values (lock-free atomics, shared between fetcher + config watcher)
+pub struct LiveConfig {
+    // Default values (immutable, used for reset when overrides are deleted)
+    pub default_blocks_per_query: u64,
+    pub default_concurrent_fetches: usize,
+    pub default_poll_interval_ms: u64,
+    pub default_confirmation_blocks: u64,
+    pub default_copy_threshold: u64,
+    // Live values (atomics, updated by config watcher)
+    pub max_blocks_per_query: AtomicU64,
+    pub max_concurrent_fetches: AtomicUsize,
+    pub poll_interval_ms: AtomicU64,
+    pub confirmation_blocks: AtomicU64,
+    pub copy_threshold: AtomicU64,
+}
+
+impl LiveConfig {
+    pub fn from_network(network: &NetworkConfig) -> Self {
+        Self {
+            default_blocks_per_query: network.blocks_per_request,
+            default_concurrent_fetches: network.concurrent_fetches,
+            default_poll_interval_ms: network.poll_interval_ms,
+            default_confirmation_blocks: network.confirmation_blocks,
+            default_copy_threshold: 1,
+            max_blocks_per_query: AtomicU64::new(network.blocks_per_request),
+            max_concurrent_fetches: AtomicUsize::new(network.concurrent_fetches),
+            poll_interval_ms: AtomicU64::new(network.poll_interval_ms),
+            confirmation_blocks: AtomicU64::new(network.confirmation_blocks),
+            copy_threshold: AtomicU64::new(1),
+        }
+    }
+}
 
 /// Crypto2Fiat event data from KentuckyDelegate
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

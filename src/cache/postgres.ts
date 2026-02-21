@@ -221,6 +221,20 @@ export class PostgresCache {
     }
   }
 
+  async getMetricsHistory(chainId: number, minutes: number): Promise<any[]> {
+    try {
+      const cutoff = Math.floor(Date.now() / 1000) - (minutes * 60);
+      const result = await this.pool.query(
+        'SELECT recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total ' +
+        'FROM listener_metrics_history WHERE chain_id = $1 AND recorded_at >= $2 ORDER BY recorded_at ASC',
+        [chainId, cutoff]
+      );
+      return result.rows;
+    } catch {
+      return [];
+    }
+  }
+
   // =========================================================================
   // Fusion+ Query Methods
   // =========================================================================

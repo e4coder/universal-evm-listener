@@ -80,14 +80,16 @@ async fn main() {
                     let total_deleted = stats.transfers_deleted
                         + stats.fusion_plus_deleted
                         + stats.fusion_deleted
-                        + stats.crypto2fiat_deleted;
+                        + stats.crypto2fiat_deleted
+                        + stats.metrics_deleted;
                     if total_deleted > 0 {
                         info!(
-                            "Cleanup: removed {} transfers, {} Fusion+ swaps, {} Fusion swaps, {} Crypto2Fiat events",
+                            "Cleanup: removed {} transfers, {} Fusion+ swaps, {} Fusion swaps, {} Crypto2Fiat events, {} metrics snapshots",
                             stats.transfers_deleted,
                             stats.fusion_plus_deleted,
                             stats.fusion_deleted,
-                            stats.crypto2fiat_deleted
+                            stats.crypto2fiat_deleted,
+                            stats.metrics_deleted
                         );
                     }
                 }
@@ -127,17 +129,24 @@ async fn main() {
         poller_handles.push(handle);
     }
 
-    // Spawn stats writer task (every 1 second, writes all chain stats to DB)
+    // Spawn stats writer task (every 1 second, writes all chain stats to DB + metrics history)
     let db_stats = Arc::clone(&db);
     let stats_handle = tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(1)).await;
             for stats in &all_stats {
+                let current = stats.current_block.load(Relaxed);
+                let checkpoint = stats.checkpoint_block.load(Relaxed);
+                let insert_time = stats.last_insert_time_ms.load(Relaxed);
+                let batch = stats.last_batch_size.load(Relaxed);
+                let buf = stats.buffer_size.load(Relaxed);
+                let events = stats.total_transfers.load(Relaxed);
+
                 if let Err(e) = db_stats.upsert_listener_stats(
                     stats.chain_id,
                     stats.chain_name,
-                    stats.current_block.load(Relaxed),
-                    stats.checkpoint_block.load(Relaxed),
+                    current,
+                    checkpoint,
                     stats.pending_ranges.load(Relaxed),
                     stats.last_chance_count.load(Relaxed),
                     stats.inflight_fetches.load(Relaxed),
@@ -145,13 +154,23 @@ async fn main() {
                     stats.failed_fetches.load(Relaxed),
                     stats.timed_out_fetches.load(Relaxed),
                     stats.blocks_processed.load(Relaxed),
-                    stats.total_transfers.load(Relaxed),
-                    stats.buffer_size.load(Relaxed),
-                    stats.last_insert_time_ms.load(Relaxed),
-                    stats.last_batch_size.load(Relaxed),
+                    events,
+                    buf,
+                    insert_time,
+                    batch,
                 ).await {
                     warn!("Failed to write stats for chain {}: {}", stats.chain_id, e);
                 }
+
+                // Record metrics history for charts
+                let _ = db_stats.insert_metrics_snapshot(
+                    stats.chain_id,
+                    insert_time,
+                    batch,
+                    buf,
+                    current.saturating_sub(checkpoint),
+                    events,
+                ).await;
             }
         }
     });

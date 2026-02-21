@@ -433,6 +433,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return sendResponse(res, 200, { success: true, data: stats });
     }
 
+    // GET /monitor/history?chain_id=137&minutes=60 - Historical metrics for charts
+    if (path === '/monitor/history') {
+      const chainId = parseInt(url.searchParams.get('chain_id') || '0');
+      const minutes = parseInt(url.searchParams.get('minutes') || '60') || 60;
+      if (!chainId) return sendResponse(res, 400, { success: false, error: 'chain_id query parameter is required' });
+      const history = await cache.getMetricsHistory(chainId, Math.min(minutes, 60));
+      return sendResponse(res, 200, { success: true, data: history });
+    }
+
     // 404 Not Found
     return sendResponse(res, 404, { success: false, error: 'Endpoint not found' });
   } catch (error: any) {

@@ -205,6 +205,25 @@ impl Database {
         client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS insert_time_ms INTEGER DEFAULT 0", &[]).await.ok();
         client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS batch_size INTEGER DEFAULT 0", &[]).await.ok();
 
+        // Historical metrics table (time-series for monitoring charts)
+        client.execute(
+            "CREATE TABLE IF NOT EXISTS listener_metrics_history (
+                id BIGSERIAL PRIMARY KEY,
+                chain_id INTEGER NOT NULL,
+                recorded_at BIGINT NOT NULL,
+                insert_time_ms INTEGER DEFAULT 0,
+                batch_size INTEGER DEFAULT 0,
+                buffer_size INTEGER DEFAULT 0,
+                blocks_behind BIGINT DEFAULT 0,
+                events_total BIGINT DEFAULT 0
+            )",
+            &[],
+        ).await?;
+        client.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metrics_chain_time ON listener_metrics_history(chain_id, recorded_at DESC)",
+            &[],
+        ).await?;
+
         // Create indexes for transfers
         let transfer_indexes = [
             "CREATE INDEX IF NOT EXISTS idx_transfers_from ON transfers(chain_id, from_addr, block_timestamp DESC)",
@@ -1192,9 +1211,59 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a historical metrics snapshot for a chain
+    pub async fn insert_metrics_snapshot(
+        &self,
+        chain_id: u32,
+        insert_time_ms: u64,
+        batch_size: u64,
+        buffer_size: u64,
+        blocks_behind: u64,
+        events_total: u64,
+    ) -> Result<(), DbError> {
+        let client = self.pool.get().await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        client.execute(
+            "INSERT INTO listener_metrics_history \
+             (chain_id, recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &(chain_id as i32),
+                &now,
+                &(insert_time_ms as i32),
+                &(batch_size as i32),
+                &(buffer_size as i32),
+                &(blocks_behind as i64),
+                &(events_total as i64),
+            ],
+        ).await?;
+
+        Ok(())
+    }
+
     // =========================================================================
     // Cleanup Methods
     // =========================================================================
+
+    /// Clean up old metrics history based on TTL
+    pub async fn cleanup_metrics_history(&self, ttl_secs: u64) -> Result<usize, DbError> {
+        let client = self.pool.get().await?;
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - ttl_secs as i64;
+
+        let result = client.execute(
+            "DELETE FROM listener_metrics_history WHERE recorded_at < $1",
+            &[&cutoff],
+        ).await?;
+        Ok(result as usize)
+    }
 
     /// Clean up all old data based on TTL
     pub async fn cleanup_all(&self, ttl_secs: u64) -> Result<CleanupStats, DbError> {
@@ -1202,12 +1271,14 @@ impl Database {
         let fusion_plus = self.cleanup_old_fusion_plus(ttl_secs).await?;
         let fusion = self.cleanup_old_fusion_swaps(ttl_secs).await?;
         let crypto2fiat = self.cleanup_old_crypto2fiat(ttl_secs).await?;
+        let metrics = self.cleanup_metrics_history(ttl_secs).await?;
 
         Ok(CleanupStats {
             transfers_deleted: transfers,
             fusion_plus_deleted: fusion_plus,
             fusion_deleted: fusion,
             crypto2fiat_deleted: crypto2fiat,
+            metrics_deleted: metrics,
         })
     }
 }
@@ -1218,4 +1289,5 @@ pub struct CleanupStats {
     pub fusion_plus_deleted: usize,
     pub fusion_deleted: usize,
     pub crypto2fiat_deleted: usize,
+    pub metrics_deleted: usize,
 }

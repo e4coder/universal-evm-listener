@@ -77,6 +77,36 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monos
 .chart-card h3 { font-size: 13px; color: #888; margin-bottom: 12px; font-weight: 500; }
 .chart-card canvas { width: 100% !important; }
 @media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
+
+/* Admin panel */
+.admin-section { max-width: 1100px; }
+.admin-key-bar { display: flex; gap: 8px; margin-bottom: 20px; align-items: center; }
+.admin-key-bar input { background: #1a1a25; color: #e0e0e0; border: 1px solid #2a2a3a; border-radius: 6px; padding: 8px 12px; font-size: 13px; width: 300px; font-family: monospace; }
+.admin-key-bar input:focus { border-color: #60a5fa; outline: none; }
+.admin-chain-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+.admin-chain-card { background: #16161f; border: 1px solid #2a2a3a; border-radius: 8px; padding: 16px; }
+.admin-chain-card .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.admin-chain-card .card-header h3 { font-size: 14px; color: #fff; font-weight: 600; }
+.admin-chain-card .card-header .chain-id-badge { font-size: 11px; color: #666; }
+.config-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #1a1a25; }
+.config-row:last-child { border-bottom: none; }
+.config-row .config-label { font-size: 12px; color: #888; }
+.config-row .config-value { display: flex; align-items: center; gap: 6px; }
+.config-row input[type="number"] { background: #0f0f18; border: 1px solid #333; color: #ccc; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; width: 80px; text-align: right; }
+.config-row input[type="number"]:focus { border-color: #60a5fa; outline: none; }
+.config-row .default-badge { font-size: 10px; color: #666; background: #1a1a25; padding: 1px 6px; border-radius: 3px; }
+.config-row .override-badge { font-size: 10px; color: #eab308; background: #2a2a1a; padding: 1px 6px; border-radius: 3px; }
+.admin-chain-card .card-actions { display: flex; gap: 6px; margin-top: 12px; }
+.admin-btn { padding: 6px 14px; font-size: 12px; border: none; border-radius: 4px; cursor: pointer; transition: all 0.2s; }
+.admin-btn.save { background: #2563eb; color: #fff; }
+.admin-btn.save:hover { background: #3b82f6; }
+.admin-btn.reset { background: #1a1a25; color: #888; border: 1px solid #333; }
+.admin-btn.reset:hover { color: #ef4444; border-color: #ef4444; }
+.admin-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.admin-toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 20px; border-radius: 6px; font-size: 13px; z-index: 100; animation: fadeIn 0.3s; }
+.admin-toast.success { background: #166534; color: #22c55e; border: 1px solid #22c55e; }
+.admin-toast.error { background: #451a1a; color: #ef4444; border: 1px solid #ef4444; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 </head>
@@ -477,6 +507,162 @@ function HistoryView({ chains }) {
 }
 
 // =========================================================================
+// Admin Panel
+// =========================================================================
+function AdminPanel() {
+  const [apiKey, setApiKey] = useState(localStorage.getItem('admin_api_key') || '');
+  const [configs, setConfigs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [edits, setEdits] = useState({});
+
+  const saveApiKey = (key) => {
+    setApiKey(key);
+    localStorage.setItem('admin_api_key', key);
+  };
+
+  const showToast = (message, type = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const fetchConfigs = useCallback(async () => {
+    if (!apiKey) { setConfigs([]); return; }
+    setLoading(true);
+    try {
+      const res = await fetch('/admin/config', { headers: { 'X-API-Key': apiKey } });
+      const json = await res.json();
+      if (json.success) {
+        setConfigs(json.data);
+      } else {
+        setConfigs([]);
+      }
+    } catch (e) {
+      setConfigs([]);
+    }
+    setLoading(false);
+  }, [apiKey]);
+
+  useEffect(() => { fetchConfigs(); }, [fetchConfigs]);
+
+  useEffect(() => {
+    if (!apiKey) return;
+    const interval = setInterval(fetchConfigs, 10000);
+    return () => clearInterval(interval);
+  }, [apiKey, fetchConfigs]);
+
+  const setEdit = (chainId, field, value) => {
+    setEdits(prev => ({
+      ...prev,
+      [chainId]: { ...(prev[chainId] || {}), [field]: value }
+    }));
+  };
+
+  const saveConfig = async (chainId) => {
+    const edit = edits[chainId];
+    if (!edit) return;
+    try {
+      const res = await fetch('/admin/config/' + chainId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body: JSON.stringify(edit),
+      });
+      const json = await res.json();
+      if (json.success) {
+        showToast('Updated ' + (CHAIN_NAMES[chainId] || chainId));
+        setEdits(prev => { const n = {...prev}; delete n[chainId]; return n; });
+        fetchConfigs();
+      } else {
+        showToast(json.error || 'Save failed', 'error');
+      }
+    } catch (e) {
+      showToast('Network error', 'error');
+    }
+  };
+
+  const resetConfig = async (chainId) => {
+    try {
+      const res = await fetch('/admin/config/' + chainId, {
+        method: 'DELETE',
+        headers: { 'X-API-Key': apiKey },
+      });
+      const json = await res.json();
+      if (json.success) {
+        showToast('Reset ' + (CHAIN_NAMES[chainId] || chainId) + ' to defaults');
+        fetchConfigs();
+      } else {
+        showToast(json.error || 'Reset failed', 'error');
+      }
+    } catch (e) {
+      showToast('Network error', 'error');
+    }
+  };
+
+  const CONFIG_FIELDS = [
+    { key: 'blocks_per_request', label: 'Blocks/Request', min: 1, max: 1000 },
+    { key: 'concurrent_fetches', label: 'Concurrency', min: 1, max: 50 },
+    { key: 'poll_interval_ms', label: 'Poll Interval (ms)', min: 50, max: 10000 },
+    { key: 'confirmation_blocks', label: 'Confirmations', min: 0, max: 200 },
+    { key: 'copy_threshold', label: 'COPY Threshold', min: 1, max: 100000 },
+  ];
+
+  return html`
+    <div class="admin-section">
+      <div class="admin-key-bar">
+        <input type="password" placeholder="Enter Admin API Key..."
+          value=${apiKey} onInput=${(e) => saveApiKey(e.target.value)} />
+        <div style="width:8px;height:8px;border-radius:50%;background:${configs.length > 0 ? '#22c55e' : apiKey ? '#ef4444' : '#666'}"></div>
+        <span style="font-size:12px;color:#888">${configs.length > 0 ? configs.length + ' chains loaded' : apiKey ? 'Invalid key' : 'Enter API key'}</span>
+      </div>
+
+      ${configs.length > 0 && html`
+        <div class="admin-chain-grid">
+          ${configs.map(cfg => {
+            const chainEdits = edits[cfg.chain_id] || {};
+            const hasEdits = Object.keys(chainEdits).length > 0;
+            const hasOverrides = cfg.overrides !== null;
+            return html`
+              <div class="admin-chain-card" key=${cfg.chain_id}>
+                <div class="card-header">
+                  <h3>${cfg.name}</h3>
+                  <span class="chain-id-badge">${cfg.chain_id} ${hasOverrides ? html` <span class="override-badge">overridden</span>` : ''}</span>
+                </div>
+                ${CONFIG_FIELDS.map(f => {
+                  const effectiveVal = cfg.effective[f.key];
+                  const defaultVal = cfg.defaults[f.key];
+                  const overrideVal = cfg.overrides && cfg.overrides[f.key];
+                  const editVal = chainEdits[f.key];
+                  const isOverridden = overrideVal !== undefined && overrideVal !== null;
+                  return html`
+                    <div class="config-row" key=${f.key}>
+                      <span class="config-label">${f.label}</span>
+                      <div class="config-value">
+                        ${isOverridden && editVal === undefined ? html`<span class="override-badge">${overrideVal}</span>` : ''}
+                        ${!isOverridden && editVal === undefined ? html`<span class="default-badge">default</span>` : ''}
+                        <input type="number" min=${f.min} max=${f.max}
+                          value=${editVal !== undefined ? editVal : effectiveVal}
+                          onInput=${(e) => setEdit(cfg.chain_id, f.key, parseInt(e.target.value) || '')}
+                          placeholder=${defaultVal} />
+                      </div>
+                    </div>
+                  `;
+                })}
+                <div class="card-actions">
+                  <button class="admin-btn save" disabled=${!hasEdits} onClick=${() => saveConfig(cfg.chain_id)}>Save</button>
+                  <button class="admin-btn reset" disabled=${!hasOverrides} onClick=${() => resetConfig(cfg.chain_id)}>Reset to Defaults</button>
+                </div>
+              </div>
+            `;
+          })}
+        </div>
+      `}
+
+      ${toast && html`<div class="admin-toast ${toast.type}">${toast.message}</div>`}
+    </div>
+  `;
+}
+
+// =========================================================================
 // App
 // =========================================================================
 function App() {
@@ -498,6 +684,7 @@ function App() {
       <div class="tab ${activeTab === 'monitor' ? 'active' : ''}" onClick=${() => setActiveTab('monitor')}>Network Status</div>
       <div class="tab ${activeTab === 'history' ? 'active' : ''}" onClick=${() => setActiveTab('history')}>History</div>
       <div class="tab ${activeTab === 'api' ? 'active' : ''}" onClick=${() => setActiveTab('api')}>API Tester</div>
+      <div class="tab ${activeTab === 'admin' ? 'active' : ''}" onClick=${() => setActiveTab('admin')}>Admin</div>
     </div>
     <div class="container">
       ${activeTab === 'monitor' && html`
@@ -508,6 +695,7 @@ function App() {
       `}
       ${activeTab === 'history' && html`<${HistoryView} chains=${chains} />`}
       ${activeTab === 'api' && html`<${ApiTester} />`}
+      ${activeTab === 'admin' && html`<${AdminPanel} />`}
     </div>
   `;
 }

@@ -1,5 +1,5 @@
 use crate::types::{Crypto2FiatEvent, DstEscrowCreatedData, FusionPlusSwap, FusionSwap, Transfer};
-use deadpool_postgres::{Config, Pool, Runtime, PoolError};
+use deadpool_postgres::{Config, Pool, Runtime, PoolError, Object as PoolClient};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio_postgres::{NoTls, Row, types::ToSql};
@@ -58,6 +58,11 @@ impl Database {
         db.create_schema().await?;
 
         Ok(db)
+    }
+
+    /// Acquire a pooled connection (for callers that manage their own transaction)
+    pub async fn get_client(&self) -> Result<PoolClient, DbError> {
+        Ok(self.pool.get().await?)
     }
 
     /// Create all tables and indexes if they don't exist
@@ -483,6 +488,221 @@ impl Database {
         }
 
         Ok(total_inserted)
+    }
+
+    // =========================================================================
+    // Transaction-aware methods (_on variants)
+    // These run on an externally-provided transaction instead of acquiring
+    // their own pool connection. Used by process_fetched_data() for atomicity.
+    // =========================================================================
+
+    /// Insert transfers within an existing transaction (COPY or multi-row INSERT)
+    pub(crate) async fn insert_transfers_batch_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        chain_id: u32,
+        transfers: &[Transfer],
+        copy_threshold: usize,
+    ) -> Result<usize, DbError> {
+        if transfers.is_empty() {
+            return Ok(0);
+        }
+
+        if transfers.len() >= copy_threshold {
+            return Self::insert_transfers_copy_on(tx, chain_id, transfers).await;
+        }
+
+        // Multi-row INSERT path (same logic as insert_transfers_batch)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let chain_id_i32 = chain_id as i32;
+        let mut total_inserted = 0;
+
+        for chunk in transfers.chunks(1500) {
+            let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, i64)> =
+                chunk.iter().map(|t| (
+                    chain_id_i32,
+                    t.tx_hash.to_lowercase(),
+                    t.log_index as i32,
+                    t.token.to_lowercase(),
+                    t.from_addr.to_lowercase(),
+                    t.to_addr.to_lowercase(),
+                    t.value.clone(),
+                    t.block_number as i64,
+                    t.block_timestamp as i64,
+                    t.swap_type.clone(),
+                    now,
+                )).collect();
+
+            let mut values_parts = Vec::with_capacity(chunk.len());
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * 11);
+
+            for (i, row) in rows.iter().enumerate() {
+                let b = i * 11;
+                values_parts.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11
+                ));
+                params.push(&row.0);
+                params.push(&row.1);
+                params.push(&row.2);
+                params.push(&row.3);
+                params.push(&row.4);
+                params.push(&row.5);
+                params.push(&row.6);
+                params.push(&row.7);
+                params.push(&row.8);
+                params.push(&row.9);
+                params.push(&row.10);
+            }
+
+            let sql = format!(
+                "INSERT INTO transfers \
+                 (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
+                 VALUES {} \
+                 ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+                values_parts.join(", ")
+            );
+
+            let result = tx.execute(sql.as_str(), &params).await?;
+            total_inserted += result as usize;
+        }
+
+        Ok(total_inserted)
+    }
+
+    /// COPY-based transfer insert within an existing transaction
+    /// No inner transaction — COPY runs directly on the outer tx.
+    async fn insert_transfers_copy_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        chain_id: u32,
+        transfers: &[Transfer],
+    ) -> Result<usize, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let chain_id_i32 = chain_id as i32;
+
+        // 1. Create temp staging table (ON COMMIT DROP fires when outer tx commits)
+        tx.execute(
+            "CREATE TEMP TABLE _transfers_staging (LIKE transfers INCLUDING DEFAULTS) ON COMMIT DROP",
+            &[],
+        ).await?;
+
+        // 2. COPY data into staging table via text-format stream
+        let sink = tx.copy_in(
+            "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) FROM STDIN"
+        ).await?;
+        futures::pin_mut!(sink);
+
+        // Build tab-separated rows, flush every ~64KB
+        let mut buf = BytesMut::with_capacity(64 * 1024);
+        for t in transfers {
+            buf.extend_from_slice(chain_id_i32.to_string().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.tx_hash.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice((t.log_index as i32).to_string().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.token.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.from_addr.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.to_addr.to_lowercase().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(t.value.as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice((t.block_number as i64).to_string().as_bytes());
+            buf.put_u8(b'\t');
+            buf.extend_from_slice((t.block_timestamp as i64).to_string().as_bytes());
+            buf.put_u8(b'\t');
+            match &t.swap_type {
+                Some(s) => buf.extend_from_slice(s.as_bytes()),
+                None => buf.extend_from_slice(b"\\N"),
+            }
+            buf.put_u8(b'\t');
+            buf.extend_from_slice(now.to_string().as_bytes());
+            buf.put_u8(b'\n');
+
+            if buf.len() >= 64 * 1024 {
+                sink.send(buf.split().freeze()).await.map_err(DbError::Postgres)?;
+            }
+        }
+        if !buf.is_empty() {
+            sink.send(buf.freeze()).await.map_err(DbError::Postgres)?;
+        }
+        sink.finish().await?;
+
+        // 3. Move from staging → real table with ON CONFLICT
+        let result = tx.execute(
+            "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
+             SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at \
+             FROM _transfers_staging \
+             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+            &[],
+        ).await?;
+
+        Ok(result as usize)
+    }
+
+    /// Get first and last transfers within an existing transaction
+    pub(crate) async fn get_first_last_transfers_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        chain_id: u32,
+        tx_hash: &str,
+    ) -> Result<Option<(Transfer, Transfer)>, DbError> {
+        let tx_hash_lower = tx_hash.to_lowercase();
+
+        let first_row = tx.query_opt(
+            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type
+             FROM transfers
+             WHERE chain_id = $1 AND tx_hash = $2
+             ORDER BY log_index ASC
+             LIMIT 1",
+            &[&(chain_id as i32), &tx_hash_lower],
+        ).await?;
+
+        let last_row = tx.query_opt(
+            "SELECT tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type
+             FROM transfers
+             WHERE chain_id = $1 AND tx_hash = $2
+             ORDER BY log_index DESC
+             LIMIT 1",
+            &[&(chain_id as i32), &tx_hash_lower],
+        ).await?;
+
+        match (first_row, last_row) {
+            (Some(first), Some(last)) => {
+                let first_transfer = Transfer {
+                    chain_id,
+                    tx_hash: first.get(0),
+                    log_index: first.get::<_, i32>(1) as u32,
+                    token: first.get(2),
+                    from_addr: first.get(3),
+                    to_addr: first.get(4),
+                    value: first.get(5),
+                    block_number: first.get::<_, i64>(6) as u64,
+                    block_timestamp: first.get::<_, i64>(7) as u64,
+                    swap_type: first.get(8),
+                };
+                let last_transfer = Transfer {
+                    chain_id,
+                    tx_hash: last.get(0),
+                    log_index: last.get::<_, i32>(1) as u32,
+                    token: last.get(2),
+                    from_addr: last.get(3),
+                    to_addr: last.get(4),
+                    value: last.get(5),
+                    block_number: last.get::<_, i64>(6) as u64,
+                    block_timestamp: last.get::<_, i64>(7) as u64,
+                    swap_type: last.get(8),
+                };
+                Ok(Some((first_transfer, last_transfer)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Get checkpoint block number for a chain
@@ -978,6 +1198,195 @@ impl Database {
         Ok(deleted as usize)
     }
 
+    // --- Fusion+ transaction-aware methods ---
+
+    /// Insert a Fusion+ swap within an existing transaction
+    pub(crate) async fn insert_fusion_plus_swap_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        swap: &FusionPlusSwap,
+    ) -> Result<bool, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let result = tx.execute(
+            "INSERT INTO fusion_plus_swaps (
+                order_hash, hashlock, secret,
+                src_chain_id, src_tx_hash, src_block_number, src_block_timestamp, src_log_index,
+                src_escrow_address, src_maker, src_taker, src_token, src_amount,
+                src_safety_deposit, src_timelocks, src_status,
+                dst_chain_id, dst_tx_hash, dst_block_number, dst_block_timestamp, dst_log_index,
+                dst_escrow_address, dst_maker, dst_taker, dst_token, dst_amount,
+                dst_safety_deposit, dst_timelocks, dst_status,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
+            )
+            ON CONFLICT (order_hash) DO NOTHING",
+            &[
+                &swap.order_hash.to_lowercase(),
+                &swap.hashlock.to_lowercase(),
+                &swap.secret,
+                &(swap.src_chain_id as i32),
+                &swap.src_tx_hash.to_lowercase(),
+                &(swap.src_block_number as i64),
+                &(swap.src_block_timestamp as i64),
+                &(swap.src_log_index as i32),
+                &swap.src_escrow_address.as_ref().map(|s| s.to_lowercase()),
+                &swap.src_maker.to_lowercase(),
+                &swap.src_taker.to_lowercase(),
+                &swap.src_token.to_lowercase(),
+                &swap.src_amount,
+                &swap.src_safety_deposit,
+                &swap.src_timelocks,
+                &swap.src_status,
+                &(swap.dst_chain_id as i32),
+                &swap.dst_tx_hash.as_ref().map(|s| s.to_lowercase()),
+                &swap.dst_block_number.map(|n| n as i64),
+                &swap.dst_block_timestamp.map(|n| n as i64),
+                &swap.dst_log_index.map(|n| n as i32),
+                &swap.dst_escrow_address.as_ref().map(|s| s.to_lowercase()),
+                &swap.dst_maker.to_lowercase(),
+                &swap.dst_taker.as_ref().map(|s| s.to_lowercase()),
+                &swap.dst_token.to_lowercase(),
+                &swap.dst_amount,
+                &swap.dst_safety_deposit,
+                &swap.dst_timelocks,
+                &swap.dst_status,
+                &now,
+                &now,
+            ],
+        ).await?;
+
+        Ok(result > 0)
+    }
+
+    /// Update Fusion+ swap with destination data within an existing transaction
+    pub(crate) async fn update_fusion_plus_dst_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        order_hash: &str,
+        dst_data: &DstEscrowCreatedData,
+        chain_id: u32,
+        tx_hash_str: &str,
+        block_number: u64,
+        block_timestamp: u64,
+        log_index: u32,
+        escrow_address: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let result = tx.execute(
+            "UPDATE fusion_plus_swaps SET
+                dst_tx_hash = $1,
+                dst_block_number = $2,
+                dst_block_timestamp = $3,
+                dst_log_index = $4,
+                dst_escrow_address = $5,
+                dst_taker = $6,
+                dst_timelocks = $7,
+                dst_status = 'created',
+                updated_at = $8
+             WHERE order_hash = $9 AND dst_chain_id = $10",
+            &[
+                &tx_hash_str.to_lowercase(),
+                &(block_number as i64),
+                &(block_timestamp as i64),
+                &(log_index as i32),
+                &escrow_address.map(|s| s.to_lowercase()),
+                &dst_data.dst_taker.to_lowercase(),
+                &dst_data.dst_timelocks,
+                &now,
+                &order_hash.to_lowercase(),
+                &(chain_id as i32),
+            ],
+        ).await?;
+
+        Ok(result > 0)
+    }
+
+    /// Update Fusion+ withdrawal by hashlock within an existing transaction
+    pub(crate) async fn update_fusion_plus_withdrawal_by_hashlock_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        hashlock: &str,
+        chain_id: u32,
+        is_src: bool,
+        secret: &str,
+        tx_hash_str: &str,
+        block_number: u64,
+        block_timestamp: u64,
+        log_index: u32,
+    ) -> Result<bool, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let result = if is_src {
+            tx.execute(
+                "UPDATE fusion_plus_swaps SET
+                    src_status = 'withdrawn',
+                    secret = $1,
+                    updated_at = $2
+                 WHERE hashlock = $3 AND src_chain_id = $4",
+                &[
+                    &secret.to_lowercase(),
+                    &now,
+                    &hashlock.to_lowercase(),
+                    &(chain_id as i32),
+                ],
+            ).await?
+        } else {
+            tx.execute(
+                "UPDATE fusion_plus_swaps SET
+                    dst_status = 'withdrawn',
+                    dst_tx_hash = $5,
+                    dst_block_number = $6,
+                    dst_block_timestamp = $7,
+                    dst_log_index = $8,
+                    secret = $1,
+                    updated_at = $2
+                 WHERE hashlock = $3 AND dst_chain_id = $4",
+                &[
+                    &secret.to_lowercase(),
+                    &now,
+                    &hashlock.to_lowercase(),
+                    &(chain_id as i32),
+                    &tx_hash_str.to_lowercase(),
+                    &(block_number as i64),
+                    &(block_timestamp as i64),
+                    &(log_index as i32),
+                ],
+            ).await?
+        };
+
+        Ok(result > 0)
+    }
+
+    /// Get Fusion+ swap by hashlock within an existing transaction
+    pub(crate) async fn get_fusion_plus_swap_by_hashlock_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        hashlock: &str,
+    ) -> Result<Option<FusionPlusSwap>, DbError> {
+        let row = tx.query_opt(
+            "SELECT order_hash, hashlock, secret,
+                    src_chain_id, src_tx_hash, src_block_number, src_block_timestamp, src_log_index,
+                    src_escrow_address, src_maker, src_taker, src_token, src_amount,
+                    src_safety_deposit, src_timelocks, src_status,
+                    dst_chain_id, dst_tx_hash, dst_block_number, dst_block_timestamp, dst_log_index,
+                    dst_escrow_address, dst_maker, dst_taker, dst_token, dst_amount,
+                    dst_safety_deposit, dst_timelocks, dst_status
+             FROM fusion_plus_swaps WHERE hashlock = $1",
+            &[&hashlock.to_lowercase()],
+        ).await?;
+
+        Ok(row.map(|r| Self::row_to_fusion_plus_swap(&r)))
+    }
+
     // =========================================================================
     // Fusion (Single-Chain) Methods
     // =========================================================================
@@ -1084,6 +1493,48 @@ impl Database {
         Ok(deleted as usize)
     }
 
+    // --- Fusion single-chain transaction-aware methods ---
+
+    /// Insert a Fusion swap within an existing transaction
+    pub(crate) async fn insert_fusion_swap_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        swap: &FusionSwap,
+    ) -> Result<bool, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let result = tx.execute(
+            "INSERT INTO fusion_swaps (
+                order_hash, chain_id, tx_hash, block_number, block_timestamp, log_index,
+                maker, taker, maker_token, taker_token, maker_amount, taker_amount,
+                remaining, is_partial_fill, status, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+            &[
+                &swap.order_hash.to_lowercase(),
+                &(swap.chain_id as i32),
+                &swap.tx_hash.to_lowercase(),
+                &(swap.block_number as i64),
+                &(swap.block_timestamp as i64),
+                &(swap.log_index as i32),
+                &swap.maker.to_lowercase(),
+                &swap.taker.as_ref().map(|s| s.to_lowercase()),
+                &swap.maker_token.as_ref().map(|s| s.to_lowercase()),
+                &swap.taker_token.as_ref().map(|s| s.to_lowercase()),
+                &swap.maker_amount,
+                &swap.taker_amount,
+                &swap.remaining,
+                &swap.is_partial_fill,
+                &swap.status,
+                &now,
+            ],
+        ).await?;
+
+        Ok(result > 0)
+    }
+
     // =========================================================================
     // Crypto2Fiat Methods
     // =========================================================================
@@ -1146,6 +1597,42 @@ impl Database {
         ).await?;
 
         Ok(deleted as usize)
+    }
+
+    // --- Crypto2Fiat transaction-aware methods ---
+
+    /// Insert a Crypto2Fiat event within an existing transaction
+    pub(crate) async fn insert_crypto2fiat_event_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        event: &Crypto2FiatEvent,
+    ) -> Result<bool, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let result = tx.execute(
+            "INSERT INTO crypto2fiat_events (
+                order_id, token, amount, recipient, metadata,
+                chain_id, tx_hash, block_number, block_timestamp, log_index, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+            &[
+                &event.order_id.to_lowercase(),
+                &event.token.to_lowercase(),
+                &event.amount,
+                &event.recipient.to_lowercase(),
+                &event.metadata,
+                &(event.chain_id as i32),
+                &event.tx_hash.to_lowercase(),
+                &(event.block_number as i64),
+                &(event.block_timestamp as i64),
+                &(event.log_index as i32),
+                &now,
+            ],
+        ).await?;
+
+        Ok(result > 0)
     }
 
     // =========================================================================

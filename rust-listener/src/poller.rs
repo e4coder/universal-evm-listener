@@ -14,6 +14,7 @@ use crate::types::{
 };
 use serde_json::json;
 use std::sync::atomic::Ordering::Relaxed;
+use tokio_postgres::Transaction as PgTransaction;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -790,14 +791,21 @@ impl ChainPoller {
             transfers.push(transfer);
         }
 
-        // Batch insert to PostgreSQL database (with swap_type already set)
+        // =====================================================================
+        // All DB operations in a single transaction for atomicity
+        // =====================================================================
         let batch_len = transfers.len();
         let insert_start = std::time::Instant::now();
 
+        let mut client = self.db.get_client().await
+            .map_err(|e| format!("DB error: {}", e))?;
+        let tx = client.transaction().await
+            .map_err(|e| format!("DB error: {}", e))?;
+
+        // Step 1: Insert transfers
         let copy_threshold = self.live_config.copy_threshold.load(Relaxed) as usize;
         let inserted = if !transfers.is_empty() {
-            self.db
-                .insert_transfers_batch(self.network.chain_id, &transfers, copy_threshold)
+            Database::insert_transfers_batch_on(&tx, self.network.chain_id, &transfers, copy_threshold)
                 .await
                 .map_err(|e| format!("DB error: {}", e))?
         } else {
@@ -808,15 +816,16 @@ impl ChainPoller {
         self.stats.last_insert_time_ms.store(insert_ms, Relaxed);
         self.stats.last_batch_size.store(batch_len as u64, Relaxed);
 
-        // =====================================================================
-        // Process fusion events (insert swap records, no UPDATE needed)
-        // Must run AFTER insert_transfers_batch (fusion needs transfers in DB)
-        // =====================================================================
+        // Step 2-4: Process fusion/c2f events (must run AFTER transfers for read-your-writes)
         let fusion_plus_events = self.process_fusion_plus_logs(
-            &data.fusion_plus_factory_logs, &data.fusion_plus_escrow_logs
+            &tx, &data.fusion_plus_factory_logs, &data.fusion_plus_escrow_logs
         ).await?;
-        let fusion_events = self.process_fusion_logs(&data.fusion_logs).await?;
-        let crypto2fiat_events = self.process_crypto2fiat_logs(&data.crypto2fiat_logs).await?;
+        let fusion_events = self.process_fusion_logs(&tx, &data.fusion_logs).await?;
+        let crypto2fiat_events = self.process_crypto2fiat_logs(&tx, &data.crypto2fiat_logs).await?;
+
+        // Commit — all data becomes visible atomically
+        tx.commit().await
+            .map_err(|e| format!("DB commit error: {}", e))?;
 
         Ok(inserted + fusion_plus_events + fusion_events + crypto2fiat_events)
     }
@@ -828,6 +837,7 @@ impl ChainPoller {
     /// Process Fusion+ logs (factory and escrow events)
     async fn process_fusion_plus_logs(
         &mut self,
+        tx: &PgTransaction<'_>,
         factory_logs: &[Log],
         escrow_logs: &[Log],
     ) -> Result<usize, String> {
@@ -841,13 +851,13 @@ impl ChainPoller {
             let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
 
             if log.topics[0].to_lowercase() == SRC_ESCROW_CREATED_TOPIC {
-                if let Err(e) = self.process_src_escrow_created(log, timestamp).await {
+                if let Err(e) = self.process_src_escrow_created(tx, log, timestamp).await {
                     warn!("[{}] Failed to process SrcEscrowCreated: {}", self.network.name, e);
                 } else {
                     events_processed += 1;
                 }
             } else if log.topics[0].to_lowercase() == DST_ESCROW_CREATED_TOPIC {
-                if let Err(e) = self.process_dst_escrow_created(log, timestamp).await {
+                if let Err(e) = self.process_dst_escrow_created(tx, log, timestamp).await {
                     warn!("[{}] Failed to process DstEscrowCreated: {}", self.network.name, e);
                 } else {
                     events_processed += 1;
@@ -863,13 +873,13 @@ impl ChainPoller {
             let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
 
             if log.topics[0].to_lowercase() == ESCROW_WITHDRAWAL_TOPIC {
-                if let Err(e) = self.process_escrow_withdrawal(log, timestamp).await {
+                if let Err(e) = self.process_escrow_withdrawal(tx, log, timestamp).await {
                     debug!("[{}] Failed to process EscrowWithdrawal: {}", self.network.name, e);
                 } else {
                     events_processed += 1;
                 }
             } else if log.topics[0].to_lowercase() == ESCROW_CANCELLED_TOPIC {
-                if let Err(e) = self.process_escrow_cancelled(log, timestamp).await {
+                if let Err(e) = self.process_escrow_cancelled(tx, log, timestamp).await {
                     debug!("[{}] Failed to process EscrowCancelled: {}", self.network.name, e);
                 } else {
                     events_processed += 1;
@@ -888,7 +898,7 @@ impl ChainPoller {
     }
 
     /// Process Fusion (single-chain) logs
-    async fn process_fusion_logs(&mut self, logs: &[Log]) -> Result<usize, String> {
+    async fn process_fusion_logs(&mut self, tx: &PgTransaction<'_>, logs: &[Log]) -> Result<usize, String> {
         let mut events_processed = 0;
 
         for log in logs {
@@ -900,13 +910,13 @@ impl ChainPoller {
             let topic0 = log.topics[0].to_lowercase();
 
             if topic0 == ORDER_FILLED_TOPIC {
-                if let Err(e) = self.process_order_filled(log, timestamp, "filled").await {
+                if let Err(e) = self.process_order_filled(tx, log, timestamp, "filled").await {
                     debug!("[{}] Failed to process OrderFilled: {}", self.network.name, e);
                 } else {
                     events_processed += 1;
                 }
             } else if topic0 == ORDER_CANCELLED_TOPIC {
-                if let Err(e) = self.process_order_filled(log, timestamp, "cancelled").await {
+                if let Err(e) = self.process_order_filled(tx, log, timestamp, "cancelled").await {
                     debug!("[{}] Failed to process OrderCancelled: {}", self.network.name, e);
                 } else {
                     events_processed += 1;
@@ -925,7 +935,7 @@ impl ChainPoller {
     }
 
     /// Process Crypto2Fiat logs
-    async fn process_crypto2fiat_logs(&mut self, logs: &[Log]) -> Result<usize, String> {
+    async fn process_crypto2fiat_logs(&mut self, tx: &PgTransaction<'_>, logs: &[Log]) -> Result<usize, String> {
         let mut events_processed = 0;
 
         for log in logs {
@@ -935,7 +945,7 @@ impl ChainPoller {
 
             let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
 
-            if let Err(e) = self.process_crypto2fiat_event(log, timestamp).await {
+            if let Err(e) = self.process_crypto2fiat_event(tx, log, timestamp).await {
                 debug!("[{}] Failed to process Crypto2Fiat event: {}", self.network.name, e);
             } else {
                 events_processed += 1;
@@ -953,7 +963,7 @@ impl ChainPoller {
     }
 
     /// Process SrcEscrowCreated event
-    async fn process_src_escrow_created(&self, log: &Log, timestamp: u64) -> Result<(), String> {
+    async fn process_src_escrow_created(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
         let data = decode_src_escrow_created(&log.data)
             .ok_or_else(|| "Failed to decode SrcEscrowCreated data".to_string())?;
 
@@ -967,9 +977,8 @@ impl ChainPoller {
             log.log_index_u32(),
         );
 
-        // Insert the swap into database
-        self.db
-            .insert_fusion_plus_swap(&swap)
+        // Insert the swap into database (within transaction)
+        Database::insert_fusion_plus_swap_on(tx, &swap)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
@@ -982,13 +991,13 @@ impl ChainPoller {
     }
 
     /// Process DstEscrowCreated event
-    async fn process_dst_escrow_created(&self, log: &Log, timestamp: u64) -> Result<(), String> {
+    async fn process_dst_escrow_created(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
         let data = decode_dst_escrow_created(&log.data)
             .ok_or_else(|| "Failed to decode DstEscrowCreated data".to_string())?;
 
-        // Update existing swap with destination data
-        let updated = self.db
-            .update_fusion_plus_dst(
+        // Update existing swap with destination data (within transaction)
+        let updated = Database::update_fusion_plus_dst_on(
+                tx,
                 &data.order_hash,
                 &data,
                 self.network.chain_id,
@@ -1017,7 +1026,7 @@ impl ChainPoller {
     }
 
     /// Process EscrowWithdrawal event
-    async fn process_escrow_withdrawal(&self, log: &Log, timestamp: u64) -> Result<(), String> {
+    async fn process_escrow_withdrawal(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
         let secret = decode_escrow_withdrawal(&log.data)
             .ok_or_else(|| "Failed to decode EscrowWithdrawal data".to_string())?;
 
@@ -1025,14 +1034,14 @@ impl ChainPoller {
         let hashlock = compute_hashlock_from_secret(&secret)
             .ok_or_else(|| "Failed to compute hashlock from secret".to_string())?;
 
-        // Look up the swap by hashlock and update its status
-        if let Ok(Some(swap)) = self.db.get_fusion_plus_swap_by_hashlock(&hashlock).await {
+        // Look up the swap by hashlock and update its status (within transaction)
+        if let Ok(Some(swap)) = Database::get_fusion_plus_swap_by_hashlock_on(tx, &hashlock).await {
             // Determine if this is src or dst withdrawal based on chain_id
             let is_src = swap.src_chain_id == self.network.chain_id;
 
             // Update the swap status with secret and tx details
-            let updated = self.db
-                .update_fusion_plus_withdrawal_by_hashlock(
+            let updated = Database::update_fusion_plus_withdrawal_by_hashlock_on(
+                    tx,
                     &hashlock,
                     self.network.chain_id,
                     is_src,
@@ -1063,7 +1072,7 @@ impl ChainPoller {
     }
 
     /// Process EscrowCancelled event
-    async fn process_escrow_cancelled(&self, log: &Log, _timestamp: u64) -> Result<(), String> {
+    async fn process_escrow_cancelled(&self, _tx: &PgTransaction<'_>, log: &Log, _timestamp: u64) -> Result<(), String> {
         debug!(
             "[{}] Fusion+ escrow cancelled: {}",
             self.network.name, log.address
@@ -1077,7 +1086,7 @@ impl ChainPoller {
     // =========================================================================
 
     /// Process OrderFilled or OrderCancelled event
-    async fn process_order_filled(&self, log: &Log, timestamp: u64, status: &str) -> Result<(), String> {
+    async fn process_order_filled(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64, status: &str) -> Result<(), String> {
         let data = decode_order_filled(&log.topics, &log.data)
             .ok_or_else(|| "Failed to decode OrderFilled data".to_string())?;
 
@@ -1085,11 +1094,11 @@ impl ChainPoller {
         let remaining_hex = data.remaining.trim_start_matches("0x");
         let is_partial = !remaining_hex.chars().all(|c| c == '0');
 
-        // Get first and last transfers to populate maker/taker info
+        // Get first and last transfers to populate maker/taker info (within transaction — reads just-inserted transfers)
         // First transfer = maker sends maker_token (maker = from_addr of first transfer)
         // Last transfer = taker receives taker_token (taker = to_addr of last transfer)
         let (maker, taker, maker_token, taker_token, maker_amount, taker_amount) =
-            match self.db.get_first_last_transfers(self.network.chain_id, &log.transaction_hash).await {
+            match Database::get_first_last_transfers_on(tx, self.network.chain_id, &log.transaction_hash).await {
                 Ok(Some((first, last))) => {
                     (
                         first.from_addr.clone(),         // maker = sender of first transfer
@@ -1128,9 +1137,8 @@ impl ChainPoller {
             status: status.to_string(),
         };
 
-        // Insert swap record
-        self.db
-            .insert_fusion_swap(&swap)
+        // Insert swap record (within transaction)
+        Database::insert_fusion_swap_on(tx, &swap)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
@@ -1181,7 +1189,7 @@ impl ChainPoller {
     // =========================================================================
 
     /// Process a Crypto2Fiat event
-    async fn process_crypto2fiat_event(&self, log: &Log, timestamp: u64) -> Result<(), String> {
+    async fn process_crypto2fiat_event(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
         let mut event = decode_crypto2fiat_event(log)
             .ok_or_else(|| "Failed to decode Crypto2Fiat event".to_string())?;
 
@@ -1192,9 +1200,8 @@ impl ChainPoller {
         event.block_timestamp = timestamp;
         event.log_index = log.log_index_u32();
 
-        // Insert the event
-        self.db
-            .insert_crypto2fiat_event(&event)
+        // Insert the event (within transaction)
+        Database::insert_crypto2fiat_event_on(tx, &event)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 

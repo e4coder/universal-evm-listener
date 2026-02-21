@@ -763,6 +763,9 @@ impl ChainPoller {
         }
 
         // Batch insert to PostgreSQL database (with swap_type already set)
+        let batch_len = transfers.len();
+        let insert_start = std::time::Instant::now();
+
         let inserted = if !transfers.is_empty() {
             self.db
                 .insert_transfers_batch(self.network.chain_id, &transfers)
@@ -771,6 +774,10 @@ impl ChainPoller {
         } else {
             0
         };
+
+        let insert_ms = insert_start.elapsed().as_millis() as u64;
+        self.stats.last_insert_time_ms.store(insert_ms, Relaxed);
+        self.stats.last_batch_size.store(batch_len as u64, Relaxed);
 
         // =====================================================================
         // Process fusion events (insert swap records, no UPDATE needed)

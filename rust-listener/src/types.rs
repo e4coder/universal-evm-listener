@@ -307,6 +307,9 @@ pub struct ChainStats {
     pub blocks_processed: AtomicU64,
     pub total_transfers: AtomicU64,
     pub buffer_size: AtomicU64,
+    // Insert performance counters
+    pub last_insert_time_ms: AtomicU64,
+    pub last_batch_size: AtomicU64,
 }
 
 impl ChainStats {
@@ -325,6 +328,8 @@ impl ChainStats {
             blocks_processed: AtomicU64::new(0),
             total_transfers: AtomicU64::new(0),
             buffer_size: AtomicU64::new(0),
+            last_insert_time_ms: AtomicU64::new(0),
+            last_batch_size: AtomicU64::new(0),
         }
     }
 }

@@ -192,10 +192,16 @@ impl Database {
                 blocks_processed BIGINT DEFAULT 0,
                 total_transfers BIGINT DEFAULT 0,
                 buffer_size INTEGER DEFAULT 0,
+                insert_time_ms INTEGER DEFAULT 0,
+                batch_size INTEGER DEFAULT 0,
                 updated_at BIGINT DEFAULT 0
             )",
             &[],
         ).await?;
+
+        // Migration: add insert timing columns to existing deployments
+        client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS insert_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+        client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS batch_size INTEGER DEFAULT 0", &[]).await.ok();
 
         // Create indexes for transfers
         let transfer_indexes = [
@@ -311,8 +317,8 @@ impl Database {
         let mut total_inserted = 0;
 
         // Multi-row INSERT: 11 params per row, PostgreSQL max ~65535 params
-        // Chunk at 5000 rows (55000 params) for efficiency
-        for chunk in transfers.chunks(5000) {
+        // Chunk at 1500 rows (16500 params) — balances round-trips vs query parse time
+        for chunk in transfers.chunks(1500) {
             // Pre-compute owned values so references stay valid
             let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, i64)> =
                 chunk.iter().map(|t| (
@@ -1049,6 +1055,8 @@ impl Database {
         blocks_processed: u64,
         total_transfers: u64,
         buffer_size: u64,
+        insert_time_ms: u64,
+        batch_size: u64,
     ) -> Result<(), DbError> {
         let client = self.pool.get().await?;
         let now = SystemTime::now()
@@ -1061,8 +1069,9 @@ impl Database {
                 chain_id, chain_name, current_block, checkpoint_block,
                 pending_ranges, last_chance_count, inflight_fetches,
                 successful_fetches, failed_fetches, timed_out_fetches,
-                blocks_processed, total_transfers, buffer_size, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                blocks_processed, total_transfers, buffer_size,
+                insert_time_ms, batch_size, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (chain_id) DO UPDATE SET
                 chain_name = EXCLUDED.chain_name,
                 current_block = EXCLUDED.current_block,
@@ -1076,6 +1085,8 @@ impl Database {
                 blocks_processed = EXCLUDED.blocks_processed,
                 total_transfers = EXCLUDED.total_transfers,
                 buffer_size = EXCLUDED.buffer_size,
+                insert_time_ms = EXCLUDED.insert_time_ms,
+                batch_size = EXCLUDED.batch_size,
                 updated_at = EXCLUDED.updated_at",
             &[
                 &(chain_id as i32),
@@ -1091,6 +1102,8 @@ impl Database {
                 &(blocks_processed as i64),
                 &(total_transfers as i64),
                 &(buffer_size as i32),
+                &(insert_time_ms as i32),
+                &(batch_size as i32),
                 &now,
             ],
         ).await?;

@@ -165,6 +165,9 @@ function ChainCard({ chain }) {
       <div class="row"><span class="k">Events Processed</span><span class="v">${Number(chain.total_transfers).toLocaleString()}</span></div>
       <div class="row"><span class="k">Blocks Processed</span><span class="v">${Number(chain.blocks_processed).toLocaleString()}</span></div>
       <div class="row"><span class="k">Buffer Size</span><span class="v">${chain.buffer_size}</span></div>
+      <div class="divider"></div>
+      <div class="row"><span class="k">Insert Time</span><span class="v ${Number(chain.insert_time_ms) > 5000 ? 'err' : Number(chain.insert_time_ms) > 1000 ? 'warn' : ''}">${chain.insert_time_ms || 0}ms</span></div>
+      <div class="row"><span class="k">Batch Size</span><span class="v">${Number(chain.batch_size || 0).toLocaleString()}</span></div>
       <div class="row"><span class="k">Updated</span><span class="v ${age > 10 ? 'err' : ''}">${age}s ago</span></div>
     </div>
   `;

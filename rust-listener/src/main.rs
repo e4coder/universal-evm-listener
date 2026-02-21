@@ -147,6 +147,8 @@ async fn main() {
                     stats.blocks_processed.load(Relaxed),
                     stats.total_transfers.load(Relaxed),
                     stats.buffer_size.load(Relaxed),
+                    stats.last_insert_time_ms.load(Relaxed),
+                    stats.last_batch_size.load(Relaxed),
                 ).await {
                     warn!("Failed to write stats for chain {}: {}", stats.chain_id, e);
                 }

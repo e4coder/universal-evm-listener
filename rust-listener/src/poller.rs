@@ -10,8 +10,9 @@ use crate::types::{
     ESCROW_WITHDRAWAL_TOPIC, ESCROW_CANCELLED_TOPIC,
     AGGREGATION_ROUTER_V6, AGGREGATION_ROUTER_ZKSYNC,
     ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC,
-    CRYPTO2FIAT_TOPIC,
+    CRYPTO2FIAT_TOPIC, TRANSFER_TOPIC,
 };
+use serde_json::json;
 use std::sync::atomic::Ordering::Relaxed;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -66,7 +67,8 @@ struct FetchedData {
     transfer_logs: Vec<Log>,
 }
 
-/// Fetch all logs for a block range with all 5 RPC calls in parallel.
+/// Fetch all logs for a block range using a single JSON-RPC batch request.
+/// All 5 eth_getLogs calls are batched into one HTTP POST (instead of 5 parallel POSTs).
 /// Standalone function compatible with tokio::spawn (no &self, only owned/'static params).
 async fn fetch_all_logs(
     rpc: Arc<RpcClient>,
@@ -80,6 +82,9 @@ async fn fetch_all_logs(
         chain_name, from_block, to_block
     );
 
+    let from_hex = format!("0x{:x}", from_block);
+    let to_hex = format!("0x{:x}", to_block);
+
     // Determine router address based on chain
     let router_address = if chain_id == 324 {
         AGGREGATION_ROUTER_ZKSYNC
@@ -87,31 +92,50 @@ async fn fetch_all_logs(
         AGGREGATION_ROUTER_V6
     };
 
-    // Fire ALL 5 RPC calls in parallel, wait for ALL to complete
-    let (fp_factory_result, fp_escrow_result, fusion_result, c2f_result, transfer_result) = tokio::join!(
-        // Fusion+ factory events (SrcEscrowCreated + DstEscrowCreated)
-        rpc.get_logs_multi_topics(
-            from_block, to_block, ESCROW_FACTORY,
-            vec![SRC_ESCROW_CREATED_TOPIC.to_string(), DST_ESCROW_CREATED_TOPIC.to_string()],
-        ),
-        // Fusion+ escrow events (Withdrawal + Cancelled) from any address
-        rpc.get_logs_multi_topics_any_address(
-            from_block, to_block,
-            vec![ESCROW_WITHDRAWAL_TOPIC.to_string(), ESCROW_CANCELLED_TOPIC.to_string()],
-        ),
-        // Fusion single-chain events (OrderFilled + OrderCancelled)
-        rpc.get_logs_multi_topics(
-            from_block, to_block, router_address,
-            vec![ORDER_FILLED_TOPIC.to_string(), ORDER_CANCELLED_TOPIC.to_string()],
-        ),
-        // Crypto2Fiat events from any address
-        rpc.get_logs_by_topic_any_address(from_block, to_block, CRYPTO2FIAT_TOPIC),
-        // ERC20 Transfer events (the main data)
-        rpc.get_transfer_logs(from_block, to_block),
-    );
+    // Build 5 filter objects — same filters as before, now batched into 1 HTTP request
+    let filters = vec![
+        // [0] Fusion+ factory events (SrcEscrowCreated + DstEscrowCreated)
+        json!({
+            "fromBlock": &from_hex, "toBlock": &to_hex,
+            "address": ESCROW_FACTORY,
+            "topics": [[SRC_ESCROW_CREATED_TOPIC, DST_ESCROW_CREATED_TOPIC]]
+        }),
+        // [1] Fusion+ escrow events (Withdrawal + Cancelled) from any address
+        json!({
+            "fromBlock": &from_hex, "toBlock": &to_hex,
+            "topics": [[ESCROW_WITHDRAWAL_TOPIC, ESCROW_CANCELLED_TOPIC]]
+        }),
+        // [2] Fusion single-chain events (OrderFilled + OrderCancelled)
+        json!({
+            "fromBlock": &from_hex, "toBlock": &to_hex,
+            "address": router_address,
+            "topics": [[ORDER_FILLED_TOPIC, ORDER_CANCELLED_TOPIC]]
+        }),
+        // [3] Crypto2Fiat events from any address
+        json!({
+            "fromBlock": &from_hex, "toBlock": &to_hex,
+            "topics": [CRYPTO2FIAT_TOPIC]
+        }),
+        // [4] ERC20 Transfer events (the main data)
+        json!({
+            "fromBlock": &from_hex, "toBlock": &to_hex,
+            "topics": [TRANSFER_TOPIC]
+        }),
+    ];
 
-    // Fusion/c2f logs default to empty on error (non-critical)
-    // Transfer logs propagate errors (critical - triggers adaptive step)
+    let mut results = rpc
+        .batch_get_logs(&filters)
+        .await
+        .map_err(|e| format!("Batch getLogs failed: {}", e))?;
+
+    // Destructure the 5 results by consuming in reverse order (avoids clone)
+    let transfer_result = results.pop().unwrap();
+    let c2f_result = results.pop().unwrap();
+    let fusion_result = results.pop().unwrap();
+    let fp_escrow_result = results.pop().unwrap();
+    let fp_factory_result = results.pop().unwrap();
+
+    // Same error policy: fusion/c2f default to empty on error, transfers propagate
     Ok(FetchedData {
         from_block,
         to_block,
@@ -119,7 +143,8 @@ async fn fetch_all_logs(
         fusion_plus_escrow_logs: fp_escrow_result.unwrap_or_default(),
         fusion_logs: fusion_result.unwrap_or_default(),
         crypto2fiat_logs: c2f_result.unwrap_or_default(),
-        transfer_logs: transfer_result.map_err(|e| format!("Failed to get transfer logs: {}", e))?,
+        transfer_logs: transfer_result
+            .map_err(|e| format!("Failed to get transfer logs: {}", e))?,
     })
 }
 
@@ -687,22 +712,14 @@ impl ChainPoller {
                 .collect();
 
             if !uncached.is_empty() {
-                let mut futs = Vec::with_capacity(uncached.len());
-                for block_num in &uncached {
-                    let rpc = Arc::clone(&self.rpc);
-                    let bn = *block_num;
-                    futs.push(async move {
-                        let result = rpc.get_block(bn).await;
-                        (bn, result)
-                    });
-                }
+                // Batch all eth_getBlockByNumber calls into a single HTTP request
+                let results = self.rpc.batch_get_blocks(&uncached).await
+                    .map_err(|e| format!("Batch getBlockByNumber failed: {}", e))?;
 
-                let results = futures::future::join_all(futs).await;
-
-                for (block_num, result) in results {
+                for (block_num, result) in uncached.iter().zip(results.into_iter()) {
                     match result {
                         Ok(block) => {
-                            self.block_timestamp_cache.insert(block_num, block.timestamp_u64());
+                            self.block_timestamp_cache.insert(*block_num, block.timestamp_u64());
                         }
                         Err(e) => {
                             return Err(format!("Failed to get block {}: {}", block_num, e));

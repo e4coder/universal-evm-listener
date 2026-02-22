@@ -1,16 +1,21 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod adapter;
 mod config;
 mod db;
+mod evm_adapter;
 mod fusion;
 mod poller;
 mod rpc;
 mod types;
 
+use crate::adapter::ChainAdapter;
 use crate::config::{get_database_url, get_ttl_secs, load_networks};
 use crate::db::Database;
+use crate::evm_adapter::EvmAdapter;
 use crate::poller::ChainPoller;
+use crate::rpc::RpcClient;
 use crate::types::{ChainStats, LiveConfig};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::Relaxed;
@@ -124,8 +129,23 @@ async fn main() {
         all_stats.push(Arc::clone(&stats));
         all_live_configs.push((network.chain_id, Arc::clone(&live_config)));
 
+        // Construct protocol adapter (EVM for all current chains)
+        let rpc = Arc::new(RpcClient::new(&network.rpc_url, network.name));
+        let slow_rpc = Arc::new(RpcClient::with_config(
+            &network.rpc_url,
+            network.name,
+            3,
+            100,
+            60,
+        ));
+        let adapter: Arc<dyn ChainAdapter> =
+            Arc::new(EvmAdapter::new(rpc, network.chain_id, network.name));
+        let slow_adapter: Arc<dyn ChainAdapter> =
+            Arc::new(EvmAdapter::new(slow_rpc, network.chain_id, network.name));
+
         let handle = tokio::spawn(async move {
-            let mut poller = ChainPoller::new(network, db_clone, stats, live_config);
+            let mut poller =
+                ChainPoller::new(network, adapter, slow_adapter, db_clone, stats, live_config);
             poller.run().await;
         });
 

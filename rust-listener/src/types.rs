@@ -66,6 +66,57 @@ pub struct NetworkConfig {
     pub confirmation_blocks: u64,
 }
 
+// ============================================================================
+// Protocol-Agnostic Decoded Types (produced by ChainAdapter, consumed by pipeline)
+// ============================================================================
+
+/// Protocol-agnostic decoded events for a block range.
+/// Produced by ChainAdapter::fetch_decoded(), consumed by insert_decoded_range().
+pub struct DecodedBlockRange {
+    pub from_block: u64,
+    pub to_block: u64,
+    pub transfers: Vec<Transfer>,
+    pub fusion_plus_actions: Vec<FpAction>,
+    pub fusion_actions: Vec<FusionAction>,
+    pub crypto2fiat_events: Vec<Crypto2FiatEvent>,
+}
+
+/// Decoded Fusion+ action (protocol-agnostic output from adapter)
+pub enum FpAction {
+    SrcEscrowCreated {
+        swap: FusionPlusSwap,
+    },
+    DstEscrowCreated {
+        order_hash: String,
+        data: DstEscrowCreatedData,
+        chain_id: u32,
+        tx_hash: String,
+        block_number: u64,
+        block_timestamp: u64,
+        log_index: u32,
+        escrow_address: String,
+    },
+    EscrowWithdrawal {
+        secret: String,
+        hashlock: String,
+        chain_id: u32,
+        tx_hash: String,
+        block_number: u64,
+        block_timestamp: u64,
+        log_index: u32,
+        escrow_address: String,
+    },
+    EscrowCancelled {
+        escrow_address: String,
+    },
+}
+
+/// Decoded Fusion single-chain action (protocol-agnostic output from adapter)
+pub enum FusionAction {
+    OrderFilled { swap: FusionSwap },
+    OrderCancelled { swap: FusionSwap },
+}
+
 /// Transfer event data to store in PostgreSQL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {

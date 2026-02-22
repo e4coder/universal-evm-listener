@@ -10,6 +10,24 @@ services:
       POSTGRES_USER: erc20cache
       POSTGRES_PASSWORD: erc20cache_pass
       POSTGRES_DB: erc20cache
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "max_wal_size=4GB"
+      - "-c"
+      - "wal_buffers=64MB"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_cache_size=1536MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "max_connections=100"
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped

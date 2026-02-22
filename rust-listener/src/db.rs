@@ -5,6 +5,7 @@ use thiserror::Error;
 use tokio_postgres::{NoTls, Row, types::ToSql};
 use bytes::{BytesMut, BufMut};
 use futures::SinkExt;
+use tracing::info;
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -24,7 +25,7 @@ pub struct Database {
 
 impl Database {
     /// Create a new database connection pool from DATABASE_URL
-    pub async fn new(database_url: &str) -> Result<Self, DbError> {
+    pub async fn new(database_url: &str, chain_ids: &[u32]) -> Result<Self, DbError> {
         // Parse the DATABASE_URL
         let config = database_url
             .parse::<tokio_postgres::Config>()
@@ -55,7 +56,7 @@ impl Database {
         let db = Self { pool };
 
         // Auto-create schema on startup
-        db.create_schema().await?;
+        db.create_schema(chain_ids).await?;
 
         Ok(db)
     }
@@ -66,13 +67,32 @@ impl Database {
     }
 
     /// Create all tables and indexes if they don't exist
-    async fn create_schema(&self) -> Result<(), DbError> {
+    async fn create_schema(&self, chain_ids: &[u32]) -> Result<(), DbError> {
         let client = self.pool.get().await?;
 
-        // Transfers table (chain-specific data with chain_id column)
+        // Migrate non-partitioned transfers table to partitioned (10-min TTL — brief data gap OK)
+        let table_exists = client.query_opt(
+            "SELECT 1 FROM pg_class WHERE relname = 'transfers' AND relnamespace = 'public'::regnamespace",
+            &[],
+        ).await?.is_some();
+
+        if table_exists {
+            let is_partitioned = client.query_opt(
+                "SELECT 1 FROM pg_class WHERE relname = 'transfers' AND relkind = 'p'",
+                &[],
+            ).await?.is_some();
+
+            if !is_partitioned {
+                info!("Migrating transfers table to partitioned schema (LIST by chain_id)...");
+                client.execute("DROP TABLE transfers CASCADE", &[]).await?;
+                info!("Old non-partitioned transfers table dropped");
+            }
+        }
+
+        // Transfers table — partitioned by chain_id for per-chain index locality
         client.execute(
             "CREATE TABLE IF NOT EXISTS transfers (
-                id BIGSERIAL PRIMARY KEY,
+                id BIGSERIAL,
                 chain_id INTEGER NOT NULL,
                 tx_hash VARCHAR(66) NOT NULL,
                 log_index INTEGER NOT NULL,
@@ -84,10 +104,22 @@ impl Database {
                 block_timestamp BIGINT NOT NULL,
                 swap_type VARCHAR(20),
                 created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+                PRIMARY KEY (chain_id, id),
                 UNIQUE(chain_id, tx_hash, log_index)
-            )",
+            ) PARTITION BY LIST (chain_id)",
             &[],
         ).await?;
+
+        // Create a partition for each configured chain
+        for &chain_id in chain_ids {
+            client.execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS transfers_{} PARTITION OF transfers FOR VALUES IN ({})",
+                    chain_id, chain_id
+                ),
+                &[],
+            ).await?;
+        }
 
         // Checkpoints table (one row per chain)
         client.execute(

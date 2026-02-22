@@ -56,7 +56,7 @@ async fn main() {
     info!("Chain IDs: {:?}", chain_ids);
 
     // Open PostgreSQL database connection pool
-    let db = match Database::new(&database_url).await {
+    let db = match Database::new(&database_url, &chain_ids).await {
         Ok(db) => Arc::new(db),
         Err(e) => {
             error!("Failed to connect to PostgreSQL: {}", e);

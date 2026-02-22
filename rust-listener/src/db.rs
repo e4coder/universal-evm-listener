@@ -247,11 +247,13 @@ impl Database {
             &[],
         ).await?;
 
+        // Drop redundant index — UNIQUE(chain_id, tx_hash, log_index) covers all (chain_id, tx_hash) queries
+        client.execute("DROP INDEX IF EXISTS idx_transfers_tx_hash", &[]).await?;
+
         // Create indexes for transfers
         let transfer_indexes = [
             "CREATE INDEX IF NOT EXISTS idx_transfers_from ON transfers(chain_id, from_addr, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_to ON transfers(chain_id, to_addr, block_timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_transfers_tx_hash ON transfers(chain_id, tx_hash)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_created ON transfers(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_swap_type ON transfers(chain_id, swap_type, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_from_id ON transfers(chain_id, from_addr, id)",
@@ -576,79 +578,90 @@ impl Database {
         Ok(total_inserted)
     }
 
-    /// COPY-based transfer insert within an existing transaction
-    /// No inner transaction — COPY runs directly on the outer tx.
+    /// COPY-based transfer insert within an existing transaction.
+    /// Chunks large batches into ~1000-row sub-batches to reduce index maintenance
+    /// pressure and buffer pool thrashing per INSERT...SELECT ON CONFLICT.
     async fn insert_transfers_copy_on(
         tx: &tokio_postgres::Transaction<'_>,
         chain_id: u32,
         transfers: &[Transfer],
     ) -> Result<usize, DbError> {
+        const INSERT_CHUNK: usize = 1000;
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         let chain_id_i32 = chain_id as i32;
 
-        // 1. Create temp staging table (ON COMMIT DROP fires when outer tx commits)
+        // Create temp staging table once (ON COMMIT DROP fires when outer tx commits)
         tx.execute(
             "CREATE TEMP TABLE _transfers_staging (LIKE transfers INCLUDING DEFAULTS) ON COMMIT DROP",
             &[],
         ).await?;
 
-        // 2. COPY data into staging table via text-format stream
-        let sink = tx.copy_in(
-            "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) FROM STDIN"
-        ).await?;
-        futures::pin_mut!(sink);
+        let mut total_inserted = 0usize;
 
-        // Build tab-separated rows, flush every ~64KB
-        let mut buf = BytesMut::with_capacity(64 * 1024);
-        for t in transfers {
-            buf.extend_from_slice(chain_id_i32.to_string().as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice(t.tx_hash.to_lowercase().as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice((t.log_index as i32).to_string().as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice(t.token.to_lowercase().as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice(t.from_addr.to_lowercase().as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice(t.to_addr.to_lowercase().as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice(t.value.as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice((t.block_number as i64).to_string().as_bytes());
-            buf.put_u8(b'\t');
-            buf.extend_from_slice((t.block_timestamp as i64).to_string().as_bytes());
-            buf.put_u8(b'\t');
-            match &t.swap_type {
-                Some(s) => buf.extend_from_slice(s.as_bytes()),
-                None => buf.extend_from_slice(b"\\N"),
+        for chunk in transfers.chunks(INSERT_CHUNK) {
+            // COPY chunk into staging table
+            let sink = tx.copy_in(
+                "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) FROM STDIN"
+            ).await?;
+            futures::pin_mut!(sink);
+
+            let mut buf = BytesMut::with_capacity(64 * 1024);
+            for t in chunk {
+                buf.extend_from_slice(chain_id_i32.to_string().as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice(t.tx_hash.to_lowercase().as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice((t.log_index as i32).to_string().as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice(t.token.to_lowercase().as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice(t.from_addr.to_lowercase().as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice(t.to_addr.to_lowercase().as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice(t.value.as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice((t.block_number as i64).to_string().as_bytes());
+                buf.put_u8(b'\t');
+                buf.extend_from_slice((t.block_timestamp as i64).to_string().as_bytes());
+                buf.put_u8(b'\t');
+                match &t.swap_type {
+                    Some(s) => buf.extend_from_slice(s.as_bytes()),
+                    None => buf.extend_from_slice(b"\\N"),
+                }
+                buf.put_u8(b'\t');
+                buf.extend_from_slice(now.to_string().as_bytes());
+                buf.put_u8(b'\n');
+
+                if buf.len() >= 64 * 1024 {
+                    sink.send(buf.split().freeze()).await.map_err(DbError::Postgres)?;
+                }
             }
-            buf.put_u8(b'\t');
-            buf.extend_from_slice(now.to_string().as_bytes());
-            buf.put_u8(b'\n');
-
-            if buf.len() >= 64 * 1024 {
-                sink.send(buf.split().freeze()).await.map_err(DbError::Postgres)?;
+            if !buf.is_empty() {
+                sink.send(buf.freeze()).await.map_err(DbError::Postgres)?;
             }
-        }
-        if !buf.is_empty() {
-            sink.send(buf.freeze()).await.map_err(DbError::Postgres)?;
-        }
-        sink.finish().await?;
+            sink.finish().await?;
 
-        // 3. Move from staging → real table with ON CONFLICT
-        let result = tx.execute(
-            "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
-             SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at \
-             FROM _transfers_staging \
-             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
-            &[],
-        ).await?;
+            // Move from staging → real table with ON CONFLICT
+            let result = tx.execute(
+                "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
+                 SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at \
+                 FROM _transfers_staging \
+                 ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
+                &[],
+            ).await?;
 
-        Ok(result as usize)
+            total_inserted += result as usize;
+
+            // Clear staging for next chunk
+            tx.execute("TRUNCATE _transfers_staging", &[]).await?;
+        }
+
+        Ok(total_inserted)
     }
 
     /// Get first and last transfers within an existing transaction

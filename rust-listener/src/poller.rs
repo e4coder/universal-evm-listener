@@ -905,7 +905,7 @@ impl ChainPoller {
                             }
 
                             // Collect results
-                            while let Some(Ok((key, data, result))) = join_set.join_next().await {
+                            while let Some(Ok((_key, data, result))) = join_set.join_next().await {
                                 match result {
                                     Ok(events) => {
                                         if events > 0 {

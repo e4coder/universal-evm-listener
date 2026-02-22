@@ -421,20 +421,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
 
       // Rust-side default configs (must match config.rs)
-      const CHAIN_DEFAULTS: Record<number, { name: string, blocks_per_request: number, concurrent_fetches: number, poll_interval_ms: number, confirmation_blocks: number, copy_threshold: number }> = {
-        1:     { name: 'Ethereum',       blocks_per_request: 10,  concurrent_fetches: 10, poll_interval_ms: 500,  confirmation_blocks: 12, copy_threshold: 1 },
-        8453:  { name: 'Base',            blocks_per_request: 10,  concurrent_fetches: 15, poll_interval_ms: 300,  confirmation_blocks: 1,  copy_threshold: 1 },
-        42161: { name: 'Arbitrum One',    blocks_per_request: 50,  concurrent_fetches: 15, poll_interval_ms: 100,  confirmation_blocks: 1,  copy_threshold: 1 },
-        137:   { name: 'Polygon',         blocks_per_request: 10,  concurrent_fetches: 15, poll_interval_ms: 300,  confirmation_blocks: 50, copy_threshold: 1 },
-        56:    { name: 'BNB Smart Chain', blocks_per_request: 30,  concurrent_fetches: 15, poll_interval_ms: 500,  confirmation_blocks: 3,  copy_threshold: 1 },
-        10:    { name: 'OP Mainnet',      blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1 },
-        43114: { name: 'Avalanche',       blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1 },
-        100:   { name: 'Gnosis',          blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 12, copy_threshold: 1 },
-        1868:  { name: 'Soneium',         blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1 },
-        59144: { name: 'Linea',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
-        130:   { name: 'Unichain',        blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
-        146:   { name: 'Sonic',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
-        57073: { name: 'Ink',             blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1 },
+      const CHAIN_DEFAULTS: Record<number, { name: string, blocks_per_request: number, concurrent_fetches: number, poll_interval_ms: number, confirmation_blocks: number, copy_threshold: number, concurrent_inserts: number }> = {
+        1:     { name: 'Ethereum',       blocks_per_request: 10,  concurrent_fetches: 10, poll_interval_ms: 500,  confirmation_blocks: 12, copy_threshold: 1, concurrent_inserts: 3 },
+        8453:  { name: 'Base',            blocks_per_request: 10,  concurrent_fetches: 15, poll_interval_ms: 300,  confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        42161: { name: 'Arbitrum One',    blocks_per_request: 50,  concurrent_fetches: 15, poll_interval_ms: 100,  confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        137:   { name: 'Polygon',         blocks_per_request: 10,  concurrent_fetches: 15, poll_interval_ms: 300,  confirmation_blocks: 50, copy_threshold: 1, concurrent_inserts: 3 },
+        56:    { name: 'BNB Smart Chain', blocks_per_request: 30,  concurrent_fetches: 15, poll_interval_ms: 500,  confirmation_blocks: 3,  copy_threshold: 1, concurrent_inserts: 3 },
+        10:    { name: 'OP Mainnet',      blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        43114: { name: 'Avalanche',       blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        100:   { name: 'Gnosis',          blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 12, copy_threshold: 1, concurrent_inserts: 3 },
+        1868:  { name: 'Soneium',         blocks_per_request: 50,  concurrent_fetches: 5,  poll_interval_ms: 500,  confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        59144: { name: 'Linea',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        130:   { name: 'Unichain',        blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        146:   { name: 'Sonic',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        57073: { name: 'Ink',             blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
       };
 
       // GET /admin/config — list all chains with defaults + overrides
@@ -457,6 +457,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
               poll_interval_ms: ov?.poll_interval_ms ?? defaults.poll_interval_ms,
               confirmation_blocks: ov?.confirmation_blocks ?? defaults.confirmation_blocks,
               copy_threshold: ov?.copy_threshold ?? defaults.copy_threshold,
+              concurrent_inserts: ov?.concurrent_inserts ?? defaults.concurrent_inserts,
             }
           };
         });
@@ -483,6 +484,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
               poll_interval_ms: override?.poll_interval_ms ?? defaults.poll_interval_ms,
               confirmation_blocks: override?.confirmation_blocks ?? defaults.confirmation_blocks,
               copy_threshold: override?.copy_threshold ?? defaults.copy_threshold,
+              concurrent_inserts: override?.concurrent_inserts ?? defaults.concurrent_inserts,
             }
           }
         });
@@ -523,6 +525,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (isNaN(v) || v < 1 || v > 100000) return sendResponse(res, 400, { success: false, error: 'copy_threshold must be 1-100000' });
             body.copy_threshold = v;
           }
+          if (body.concurrent_inserts !== undefined) {
+            const v = parseInt(body.concurrent_inserts);
+            if (isNaN(v) || v < 1 || v > 10) return sendResponse(res, 400, { success: false, error: 'concurrent_inserts must be 1-10' });
+            body.concurrent_inserts = v;
+          }
 
           await cache.upsertConfigOverride(chainId, body);
           const updated = await cache.getConfigOverride(chainId);
@@ -538,6 +545,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 poll_interval_ms: updated?.poll_interval_ms ?? defaults.poll_interval_ms,
                 confirmation_blocks: updated?.confirmation_blocks ?? defaults.confirmation_blocks,
                 copy_threshold: updated?.copy_threshold ?? defaults.copy_threshold,
+                concurrent_inserts: updated?.concurrent_inserts ?? defaults.concurrent_inserts,
               },
               note: 'Config watcher picks up changes within 5 seconds'
             }

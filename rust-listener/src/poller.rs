@@ -166,7 +166,7 @@ async fn fetcher_loop(
     stats: Arc<ChainStats>,
 ) {
     let mut next_from = start_from + 1;
-    let mut join_set: JoinSet<(u64, u64, Result<FetchedData, String>)> = JoinSet::new();
+    let mut join_set: JoinSet<(u64, u64, Result<FetchedData, String>, u64)> = JoinSet::new();
     let mut pending_ranges: VecDeque<(u64, u64)> = VecDeque::new();
     let mut last_chance_ranges: HashSet<(u64, u64)> = HashSet::new();
     let mut cached_safe_tip: u64 = 0;
@@ -222,8 +222,9 @@ async fn fetcher_loop(
                     retry_filled += 1;
                     let rpc_clone = Arc::clone(&rpc);
                     join_set.spawn(async move {
+                        let start = Instant::now();
                         let result = fetch_all_logs(rpc_clone, chain_id, chain_name, from, to).await;
-                        (from, to, result)
+                        (from, to, result, start.elapsed().as_millis() as u64)
                     });
                 }
                 None => break,
@@ -245,8 +246,9 @@ async fn fetcher_loop(
                 Some((from, to)) => {
                     let rpc_clone = Arc::clone(&rpc);
                     join_set.spawn(async move {
+                        let start = Instant::now();
                         let result = fetch_all_logs(rpc_clone, chain_id, chain_name, from, to).await;
-                        (from, to, result)
+                        (from, to, result, start.elapsed().as_millis() as u64)
                     });
                 }
                 None => break,
@@ -269,8 +271,9 @@ async fn fetcher_loop(
         };
 
         match join_result {
-            Ok((from, to, Ok(data))) => {
+            Ok((from, to, Ok(data), elapsed_ms)) => {
                 stats.successful_fetches.fetch_add(1, Relaxed);
+                stats.last_fetch_time_ms.store(elapsed_ms, Relaxed);
                 debug!(
                     "[{}] Fetcher: completed blocks {}-{} ({} transfer logs)",
                     chain_name, from, to, data.transfer_logs.len()
@@ -280,7 +283,7 @@ async fn fetcher_loop(
                     return;
                 }
             }
-            Ok((from, to, Err(e))) => {
+            Ok((from, to, Err(e), _elapsed_ms)) => {
                 stats.failed_fetches.fetch_add(1, Relaxed);
                 if last_chance_ranges.remove(&(from, to)) {
                     // Last chance with 2x timeout also failed — truly give up
@@ -311,8 +314,9 @@ async fn fetcher_loop(
                     last_chance_ranges.insert((from, to));
                     let rpc_clone = Arc::clone(&slow_rpc);
                     join_set.spawn(async move {
+                        let start = Instant::now();
                         let result = fetch_all_logs(rpc_clone, chain_id, chain_name, from, to).await;
-                        (from, to, result)
+                        (from, to, result, start.elapsed().as_millis() as u64)
                     });
                 } else {
                     // Split range in half and retry both halves
@@ -334,8 +338,9 @@ async fn fetcher_loop(
                             last_chance_ranges.insert((f, t));
                             let rpc_clone = Arc::clone(&slow_rpc);
                             join_set.spawn(async move {
+                                let start = Instant::now();
                                 let result = fetch_all_logs(rpc_clone, chain_id, chain_name, f, t).await;
-                                (f, t, result)
+                                (f, t, result, start.elapsed().as_millis() as u64)
                             });
                         }
                     }

@@ -171,6 +171,11 @@ async fn main() {
                             } else {
                                 live_config.copy_threshold.store(live_config.default_copy_threshold, Relaxed);
                             }
+                            if let Some(v) = ov.concurrent_inserts {
+                                live_config.max_concurrent_inserts.store(v as usize, Relaxed);
+                            } else {
+                                live_config.max_concurrent_inserts.store(live_config.default_concurrent_inserts, Relaxed);
+                            }
                         } else {
                             // No override for this chain — reset to defaults
                             live_config.max_blocks_per_query.store(live_config.default_blocks_per_query, Relaxed);
@@ -178,6 +183,7 @@ async fn main() {
                             live_config.poll_interval_ms.store(live_config.default_poll_interval_ms, Relaxed);
                             live_config.confirmation_blocks.store(live_config.default_confirmation_blocks, Relaxed);
                             live_config.copy_threshold.store(live_config.default_copy_threshold, Relaxed);
+                            live_config.max_concurrent_inserts.store(live_config.default_concurrent_inserts, Relaxed);
                         }
                     }
                 }
@@ -198,6 +204,7 @@ async fn main() {
                 let batch = stats.last_batch_size.load(Relaxed);
                 let buf = stats.buffer_size.load(Relaxed);
                 let events = stats.total_transfers.load(Relaxed);
+                let fetch_time = stats.last_fetch_time_ms.load(Relaxed);
 
                 if let Err(e) = db_stats.upsert_listener_stats(
                     stats.chain_id,
@@ -215,6 +222,7 @@ async fn main() {
                     buf,
                     insert_time,
                     batch,
+                    fetch_time,
                 ).await {
                     warn!("Failed to write stats for chain {}: {}", stats.chain_id, e);
                 }
@@ -227,6 +235,7 @@ async fn main() {
                     buf,
                     current.saturating_sub(checkpoint),
                     events,
+                    fetch_time,
                 ).await;
             }
         }

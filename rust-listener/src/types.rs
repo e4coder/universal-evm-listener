@@ -310,6 +310,8 @@ pub struct ChainStats {
     // Insert performance counters
     pub last_insert_time_ms: AtomicU64,
     pub last_batch_size: AtomicU64,
+    // Fetch performance counters
+    pub last_fetch_time_ms: AtomicU64,
 }
 
 impl ChainStats {
@@ -330,6 +332,7 @@ impl ChainStats {
             buffer_size: AtomicU64::new(0),
             last_insert_time_ms: AtomicU64::new(0),
             last_batch_size: AtomicU64::new(0),
+            last_fetch_time_ms: AtomicU64::new(0),
         }
     }
 }
@@ -346,12 +349,14 @@ pub struct LiveConfig {
     pub default_poll_interval_ms: u64,
     pub default_confirmation_blocks: u64,
     pub default_copy_threshold: u64,
+    pub default_concurrent_inserts: usize,
     // Live values (atomics, updated by config watcher)
     pub max_blocks_per_query: AtomicU64,
     pub max_concurrent_fetches: AtomicUsize,
     pub poll_interval_ms: AtomicU64,
     pub confirmation_blocks: AtomicU64,
     pub copy_threshold: AtomicU64,
+    pub max_concurrent_inserts: AtomicUsize,
 }
 
 impl LiveConfig {
@@ -362,11 +367,13 @@ impl LiveConfig {
             default_poll_interval_ms: network.poll_interval_ms,
             default_confirmation_blocks: network.confirmation_blocks,
             default_copy_threshold: 1,
+            default_concurrent_inserts: 3,
             max_blocks_per_query: AtomicU64::new(network.blocks_per_request),
             max_concurrent_fetches: AtomicUsize::new(network.concurrent_fetches),
             poll_interval_ms: AtomicU64::new(network.poll_interval_ms),
             confirmation_blocks: AtomicU64::new(network.confirmation_blocks),
             copy_threshold: AtomicU64::new(1),
+            max_concurrent_inserts: AtomicUsize::new(3),
         }
     }
 }

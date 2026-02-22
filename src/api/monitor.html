@@ -211,6 +211,7 @@ function ChainCard({ chain }) {
       <div class="row"><span class="k">Buffer Size</span><span class="v">${chain.buffer_size}</span></div>
       <div class="divider"></div>
       <div class="row"><span class="k">Insert Time</span><span class="v ${Number(chain.insert_time_ms) > 5000 ? 'err' : Number(chain.insert_time_ms) > 1000 ? 'warn' : ''}">${chain.insert_time_ms || 0}ms</span></div>
+      <div class="row"><span class="k">Fetch Time</span><span class="v ${Number(chain.fetch_time_ms) > 5000 ? 'err' : Number(chain.fetch_time_ms) > 2000 ? 'warn' : ''}">${chain.fetch_time_ms || 0}ms</span></div>
       <div class="row"><span class="k">Batch Size</span><span class="v">${Number(chain.batch_size || 0).toLocaleString()}</span></div>
       <div class="row"><span class="k">Updated</span><span class="v ${age > 10 ? 'err' : ''}">${age}s ago</span></div>
     </div>
@@ -375,6 +376,7 @@ function HistoryView({ chains }) {
   const GREEN = '#22c55e';
   const YELLOW = '#eab308';
   const RED = '#ef4444';
+  const ORANGE = '#f97316';
   const GRID = '#1e1e2e';
   const TEXT = '#666';
 
@@ -413,6 +415,15 @@ function HistoryView({ chains }) {
             tension: 0.3,
             pointRadius: 0,
             fill: true,
+          },
+          {
+            label: 'Fetch Time (ms)',
+            data: history.map(d => Number(d.fetch_time_ms || 0)),
+            borderColor: ORANGE,
+            yAxisID: 'y',
+            tension: 0.3,
+            pointRadius: 0,
+            borderDash: [5, 3],
           },
           {
             label: 'Batch Size',
@@ -604,6 +615,7 @@ function AdminPanel() {
     { key: 'poll_interval_ms', label: 'Poll Interval (ms)', min: 50, max: 10000 },
     { key: 'confirmation_blocks', label: 'Confirmations', min: 0, max: 200 },
     { key: 'copy_threshold', label: 'COPY Threshold', min: 1, max: 100000 },
+    { key: 'concurrent_inserts', label: 'Concurrent Inserts', min: 1, max: 10 },
   ];
 
   return html`

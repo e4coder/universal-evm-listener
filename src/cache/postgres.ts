@@ -228,7 +228,7 @@ export class PostgresCache {
     try {
       const cutoff = Math.floor(Date.now() / 1000) - (minutes * 60);
       const result = await this.pool.query(
-        'SELECT recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total ' +
+        'SELECT recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total, COALESCE(fetch_time_ms, 0) as fetch_time_ms ' +
         'FROM listener_metrics_history WHERE chain_id = $1 AND recorded_at >= $2 ORDER BY recorded_at ASC',
         [chainId, cutoff]
       );
@@ -268,21 +268,23 @@ export class PostgresCache {
     poll_interval_ms?: number | null,
     confirmation_blocks?: number | null,
     copy_threshold?: number | null,
+    concurrent_inserts?: number | null,
   }): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
     await this.pool.query(
-      `INSERT INTO config_overrides (chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO config_overrides (chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, concurrent_inserts, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (chain_id) DO UPDATE SET
          blocks_per_request = COALESCE($2, config_overrides.blocks_per_request),
          concurrent_fetches = COALESCE($3, config_overrides.concurrent_fetches),
          poll_interval_ms = COALESCE($4, config_overrides.poll_interval_ms),
          confirmation_blocks = COALESCE($5, config_overrides.confirmation_blocks),
          copy_threshold = COALESCE($6, config_overrides.copy_threshold),
-         updated_at = $7`,
+         concurrent_inserts = COALESCE($7, config_overrides.concurrent_inserts),
+         updated_at = $8`,
       [chainId, config.blocks_per_request ?? null, config.concurrent_fetches ?? null,
        config.poll_interval_ms ?? null, config.confirmation_blocks ?? null,
-       config.copy_threshold ?? null, now]
+       config.copy_threshold ?? null, config.concurrent_inserts ?? null, now]
     );
   }
 

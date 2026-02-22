@@ -42,9 +42,9 @@ impl Database {
         cfg.dbname = config.get_dbname().map(|s| s.to_string());
 
         // Limit pool size to prevent unbounded connection growth
-        // 13 chains + 1 cleanup task + 1 stats writer = 15 concurrent users; pool size 28 gives headroom
+        // 13 chains × 3 concurrent inserts = 39 + cleanup + stats + config watcher + headroom ≈ 50
         cfg.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: 28,
+            max_size: 50,
             ..Default::default()
         });
 
@@ -209,6 +209,9 @@ impl Database {
         // Migration: add insert timing columns to existing deployments
         client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS insert_time_ms INTEGER DEFAULT 0", &[]).await.ok();
         client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS batch_size INTEGER DEFAULT 0", &[]).await.ok();
+        client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+        client.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+        client.execute("ALTER TABLE config_overrides ADD COLUMN IF NOT EXISTS concurrent_inserts INTEGER", &[]).await.ok();
 
         // Historical metrics table (time-series for monitoring charts)
         client.execute(
@@ -220,7 +223,8 @@ impl Database {
                 batch_size INTEGER DEFAULT 0,
                 buffer_size INTEGER DEFAULT 0,
                 blocks_behind BIGINT DEFAULT 0,
-                events_total BIGINT DEFAULT 0
+                events_total BIGINT DEFAULT 0,
+                fetch_time_ms INTEGER DEFAULT 0
             )",
             &[],
         ).await?;
@@ -1657,6 +1661,7 @@ impl Database {
         buffer_size: u64,
         insert_time_ms: u64,
         batch_size: u64,
+        fetch_time_ms: u64,
     ) -> Result<(), DbError> {
         let client = self.pool.get().await?;
         let now = SystemTime::now()
@@ -1670,8 +1675,8 @@ impl Database {
                 pending_ranges, last_chance_count, inflight_fetches,
                 successful_fetches, failed_fetches, timed_out_fetches,
                 blocks_processed, total_transfers, buffer_size,
-                insert_time_ms, batch_size, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                insert_time_ms, batch_size, fetch_time_ms, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (chain_id) DO UPDATE SET
                 chain_name = EXCLUDED.chain_name,
                 current_block = EXCLUDED.current_block,
@@ -1687,6 +1692,7 @@ impl Database {
                 buffer_size = EXCLUDED.buffer_size,
                 insert_time_ms = EXCLUDED.insert_time_ms,
                 batch_size = EXCLUDED.batch_size,
+                fetch_time_ms = EXCLUDED.fetch_time_ms,
                 updated_at = EXCLUDED.updated_at",
             &[
                 &(chain_id as i32),
@@ -1704,6 +1710,7 @@ impl Database {
                 &(buffer_size as i32),
                 &(insert_time_ms as i32),
                 &(batch_size as i32),
+                &(fetch_time_ms as i32),
                 &now,
             ],
         ).await?;
@@ -1720,6 +1727,7 @@ impl Database {
         buffer_size: u64,
         blocks_behind: u64,
         events_total: u64,
+        fetch_time_ms: u64,
     ) -> Result<(), DbError> {
         let client = self.pool.get().await?;
         let now = SystemTime::now()
@@ -1729,8 +1737,8 @@ impl Database {
 
         client.execute(
             "INSERT INTO listener_metrics_history \
-             (chain_id, recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (chain_id, recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total, fetch_time_ms) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
                 &(chain_id as i32),
                 &now,
@@ -1739,6 +1747,7 @@ impl Database {
                 &(buffer_size as i32),
                 &(blocks_behind as i64),
                 &(events_total as i64),
+                &(fetch_time_ms as i32),
             ],
         ).await?;
 
@@ -1758,7 +1767,7 @@ impl Database {
     pub async fn get_all_config_overrides(&self) -> Result<Vec<ConfigOverrideRow>, DbError> {
         let client = self.pool.get().await?;
         let rows = client.query(
-            "SELECT chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold FROM config_overrides",
+            "SELECT chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, concurrent_inserts FROM config_overrides",
             &[],
         ).await?;
 
@@ -1769,6 +1778,7 @@ impl Database {
             poll_interval_ms: row.get(3),
             confirmation_blocks: row.get(4),
             copy_threshold: row.get(5),
+            concurrent_inserts: row.get(6),
         }).collect())
     }
 
@@ -1822,4 +1832,5 @@ pub struct ConfigOverrideRow {
     pub poll_interval_ms: Option<i64>,
     pub confirmation_blocks: Option<i32>,
     pub copy_threshold: Option<i32>,
+    pub concurrent_inserts: Option<i32>,
 }

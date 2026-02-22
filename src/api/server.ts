@@ -422,6 +422,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
       // Rust-side default configs (must match config.rs)
       const CHAIN_DEFAULTS: Record<number, { name: string, blocks_per_request: number, concurrent_fetches: number, poll_interval_ms: number, confirmation_blocks: number, copy_threshold: number, concurrent_inserts: number }> = {
+        0:     { name: 'Bitcoin',        blocks_per_request: 1,   concurrent_fetches: 2,  poll_interval_ms: 5000, confirmation_blocks: 6,  copy_threshold: 1, concurrent_inserts: 3 },
         1:     { name: 'Ethereum',       blocks_per_request: 10,  concurrent_fetches: 10, poll_interval_ms: 500,  confirmation_blocks: 12, copy_threshold: 1, concurrent_inserts: 3 },
         8453:  { name: 'Base',            blocks_per_request: 10,  concurrent_fetches: 15, poll_interval_ms: 300,  confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
         42161: { name: 'Arbitrum One',    blocks_per_request: 50,  concurrent_fetches: 15, poll_interval_ms: 100,  confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
@@ -605,7 +606,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (path === '/monitor/history') {
       const chainId = parseInt(url.searchParams.get('chain_id') || '0');
       const minutes = parseInt(url.searchParams.get('minutes') || '60') || 60;
-      if (!chainId) return sendResponse(res, 400, { success: false, error: 'chain_id query parameter is required' });
+      if (isNaN(chainId)) return sendResponse(res, 400, { success: false, error: 'chain_id query parameter is required' });
       const history = await cache.getMetricsHistory(chainId, Math.min(minutes, 60));
       return sendResponse(res, 200, { success: true, data: history });
     }

@@ -58,21 +58,21 @@ pub fn load_networks() -> Vec<NetworkConfig> {
         evm_network(57073, "Ink", alchemy_url("ink-mainnet", &api_key), 200, 3, 1000, 1),
     ];
 
-    // Conditionally add Bitcoin if BITCOIN_RPC_URL is set
-    if let Ok(btc_url) = env::var("BITCOIN_RPC_URL") {
-        networks.push(NetworkConfig {
-            chain_id: 0,
-            name: "Bitcoin",
-            rpc_url: btc_url,
-            chain_type: ChainType::Bitcoin,
-            blocks_per_request: 1,
-            concurrent_fetches: 2,
-            poll_interval_ms: 5000,
-            confirmation_blocks: 6,
-            rpc_user: env::var("BITCOIN_RPC_USER").ok(),
-            rpc_password: env::var("BITCOIN_RPC_PASSWORD").ok(),
-        });
-    }
+    // Bitcoin: use BITCOIN_RPC_URL override, or default to Alchemy
+    let btc_url = env::var("BITCOIN_RPC_URL")
+        .unwrap_or_else(|_| alchemy_url("bitcoin-mainnet", &api_key));
+    networks.push(NetworkConfig {
+        chain_id: 0,
+        name: "Bitcoin",
+        rpc_url: btc_url,
+        chain_type: ChainType::Bitcoin,
+        blocks_per_request: 1,
+        concurrent_fetches: 2,
+        poll_interval_ms: 5000,
+        confirmation_blocks: 6,
+        rpc_user: env::var("BITCOIN_RPC_USER").ok(),
+        rpc_password: env::var("BITCOIN_RPC_PASSWORD").ok(),
+    });
 
     networks
 }

@@ -9,16 +9,20 @@ use tracing::{debug, warn};
 pub struct BitcoinRpcClient {
     client: Client,
     url: String,
-    auth_header: String, // "Basic <base64(user:pass)>"
+    auth_header: Option<String>, // None for Alchemy (key in URL), Some for Bitcoin Core (Basic Auth)
     chain_name: &'static str,
     max_retries: u32,
 }
 
 impl BitcoinRpcClient {
     pub fn new(url: &str, user: &str, password: &str, chain_name: &'static str) -> Self {
-        let credentials = format!("{}:{}", user, password);
-        let encoded = base64_encode(&credentials);
-        let auth_header = format!("Basic {}", encoded);
+        let auth_header = if user.is_empty() && password.is_empty() {
+            None // Alchemy-style: API key in URL, no auth header
+        } else {
+            let credentials = format!("{}:{}", user, password);
+            let encoded = base64_encode(&credentials);
+            Some(format!("Basic {}", encoded))
+        };
 
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
@@ -45,14 +49,14 @@ impl BitcoinRpcClient {
         });
 
         for attempt in 0..=self.max_retries {
-            let resp = self
+            let mut req = self
                 .client
                 .post(&self.url)
-                .header("Authorization", &self.auth_header)
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await;
+                .header("Content-Type", "application/json");
+            if let Some(auth) = &self.auth_header {
+                req = req.header("Authorization", auth);
+            }
+            let resp = req.json(&body).send().await;
 
             match resp {
                 Ok(response) => {
@@ -124,11 +128,14 @@ impl BitcoinRpcClient {
             })
             .collect();
 
-        let resp = self
+        let mut req = self
             .client
             .post(&self.url)
-            .header("Authorization", &self.auth_header)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        if let Some(auth) = &self.auth_header {
+            req = req.header("Authorization", auth);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await

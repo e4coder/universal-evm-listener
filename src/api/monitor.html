@@ -227,6 +227,13 @@ const ENDPOINTS = {
     { method: 'GET', path: '/stats', params: [] },
     { method: 'GET', path: '/monitor/stats', params: [] },
   ],
+  'Bitcoin': [
+    { method: 'GET', path: '/btc/address/{address}', params: ['address'] },
+    { method: 'GET', path: '/btc/from/{address}', params: ['address'] },
+    { method: 'GET', path: '/btc/to/{address}', params: ['address'] },
+    { method: 'GET', path: '/btc/tx/{txHash}', params: ['txHash'] },
+    { method: 'GET', path: '/btc/pending', params: [] },
+  ],
   'ERC20': [
     { method: 'GET', path: '/erc20/from/{chainId}/{address}', params: ['chainId', 'address'] },
     { method: 'GET', path: '/erc20/to/{chainId}/{address}', params: ['chainId', 'address'] },

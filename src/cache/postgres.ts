@@ -178,6 +178,71 @@ export class PostgresCache {
     return [];
   }
 
+  // Bitcoin transfer queries (chain_id = 0, includes status field)
+
+  async getBitcoinTransfersByAddress(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 0 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp", status
+       FROM transfers
+       WHERE chain_id = 0 AND (from_addr = $1 OR to_addr = $1)
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getBitcoinTransfersByFrom(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 0 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp", status
+       FROM transfers
+       WHERE chain_id = 0 AND from_addr = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getBitcoinTransfersByTo(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 0 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp", status
+       FROM transfers
+       WHERE chain_id = 0 AND to_addr = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getBitcoinTransfersByTx(txHash: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 0 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp", status, log_index as "vout"
+       FROM transfers
+       WHERE chain_id = 0 AND tx_hash = $1
+       ORDER BY log_index ASC`,
+      [txHash]
+    );
+    return result.rows;
+  }
+
+  async getBitcoinPendingTransfers(): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 0 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp", status
+       FROM transfers
+       WHERE chain_id = 0 AND status = 'pending'
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`
+    );
+    return result.rows;
+  }
+
   // Health check
 
   async isHealthy(): Promise<boolean> {

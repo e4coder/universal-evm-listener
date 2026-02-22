@@ -74,6 +74,54 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   const path = url.pathname;
 
   try {
+    // =========================================================================
+    // Bitcoin Endpoints (chain_id = 0, non-EVM address formats)
+    // =========================================================================
+
+    // Bitcoin address pattern: base58 (1xxx, 3xxx) or bech32 (bc1xxx)
+    const btcAddrPattern = /^(1[a-km-zA-HJ-NP-Z1-9]{25,34}|3[a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{8,87})$/;
+
+    // GET /btc/address/:address - transfers involving address (from or to)
+    if (path.match(/^\/btc\/address\/[a-zA-Z0-9]{20,90}$/)) {
+      const address = path.split('/')[3];
+      if (!btcAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Bitcoin address' });
+      const transfers = await cache.getBitcoinTransfersByAddress(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /btc/from/:address - transfers from address
+    if (path.match(/^\/btc\/from\/[a-zA-Z0-9]{20,90}$/)) {
+      const address = path.split('/')[3];
+      if (!btcAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Bitcoin address' });
+      const transfers = await cache.getBitcoinTransfersByFrom(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /btc/to/:address - transfers to address
+    if (path.match(/^\/btc\/to\/[a-zA-Z0-9]{20,90}$/)) {
+      const address = path.split('/')[3];
+      if (!btcAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Bitcoin address' });
+      const transfers = await cache.getBitcoinTransfersByTo(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /btc/tx/:txHash - all outputs for a Bitcoin transaction
+    if (path.match(/^\/btc\/tx\/[a-fA-F0-9]{64}$/)) {
+      const txHash = path.split('/')[3];
+      const transfers = await cache.getBitcoinTransfersByTx(txHash);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /btc/pending - pending mempool transactions
+    if (path === '/btc/pending') {
+      const transfers = await cache.getBitcoinPendingTransfers();
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // =========================================================================
+    // ERC20 Endpoints
+    // =========================================================================
+
     // GET /erc20/from/:chainId/:address
     if (path.match(/^\/erc20\/from\/\d+\/0x[a-fA-F0-9]{40}$/)) {
       const [, , , chainIdStr, address] = path.split('/');
@@ -641,6 +689,12 @@ async function startServer(): Promise<void> {
     console.log('\nAvailable endpoints:');
     console.log('  GET /networks');
     console.log('  GET /stats');
+    console.log('\n  Bitcoin:');
+    console.log('  GET /btc/address/:address');
+    console.log('  GET /btc/from/:address');
+    console.log('  GET /btc/to/:address');
+    console.log('  GET /btc/tx/:txHash');
+    console.log('  GET /btc/pending');
     console.log('\n  ERC20 Transfers:');
     console.log('  GET /erc20/from/:chainId/:address');
     console.log('  GET /erc20/to/:chainId/:address');

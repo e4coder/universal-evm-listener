@@ -366,8 +366,8 @@ impl Database {
 
         let result = client.execute(
             "INSERT INTO transfers
-             (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
             &[
                 &(chain_id as i32),
@@ -380,6 +380,7 @@ impl Database {
                 &(transfer.block_number as i64),
                 &(transfer.block_timestamp as i64),
                 &transfer.swap_type,
+                &transfer.status,
                 &now,
             ],
         ).await?;
@@ -407,7 +408,7 @@ impl Database {
 
         // 2. COPY data into staging table via text-format stream
         let sink = tx.copy_in(
-            "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) FROM STDIN"
+            "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at) FROM STDIN"
         ).await?;
         futures::pin_mut!(sink);
 
@@ -438,6 +439,11 @@ impl Database {
                 None => buf.extend_from_slice(b"\\N"),
             }
             buf.put_u8(b'\t');
+            match &t.status {
+                Some(s) => buf.extend_from_slice(s.as_bytes()),
+                None => buf.extend_from_slice(b"\\N"),
+            }
+            buf.put_u8(b'\t');
             buf.extend_from_slice(now.to_string().as_bytes());
             buf.put_u8(b'\n');
 
@@ -452,8 +458,8 @@ impl Database {
 
         // 3. Move from staging → real table with ON CONFLICT
         let result = tx.execute(
-            "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
-             SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at \
+            "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at) \
+             SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at \
              FROM _transfers_staging \
              ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
             &[],
@@ -485,7 +491,7 @@ impl Database {
         let mut total_inserted = 0;
 
         for chunk in transfers.chunks(1500) {
-            let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, i64)> =
+            let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, Option<String>, i64)> =
                 chunk.iter().map(|t| (
                     chain_id_i32,
                     t.tx_hash.to_lowercase(),
@@ -497,17 +503,18 @@ impl Database {
                     t.block_number as i64,
                     t.block_timestamp as i64,
                     t.swap_type.clone(),
+                    t.status.clone(),
                     now,
                 )).collect();
 
             let mut values_parts = Vec::with_capacity(chunk.len());
-            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * 11);
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * 12);
 
             for (i, row) in rows.iter().enumerate() {
-                let b = i * 11;
+                let b = i * 12;
                 values_parts.push(format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                    b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11, b+12
                 ));
                 params.push(&row.0);
                 params.push(&row.1);
@@ -520,11 +527,12 @@ impl Database {
                 params.push(&row.8);
                 params.push(&row.9);
                 params.push(&row.10);
+                params.push(&row.11);
             }
 
             let sql = format!(
                 "INSERT INTO transfers \
-                 (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
+                 (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at) \
                  VALUES {} \
                  ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
                 values_parts.join(", ")

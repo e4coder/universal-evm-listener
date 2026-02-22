@@ -73,11 +73,20 @@ async fn insert_decoded_range(
     let copy_threshold = live_config.copy_threshold.load(Relaxed) as usize;
     let mut total = 0;
 
-    // 1. Insert transfers
+    // 1. Insert transfers (status-aware: Bitcoin uses upsert, EVM uses DO NOTHING)
     if !data.transfers.is_empty() {
-        total += Database::insert_transfers_batch_on(&tx, chain_id, &data.transfers, copy_threshold)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        let has_status = data.transfers.first().map_or(false, |t| t.status.is_some());
+        if has_status {
+            // Bitcoin path: ON CONFLICT DO UPDATE for pending→confirmed transitions
+            total += Database::upsert_bitcoin_transfers_on(&tx, chain_id, &data.transfers)
+                .await
+                .map_err(|e| format!("DB error: {}", e))?;
+        } else {
+            // EVM path: ON CONFLICT DO NOTHING (standard)
+            total += Database::insert_transfers_batch_on(&tx, chain_id, &data.transfers, copy_threshold)
+                .await
+                .map_err(|e| format!("DB error: {}", e))?;
+        }
     }
 
     let insert_ms = insert_start.elapsed().as_millis() as u64;
@@ -456,6 +465,92 @@ async fn fetcher_loop(
 
 /// Per-chain poller that uses a ChainAdapter to fetch decoded events
 /// and stores them in PostgreSQL via the generic insert_decoded_range().
+// =============================================================================
+// Mempool Loop (Bitcoin) - standalone function, spawned for mempool-aware adapters
+// =============================================================================
+
+/// Polls the mempool via the adapter and writes delta updates to the database.
+/// Runs alongside the block fetcher_loop for chains that support mempool monitoring.
+async fn mempool_loop(
+    adapter: Arc<dyn ChainAdapter>,
+    db: Arc<Database>,
+    chain_id: u32,
+    chain_name: &'static str,
+    stats: Arc<ChainStats>,
+    live_config: Arc<LiveConfig>,
+) {
+    let mut known_txids: HashSet<String> = HashSet::new();
+
+    info!("[{}] Mempool loop started", chain_name);
+
+    loop {
+        let poll_interval = Duration::from_millis(live_config.poll_interval_ms.load(Relaxed));
+
+        match adapter.poll_mempool(&known_txids).await {
+            Ok(update) => {
+                // 1. Insert new pending transfers
+                if !update.new_transfers.is_empty() {
+                    let count = update.new_transfers.len();
+                    match db.upsert_bitcoin_transfers(chain_id, &update.new_transfers).await {
+                        Ok(inserted) => {
+                            stats.total_transfers.fetch_add(inserted as u64, Relaxed);
+                            if inserted > 0 {
+                                debug!(
+                                    "[{}] Mempool: inserted {} pending transfers ({} outputs)",
+                                    chain_name, inserted, count
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[{}] Mempool: insert error: {}", chain_name, e);
+                        }
+                    }
+                }
+
+                // 2. Mark confirmed transfers
+                for (txid, block_number, block_timestamp) in &update.confirmed {
+                    if let Err(e) = db
+                        .mark_transfers_confirmed(chain_id, txid, *block_number, *block_timestamp)
+                        .await
+                    {
+                        warn!("[{}] Mempool: confirm error for {}: {}", chain_name, txid, e);
+                    }
+                }
+
+                // 3. Mark dropped transfers
+                if !update.dropped.is_empty() {
+                    let count = update.dropped.len();
+                    match db.mark_transfers_dropped(chain_id, &update.dropped).await {
+                        Ok(marked) => {
+                            if marked > 0 {
+                                debug!(
+                                    "[{}] Mempool: marked {} dropped ({} candidates)",
+                                    chain_name, marked, count
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[{}] Mempool: drop error: {}", chain_name, e);
+                        }
+                    }
+                }
+
+                // 4. Update known set for next cycle
+                known_txids = update.current_txids;
+            }
+            Err(e) => {
+                warn!("[{}] Mempool poll error: {}", chain_name, e);
+            }
+        }
+
+        sleep(poll_interval).await;
+    }
+}
+
+// =============================================================================
+// Chain Poller
+// =============================================================================
+
 pub struct ChainPoller {
     network: NetworkConfig,
     adapter: Arc<dyn ChainAdapter>,
@@ -538,11 +633,29 @@ impl ChainPoller {
             .await;
         });
 
+        // Spawn mempool loop if adapter supports it (Bitcoin)
+        let mempool_handle = if self.adapter.supports_mempool() {
+            info!("[{}] Spawning mempool loop", self.network.name);
+            Some(tokio::spawn(mempool_loop(
+                Arc::clone(&self.adapter),
+                Arc::clone(&self.db),
+                self.network.chain_id,
+                self.network.name,
+                Arc::clone(&self.stats),
+                Arc::clone(&self.live_config),
+            )))
+        } else {
+            None
+        };
+
         // Run processor on current task
         self.processor_loop(rx, last_processed_block).await;
 
-        // If processor exits, abort fetcher
+        // If processor exits, abort fetcher and mempool loop
         fetcher_handle.abort();
+        if let Some(h) = mempool_handle {
+            h.abort();
+        }
         info!("[{}] Poller stopped", self.network.name);
     }
 

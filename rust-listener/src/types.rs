@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// ERC20 Transfer event topic (keccak256 of "Transfer(address,address,uint256)")
@@ -52,18 +53,29 @@ pub const ORDER_CANCELLED_TOPIC: &str = "0xc9f7df58a71d1f49f7d4e6d19a4b5d8f5c6c7
 /// keccak256("Crypto2Fiat(bytes32,address,uint256,address,bytes)")
 pub const CRYPTO2FIAT_TOPIC: &str = "0x86ac35f38cd2d17935b5bb6295c74cadb683bcfba935852c32096a81df8998ef";
 
+/// Chain protocol type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainType {
+    Evm,
+    Bitcoin,
+}
+
 /// Network configuration for a blockchain
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub chain_id: u32,
     pub name: &'static str,
     pub rpc_url: String,
+    pub chain_type: ChainType,
     pub blocks_per_request: u64,
     pub concurrent_fetches: usize,
     /// Polling interval when caught up to tip (ms). Lower = faster for high-throughput chains.
     pub poll_interval_ms: u64,
     /// Number of confirmations before processing a block. Higher = safer against reorgs.
     pub confirmation_blocks: u64,
+    /// Bitcoin RPC authentication (optional)
+    pub rpc_user: Option<String>,
+    pub rpc_password: Option<String>,
 }
 
 // ============================================================================
@@ -117,6 +129,18 @@ pub enum FusionAction {
     OrderCancelled { swap: FusionSwap },
 }
 
+/// Delta update from mempool polling (produced by ChainAdapter::poll_mempool())
+pub struct MempoolUpdate {
+    /// New pending transfers (not yet in DB)
+    pub new_transfers: Vec<Transfer>,
+    /// Txids confirmed in a block: (txid, block_number, block_timestamp)
+    pub confirmed: Vec<(String, u64, u64)>,
+    /// Txids dropped from mempool (not confirmed)
+    pub dropped: Vec<String>,
+    /// Full set of current mempool txids (replaces known set in caller)
+    pub current_txids: HashSet<String>,
+}
+
 /// Transfer event data to store in PostgreSQL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {
@@ -130,6 +154,9 @@ pub struct Transfer {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub swap_type: Option<String>,
+    /// Transaction lifecycle status: None for EVM (implicitly confirmed),
+    /// Some("pending"|"confirmed"|"dropped") for Bitcoin mempool tracking
+    pub status: Option<String>,
 }
 
 /// JSON-RPC response structures

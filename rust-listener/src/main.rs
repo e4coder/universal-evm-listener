@@ -2,6 +2,8 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod adapter;
+mod bitcoin_adapter;
+mod bitcoin_rpc;
 mod config;
 mod db;
 mod evm_adapter;
@@ -11,12 +13,14 @@ mod rpc;
 mod types;
 
 use crate::adapter::ChainAdapter;
+use crate::bitcoin_adapter::BitcoinAdapter;
+use crate::bitcoin_rpc::BitcoinRpcClient;
 use crate::config::{get_database_url, get_ttl_secs, load_networks};
 use crate::db::Database;
 use crate::evm_adapter::EvmAdapter;
 use crate::poller::ChainPoller;
 use crate::rpc::RpcClient;
-use crate::types::{ChainStats, LiveConfig};
+use crate::types::{ChainStats, ChainType, LiveConfig};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -129,19 +133,39 @@ async fn main() {
         all_stats.push(Arc::clone(&stats));
         all_live_configs.push((network.chain_id, Arc::clone(&live_config)));
 
-        // Construct protocol adapter (EVM for all current chains)
-        let rpc = Arc::new(RpcClient::new(&network.rpc_url, network.name));
-        let slow_rpc = Arc::new(RpcClient::with_config(
-            &network.rpc_url,
-            network.name,
-            3,
-            100,
-            60,
-        ));
-        let adapter: Arc<dyn ChainAdapter> =
-            Arc::new(EvmAdapter::new(rpc, network.chain_id, network.name));
-        let slow_adapter: Arc<dyn ChainAdapter> =
-            Arc::new(EvmAdapter::new(slow_rpc, network.chain_id, network.name));
+        // Construct protocol adapter based on chain type
+        let (adapter, slow_adapter): (Arc<dyn ChainAdapter>, Arc<dyn ChainAdapter>) =
+            match network.chain_type {
+                ChainType::Evm => {
+                    let rpc = Arc::new(RpcClient::new(&network.rpc_url, network.name));
+                    let slow_rpc = Arc::new(RpcClient::with_config(
+                        &network.rpc_url,
+                        network.name,
+                        3,
+                        100,
+                        60,
+                    ));
+                    (
+                        Arc::new(EvmAdapter::new(rpc, network.chain_id, network.name)),
+                        Arc::new(EvmAdapter::new(slow_rpc, network.chain_id, network.name)),
+                    )
+                }
+                ChainType::Bitcoin => {
+                    let btc_rpc = Arc::new(BitcoinRpcClient::new(
+                        &network.rpc_url,
+                        network.rpc_user.as_deref().unwrap_or(""),
+                        network.rpc_password.as_deref().unwrap_or(""),
+                        network.name,
+                    ));
+                    let adapter: Arc<dyn ChainAdapter> = Arc::new(BitcoinAdapter::new(
+                        Arc::clone(&btc_rpc),
+                        network.chain_id,
+                        network.name,
+                    ));
+                    // Bitcoin uses same adapter for both (no fast/slow distinction)
+                    (Arc::clone(&adapter), adapter)
+                }
+            };
 
         let handle = tokio::spawn(async move {
             let mut poller =

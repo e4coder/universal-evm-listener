@@ -200,6 +200,7 @@ impl EvmAdapter {
                 block_number,
                 block_timestamp: timestamp,
                 swap_type,
+                status: None,
             });
         }
         Ok(transfers)

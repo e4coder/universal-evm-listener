@@ -96,13 +96,14 @@ impl Database {
                 chain_id INTEGER NOT NULL,
                 tx_hash VARCHAR(66) NOT NULL,
                 log_index INTEGER NOT NULL,
-                token VARCHAR(42) NOT NULL,
-                from_addr VARCHAR(42) NOT NULL,
-                to_addr VARCHAR(42) NOT NULL,
+                token VARCHAR(128) NOT NULL,
+                from_addr VARCHAR(128) NOT NULL,
+                to_addr VARCHAR(128) NOT NULL,
                 value VARCHAR(78) NOT NULL,
                 block_number BIGINT NOT NULL,
                 block_timestamp BIGINT NOT NULL,
                 swap_type VARCHAR(20),
+                status VARCHAR(10),
                 created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
                 PRIMARY KEY (chain_id, id),
                 UNIQUE(chain_id, tx_hash, log_index)
@@ -245,6 +246,13 @@ impl Database {
         client.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
         client.execute("ALTER TABLE config_overrides ADD COLUMN IF NOT EXISTS concurrent_inserts INTEGER", &[]).await.ok();
 
+        // Migration: add status column for Bitcoin mempool lifecycle tracking (NULL = EVM confirmed)
+        client.execute("ALTER TABLE transfers ADD COLUMN IF NOT EXISTS status VARCHAR(10)", &[]).await.ok();
+        // Migration: widen address columns for Bitcoin (Bech32/Taproot up to 62 chars) and future chains
+        client.execute("ALTER TABLE transfers ALTER COLUMN from_addr TYPE VARCHAR(128)", &[]).await.ok();
+        client.execute("ALTER TABLE transfers ALTER COLUMN to_addr TYPE VARCHAR(128)", &[]).await.ok();
+        client.execute("ALTER TABLE transfers ALTER COLUMN token TYPE VARCHAR(128)", &[]).await.ok();
+
         // Historical metrics table (time-series for monitoring charts)
         client.execute(
             "CREATE TABLE IF NOT EXISTS listener_metrics_history (
@@ -290,6 +298,7 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_transfers_swap_type ON transfers(chain_id, swap_type, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_from_id ON transfers(chain_id, from_addr, id)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_to_id ON transfers(chain_id, to_addr, id)",
+            "CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(chain_id, status) WHERE status IS NOT NULL",
         ];
 
         for sql in transfer_indexes {
@@ -558,7 +567,7 @@ impl Database {
         let mut total_inserted = 0;
 
         for chunk in transfers.chunks(1500) {
-            let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, i64)> =
+            let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, Option<String>, i64)> =
                 chunk.iter().map(|t| (
                     chain_id_i32,
                     t.tx_hash.to_lowercase(),
@@ -570,17 +579,18 @@ impl Database {
                     t.block_number as i64,
                     t.block_timestamp as i64,
                     t.swap_type.clone(),
+                    t.status.clone(),
                     now,
                 )).collect();
 
             let mut values_parts = Vec::with_capacity(chunk.len());
-            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * 11);
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * 12);
 
             for (i, row) in rows.iter().enumerate() {
-                let b = i * 11;
+                let b = i * 12;
                 values_parts.push(format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                    b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11, b+12
                 ));
                 params.push(&row.0);
                 params.push(&row.1);
@@ -593,11 +603,12 @@ impl Database {
                 params.push(&row.8);
                 params.push(&row.9);
                 params.push(&row.10);
+                params.push(&row.11);
             }
 
             let sql = format!(
                 "INSERT INTO transfers \
-                 (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
+                 (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at) \
                  VALUES {} \
                  ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
                 values_parts.join(", ")
@@ -637,7 +648,7 @@ impl Database {
         for chunk in transfers.chunks(INSERT_CHUNK) {
             // COPY chunk into staging table
             let sink = tx.copy_in(
-                "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) FROM STDIN"
+                "COPY _transfers_staging (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at) FROM STDIN"
             ).await?;
             futures::pin_mut!(sink);
 
@@ -666,6 +677,11 @@ impl Database {
                     None => buf.extend_from_slice(b"\\N"),
                 }
                 buf.put_u8(b'\t');
+                match &t.status {
+                    Some(s) => buf.extend_from_slice(s.as_bytes()),
+                    None => buf.extend_from_slice(b"\\N"),
+                }
+                buf.put_u8(b'\t');
                 buf.extend_from_slice(now.to_string().as_bytes());
                 buf.put_u8(b'\n');
 
@@ -680,8 +696,8 @@ impl Database {
 
             // Move from staging → real table with ON CONFLICT
             let result = tx.execute(
-                "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at) \
-                 SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, created_at \
+                "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at) \
+                 SELECT chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at \
                  FROM _transfers_staging \
                  ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING",
                 &[],
@@ -735,6 +751,7 @@ impl Database {
                     block_number: first.get::<_, i64>(6) as u64,
                     block_timestamp: first.get::<_, i64>(7) as u64,
                     swap_type: first.get(8),
+                    status: None,
                 };
                 let last_transfer = Transfer {
                     chain_id,
@@ -747,6 +764,7 @@ impl Database {
                     block_number: last.get::<_, i64>(6) as u64,
                     block_timestamp: last.get::<_, i64>(7) as u64,
                     swap_type: last.get(8),
+                    status: None,
                 };
                 Ok(Some((first_transfer, last_transfer)))
             }
@@ -876,6 +894,7 @@ impl Database {
                     block_number: first.get::<_, i64>(6) as u64,
                     block_timestamp: first.get::<_, i64>(7) as u64,
                     swap_type: first.get(8),
+                    status: None,
                 };
                 let last_transfer = Transfer {
                     chain_id,
@@ -888,6 +907,7 @@ impl Database {
                     block_number: last.get::<_, i64>(6) as u64,
                     block_timestamp: last.get::<_, i64>(7) as u64,
                     swap_type: last.get(8),
+                    status: None,
                 };
                 Ok(Some((first_transfer, last_transfer)))
             }
@@ -1857,6 +1877,138 @@ impl Database {
             crypto2fiat_deleted: crypto2fiat,
             metrics_deleted: metrics,
         })
+    }
+
+    // =========================================================================
+    // Bitcoin Mempool Transfer Methods
+    // =========================================================================
+
+    /// Upsert Bitcoin transfers (pending or confirmed).
+    /// ON CONFLICT: updates status and block info when transitioning pending→confirmed.
+    pub async fn upsert_bitcoin_transfers(
+        &self,
+        chain_id: u32,
+        transfers: &[Transfer],
+    ) -> Result<usize, DbError> {
+        if transfers.is_empty() {
+            return Ok(0);
+        }
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let count = Self::upsert_bitcoin_transfers_on(&tx, chain_id, transfers).await?;
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Upsert Bitcoin transfers within an existing transaction.
+    pub(crate) async fn upsert_bitcoin_transfers_on(
+        tx: &tokio_postgres::Transaction<'_>,
+        chain_id: u32,
+        transfers: &[Transfer],
+    ) -> Result<usize, DbError> {
+        if transfers.is_empty() {
+            return Ok(0);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let chain_id_i32 = chain_id as i32;
+        let mut total_upserted = 0;
+
+        for chunk in transfers.chunks(500) {
+            let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, Option<String>, i64)> =
+                chunk.iter().map(|t| (
+                    chain_id_i32,
+                    t.tx_hash.clone(),
+                    t.log_index as i32,
+                    t.token.clone(),
+                    t.from_addr.clone(),
+                    t.to_addr.clone(),
+                    t.value.clone(),
+                    t.block_number as i64,
+                    t.block_timestamp as i64,
+                    t.swap_type.clone(),
+                    t.status.clone(),
+                    now,
+                )).collect();
+
+            let mut values_parts = Vec::with_capacity(chunk.len());
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len() * 12);
+
+            for (i, row) in rows.iter().enumerate() {
+                let b = i * 12;
+                values_parts.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    b+1, b+2, b+3, b+4, b+5, b+6, b+7, b+8, b+9, b+10, b+11, b+12
+                ));
+                params.push(&row.0);
+                params.push(&row.1);
+                params.push(&row.2);
+                params.push(&row.3);
+                params.push(&row.4);
+                params.push(&row.5);
+                params.push(&row.6);
+                params.push(&row.7);
+                params.push(&row.8);
+                params.push(&row.9);
+                params.push(&row.10);
+                params.push(&row.11);
+            }
+
+            let sql = format!(
+                "INSERT INTO transfers (chain_id, tx_hash, log_index, token, from_addr, to_addr, value, block_number, block_timestamp, swap_type, status, created_at)
+                 VALUES {}
+                 ON CONFLICT (chain_id, tx_hash, log_index)
+                 DO UPDATE SET
+                     status = EXCLUDED.status,
+                     block_number = CASE WHEN EXCLUDED.block_number > 0 THEN EXCLUDED.block_number ELSE transfers.block_number END,
+                     block_timestamp = CASE WHEN EXCLUDED.block_number > 0 THEN EXCLUDED.block_timestamp ELSE transfers.block_timestamp END
+                 WHERE transfers.status != 'confirmed'",
+                values_parts.join(", ")
+            );
+
+            let result = tx.execute(&sql, &params).await?;
+            total_upserted += result as usize;
+        }
+
+        Ok(total_upserted)
+    }
+
+    /// Mark Bitcoin transfers as confirmed (pending→confirmed) for a given txid.
+    pub async fn mark_transfers_confirmed(
+        &self,
+        chain_id: u32,
+        tx_hash: &str,
+        block_number: u64,
+        block_timestamp: u64,
+    ) -> Result<usize, DbError> {
+        let client = self.pool.get().await?;
+        let result = client.execute(
+            "UPDATE transfers SET status = 'confirmed', block_number = $3, block_timestamp = $4
+             WHERE chain_id = $1 AND tx_hash = $2 AND status = 'pending'",
+            &[&(chain_id as i32), &tx_hash, &(block_number as i64), &(block_timestamp as i64)],
+        ).await?;
+        Ok(result as usize)
+    }
+
+    /// Batch-mark Bitcoin transfers as dropped for a list of txids.
+    pub async fn mark_transfers_dropped(
+        &self,
+        chain_id: u32,
+        tx_hashes: &[String],
+    ) -> Result<usize, DbError> {
+        if tx_hashes.is_empty() {
+            return Ok(0);
+        }
+        let client = self.pool.get().await?;
+        let result = client.execute(
+            "UPDATE transfers SET status = 'dropped'
+             WHERE chain_id = $1 AND tx_hash = ANY($2) AND status = 'pending'",
+            &[&(chain_id as i32), &tx_hashes],
+        ).await?;
+        Ok(result as usize)
     }
 }
 

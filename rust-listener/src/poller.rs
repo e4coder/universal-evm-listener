@@ -354,6 +354,389 @@ async fn fetcher_loop(
 }
 
 // =============================================================================
+// Standalone range processing (for parallel insertion via tokio::spawn)
+// =============================================================================
+
+/// Pre-fetch block timestamps for multiple ranges in a single batch RPC call.
+/// Returns a map of block_number → timestamp covering all logs in `data_items`.
+async fn prefetch_timestamps(
+    rpc: &Arc<RpcClient>,
+    existing_cache: &HashMap<u64, u64>,
+    data_items: &[&FetchedData],
+) -> Result<HashMap<u64, u64>, String> {
+    let mut needed: HashSet<u64> = HashSet::new();
+    for data in data_items {
+        for log in data.transfer_logs.iter()
+            .chain(data.fusion_plus_factory_logs.iter())
+            .chain(data.fusion_plus_escrow_logs.iter())
+            .chain(data.fusion_logs.iter())
+            .chain(data.crypto2fiat_logs.iter())
+        {
+            needed.insert(log.block_number_u64());
+        }
+    }
+
+    let mut timestamps: HashMap<u64, u64> = HashMap::with_capacity(needed.len());
+    let mut uncached: Vec<u64> = Vec::new();
+    for block_num in &needed {
+        if let Some(&ts) = existing_cache.get(block_num) {
+            timestamps.insert(*block_num, ts);
+        } else {
+            uncached.push(*block_num);
+        }
+    }
+
+    if !uncached.is_empty() {
+        let results = rpc.batch_get_blocks(&uncached).await
+            .map_err(|e| format!("Batch getBlockByNumber failed: {}", e))?;
+        for (block_num, result) in uncached.iter().zip(results.into_iter()) {
+            match result {
+                Ok(block) => { timestamps.insert(*block_num, block.timestamp_u64()); }
+                Err(e) => return Err(format!("Failed to get block {}: {}", block_num, e)),
+            }
+        }
+    }
+
+    Ok(timestamps)
+}
+
+/// Process a single fetched range: build transfers, insert to DB, process fusion/c2f events.
+/// All DB operations wrapped in a single transaction. Standalone for tokio::spawn.
+async fn process_range(
+    db: Arc<Database>,
+    chain_id: u32,
+    chain_name: &'static str,
+    live_config: Arc<LiveConfig>,
+    stats: Arc<ChainStats>,
+    data: &FetchedData,
+    timestamps: &HashMap<u64, u64>,
+) -> Result<usize, String> {
+    // Build swap_type map from fusion/c2f logs
+    let mut swap_type_map: HashMap<String, &'static str> = HashMap::new();
+    for log in &data.fusion_plus_factory_logs {
+        swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
+    }
+    for log in &data.fusion_plus_escrow_logs {
+        swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
+    }
+    for log in &data.fusion_logs {
+        swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion");
+    }
+    for log in &data.crypto2fiat_logs {
+        swap_type_map.insert(log.transaction_hash.to_lowercase(), "crypto_to_fiat");
+    }
+
+    if !data.transfer_logs.is_empty() {
+        info!(
+            "[{}] Found {} Transfer events in blocks {}-{}",
+            chain_name, data.transfer_logs.len(), data.from_block, data.to_block
+        );
+    }
+
+    let mut transfers = Vec::with_capacity(data.transfer_logs.len());
+    for log in &data.transfer_logs {
+        if log.topics.len() < 3 { continue; }
+        let block_number = log.block_number_u64();
+        let timestamp = *timestamps.get(&block_number)
+            .ok_or_else(|| format!("Missing timestamp for block {}", block_number))?;
+        let swap_type = swap_type_map.get(&log.transaction_hash.to_lowercase()).map(|s| s.to_string());
+        transfers.push(Transfer {
+            chain_id,
+            tx_hash: log.transaction_hash.clone(),
+            log_index: log.log_index_u32(),
+            token: log.address.to_lowercase(),
+            from_addr: format!("0x{}", &log.topics[1][26..]),
+            to_addr: format!("0x{}", &log.topics[2][26..]),
+            value: log.data.clone(),
+            block_number,
+            block_timestamp: timestamp,
+            swap_type,
+        });
+    }
+
+    // All DB operations in a single transaction
+    let batch_len = transfers.len();
+    let insert_start = std::time::Instant::now();
+
+    let mut client = db.get_client().await.map_err(|e| format!("DB error: {}", e))?;
+    let tx = client.transaction().await.map_err(|e| format!("DB error: {}", e))?;
+
+    let copy_threshold = live_config.copy_threshold.load(Relaxed) as usize;
+    let inserted = if !transfers.is_empty() {
+        Database::insert_transfers_batch_on(&tx, chain_id, &transfers, copy_threshold)
+            .await.map_err(|e| format!("DB error: {}", e))?
+    } else {
+        0
+    };
+
+    let insert_ms = insert_start.elapsed().as_millis() as u64;
+    stats.last_insert_time_ms.store(insert_ms, Relaxed);
+    stats.last_batch_size.store(batch_len as u64, Relaxed);
+
+    // Process fusion/c2f events (must run AFTER transfers for read-your-writes)
+    let fp = process_fp_events(&tx, chain_id, chain_name, &data.fusion_plus_factory_logs, &data.fusion_plus_escrow_logs, timestamps).await?;
+    let fs = process_fusion_single_events(&tx, chain_id, chain_name, &data.fusion_logs, timestamps).await?;
+    let c2f = process_c2f_events(&tx, chain_id, chain_name, &data.crypto2fiat_logs, timestamps).await?;
+
+    tx.commit().await.map_err(|e| format!("DB commit error: {}", e))?;
+
+    Ok(inserted + fp + fs + c2f)
+}
+
+/// Process Fusion+ factory and escrow events within a transaction.
+async fn process_fp_events(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    factory_logs: &[Log],
+    escrow_logs: &[Log],
+    timestamps: &HashMap<u64, u64>,
+) -> Result<usize, String> {
+    let mut count = 0;
+
+    for log in factory_logs {
+        if log.topics.is_empty() { continue; }
+        let ts = *timestamps.get(&log.block_number_u64())
+            .ok_or_else(|| format!("Missing timestamp for block {}", log.block_number_u64()))?;
+
+        if log.topics[0].to_lowercase() == SRC_ESCROW_CREATED_TOPIC {
+            if let Err(e) = handle_src_escrow_created(tx, chain_id, chain_name, log, ts).await {
+                warn!("[{}] Failed to process SrcEscrowCreated: {}", chain_name, e);
+            } else { count += 1; }
+        } else if log.topics[0].to_lowercase() == DST_ESCROW_CREATED_TOPIC {
+            if let Err(e) = handle_dst_escrow_created(tx, chain_id, chain_name, log, ts).await {
+                warn!("[{}] Failed to process DstEscrowCreated: {}", chain_name, e);
+            } else { count += 1; }
+        }
+    }
+
+    for log in escrow_logs {
+        if log.topics.is_empty() { continue; }
+        let ts = *timestamps.get(&log.block_number_u64())
+            .ok_or_else(|| format!("Missing timestamp for block {}", log.block_number_u64()))?;
+
+        if log.topics[0].to_lowercase() == ESCROW_WITHDRAWAL_TOPIC {
+            if let Err(e) = handle_escrow_withdrawal(tx, chain_id, chain_name, log, ts).await {
+                debug!("[{}] Failed to process EscrowWithdrawal: {}", chain_name, e);
+            } else { count += 1; }
+        } else if log.topics[0].to_lowercase() == ESCROW_CANCELLED_TOPIC {
+            debug!("[{}] Fusion+ escrow cancelled: {}", chain_name, log.address);
+            count += 1;
+        }
+    }
+
+    if count > 0 { info!("[{}] Processed {} Fusion+ events", chain_name, count); }
+    Ok(count)
+}
+
+async fn handle_src_escrow_created(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    log: &Log,
+    timestamp: u64,
+) -> Result<(), String> {
+    let data = decode_src_escrow_created(&log.data)
+        .ok_or_else(|| "Failed to decode SrcEscrowCreated data".to_string())?;
+
+    let swap = FusionPlusSwap::from_src_created(
+        &data, chain_id, &log.transaction_hash, log.block_number_u64(), timestamp, log.log_index_u32(),
+    );
+    Database::insert_fusion_plus_swap_on(tx, &swap).await.map_err(|e| format!("DB error: {}", e))?;
+    info!("[{}] Fusion+ SrcEscrow created: order_hash={} dst_chain={}", chain_name, data.order_hash, data.dst_chain_id);
+    Ok(())
+}
+
+async fn handle_dst_escrow_created(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    log: &Log,
+    timestamp: u64,
+) -> Result<(), String> {
+    let data = decode_dst_escrow_created(&log.data)
+        .ok_or_else(|| "Failed to decode DstEscrowCreated data".to_string())?;
+
+    let updated = Database::update_fusion_plus_dst_on(
+        tx, &data.order_hash, &data, chain_id, &log.transaction_hash,
+        log.block_number_u64(), timestamp, log.log_index_u32(), Some(&log.address),
+    ).await.map_err(|e| format!("DB error: {}", e))?;
+
+    if updated {
+        info!("[{}] Fusion+ DstEscrow created: order_hash={}", chain_name, data.order_hash);
+    } else {
+        debug!("[{}] Fusion+ DstEscrow created for unknown order: {}", chain_name, data.order_hash);
+    }
+    Ok(())
+}
+
+async fn handle_escrow_withdrawal(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    log: &Log,
+    timestamp: u64,
+) -> Result<(), String> {
+    let secret = decode_escrow_withdrawal(&log.data)
+        .ok_or_else(|| "Failed to decode EscrowWithdrawal data".to_string())?;
+    let hashlock = compute_hashlock_from_secret(&secret)
+        .ok_or_else(|| "Failed to compute hashlock from secret".to_string())?;
+
+    if let Ok(Some(swap)) = Database::get_fusion_plus_swap_by_hashlock_on(tx, &hashlock).await {
+        let is_src = swap.src_chain_id == chain_id;
+        let updated = Database::update_fusion_plus_withdrawal_by_hashlock_on(
+            tx, &hashlock, chain_id, is_src, &secret, &log.transaction_hash,
+            log.block_number_u64(), timestamp, log.log_index_u32(),
+        ).await.map_err(|e| format!("DB error: {}", e))?;
+
+        if updated {
+            let side = if is_src { "source" } else { "destination" };
+            info!(
+                "[{}] Fusion+ {} withdrawal: order_hash={} secret={} tx={}",
+                chain_name, side, swap.order_hash, secret, log.transaction_hash
+            );
+        }
+    }
+
+    debug!("[{}] Fusion+ withdrawal from escrow {} with hashlock {}", chain_name, log.address, hashlock);
+    Ok(())
+}
+
+/// Process Fusion single-chain events within a transaction.
+async fn process_fusion_single_events(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    logs: &[Log],
+    timestamps: &HashMap<u64, u64>,
+) -> Result<usize, String> {
+    let mut count = 0;
+
+    for log in logs {
+        if log.topics.is_empty() { continue; }
+        let ts = *timestamps.get(&log.block_number_u64())
+            .ok_or_else(|| format!("Missing timestamp for block {}", log.block_number_u64()))?;
+        let topic0 = log.topics[0].to_lowercase();
+
+        if topic0 == ORDER_FILLED_TOPIC {
+            if let Err(e) = handle_order_event(tx, chain_id, chain_name, log, ts, "filled").await {
+                debug!("[{}] Failed to process OrderFilled: {}", chain_name, e);
+            } else { count += 1; }
+        } else if topic0 == ORDER_CANCELLED_TOPIC {
+            if let Err(e) = handle_order_event(tx, chain_id, chain_name, log, ts, "cancelled").await {
+                debug!("[{}] Failed to process OrderCancelled: {}", chain_name, e);
+            } else { count += 1; }
+        }
+    }
+
+    if count > 0 { info!("[{}] Processed {} Fusion events", chain_name, count); }
+    Ok(count)
+}
+
+async fn handle_order_event(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    log: &Log,
+    timestamp: u64,
+    status: &str,
+) -> Result<(), String> {
+    let data = decode_order_filled(&log.topics, &log.data)
+        .ok_or_else(|| "Failed to decode OrderFilled data".to_string())?;
+
+    let remaining_hex = data.remaining.trim_start_matches("0x");
+    let is_partial = !remaining_hex.chars().all(|c| c == '0');
+
+    let (maker, taker, maker_token, taker_token, maker_amount, taker_amount) =
+        match Database::get_first_last_transfers_on(tx, chain_id, &log.transaction_hash).await {
+            Ok(Some((first, last))) => (
+                first.from_addr.clone(),
+                Some(last.to_addr.clone()),
+                Some(first.token.clone()),
+                Some(last.token.clone()),
+                Some(first.value.clone()),
+                Some(last.value.clone()),
+            ),
+            Ok(None) => (String::new(), None, None, None, None, None),
+            Err(e) => {
+                warn!("[{}] Failed to get transfers for fusion swap: {}", chain_name, e);
+                (String::new(), None, None, None, None, None)
+            }
+        };
+
+    let swap = FusionSwap {
+        order_hash: data.order_hash.clone(),
+        chain_id,
+        tx_hash: log.transaction_hash.clone(),
+        block_number: log.block_number_u64(),
+        block_timestamp: timestamp,
+        log_index: log.log_index_u32(),
+        maker,
+        taker,
+        maker_token,
+        taker_token,
+        maker_amount,
+        taker_amount,
+        remaining: data.remaining.clone(),
+        is_partial_fill: is_partial,
+        status: status.to_string(),
+    };
+
+    Database::insert_fusion_swap_on(tx, &swap).await.map_err(|e| format!("DB error: {}", e))?;
+    info!(
+        "[{}] Fusion {} order: order_hash={} maker={} taker={:?} tx={}",
+        chain_name, status, data.order_hash, swap.maker, swap.taker, log.transaction_hash
+    );
+    Ok(())
+}
+
+/// Process Crypto2Fiat events within a transaction.
+async fn process_c2f_events(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    logs: &[Log],
+    timestamps: &HashMap<u64, u64>,
+) -> Result<usize, String> {
+    let mut count = 0;
+
+    for log in logs {
+        if log.topics.is_empty() { continue; }
+        let ts = *timestamps.get(&log.block_number_u64())
+            .ok_or_else(|| format!("Missing timestamp for block {}", log.block_number_u64()))?;
+        if let Err(e) = handle_c2f_event(tx, chain_id, chain_name, log, ts).await {
+            debug!("[{}] Failed to process Crypto2Fiat event: {}", chain_name, e);
+        } else { count += 1; }
+    }
+
+    if count > 0 { info!("[{}] Processed {} Crypto2Fiat events", chain_name, count); }
+    Ok(count)
+}
+
+async fn handle_c2f_event(
+    tx: &PgTransaction<'_>,
+    chain_id: u32,
+    chain_name: &'static str,
+    log: &Log,
+    timestamp: u64,
+) -> Result<(), String> {
+    let mut event = decode_crypto2fiat_event(log)
+        .ok_or_else(|| "Failed to decode Crypto2Fiat event".to_string())?;
+    event.chain_id = chain_id;
+    event.tx_hash = log.transaction_hash.clone();
+    event.block_number = log.block_number_u64();
+    event.block_timestamp = timestamp;
+    event.log_index = log.log_index_u32();
+
+    Database::insert_crypto2fiat_event_on(tx, &event).await.map_err(|e| format!("DB error: {}", e))?;
+    info!(
+        "[{}] Crypto2Fiat: order_id={} token={} amount={} recipient={} tx={}",
+        chain_name, event.order_id, event.token, event.amount, event.recipient, event.tx_hash
+    );
+    Ok(())
+}
+
+// =============================================================================
 // ChainPoller - owns DB, RPC, config; runs processor loop
 // =============================================================================
 
@@ -453,11 +836,8 @@ impl ChainPoller {
     // Processor Loop (Consumer)
     // =========================================================================
 
-    /// Receives fetched data from channel, buffers in BTreeMap, processes in
-    /// contiguous block order, and advances checkpoint only when there are no gaps.
-    /// Decoupled processor: inserts data for ANY available range immediately,
-    /// then advances the checkpoint only through contiguous inserted ranges.
-    /// This prevents out-of-order ranges from blocking the insertion pipeline.
+    /// Receives fetched data from channel, buffers in BTreeMap, processes ranges
+    /// in parallel, and advances checkpoint only through contiguous inserted ranges.
     async fn processor_loop(
         &mut self,
         mut rx: mpsc::Receiver<FetchedData>,
@@ -465,8 +845,6 @@ impl ChainPoller {
     ) {
         let mut buffer: BTreeMap<u64, FetchedData> = BTreeMap::new();
         let mut checkpoint_next: u64 = start_from + 1;
-        // Tracks ranges that have been inserted to DB but not yet checkpointed
-        // Key: from_block, Value: to_block
         let mut inserted: BTreeMap<u64, u64> = BTreeMap::new();
         let mut retry_counts: HashMap<u64, u32> = HashMap::new();
 
@@ -480,9 +858,7 @@ impl ChainPoller {
             let mut channel_disconnected = false;
             loop {
                 match rx.try_recv() {
-                    Ok(data) => {
-                        buffer.insert(data.from_block, data);
-                    }
+                    Ok(data) => { buffer.insert(data.from_block, data); }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         channel_disconnected = true;
@@ -491,50 +867,87 @@ impl ChainPoller {
                 }
             }
 
-            // 2. Process ALL available ranges in buffer (not just the next contiguous one)
+            // 2. Process ALL available ranges in parallel
             let mut processed_any = false;
             let keys: Vec<u64> = buffer.keys().cloned().collect();
-            for key in keys {
-                let data = buffer.remove(&key).unwrap();
 
-                match self.process_fetched_data(&data).await {
-                    Ok(events) => {
-                        if events > 0 {
-                            debug!(
-                                "[{}] Inserted {} events for blocks {}-{}",
-                                self.network.name, events, data.from_block, data.to_block
-                            );
+            if !keys.is_empty() {
+                let max_parallel = self.live_config.max_concurrent_inserts.load(Relaxed).max(1);
+
+                // Collect refs for timestamp pre-fetch
+                let data_refs: Vec<&FetchedData> = keys.iter().filter_map(|k| buffer.get(k)).collect();
+
+                // Single batch RPC call for ALL ranges' timestamps
+                match prefetch_timestamps(&self.rpc, &self.block_timestamp_cache, &data_refs).await {
+                    Ok(ts) => {
+                        // Merge into persistent cache
+                        self.block_timestamp_cache.extend(ts.iter().map(|(&k, &v)| (k, v)));
+                        let timestamps = Arc::new(ts);
+
+                        // Process in chunks of max_parallel
+                        for chunk in keys.chunks(max_parallel) {
+                            let mut join_set: JoinSet<(u64, FetchedData, Result<usize, String>)> = JoinSet::new();
+
+                            for &key in chunk {
+                                if let Some(data) = buffer.remove(&key) {
+                                    let db = Arc::clone(&self.db);
+                                    let stats = Arc::clone(&self.stats);
+                                    let lc = Arc::clone(&self.live_config);
+                                    let ts = Arc::clone(&timestamps);
+                                    let cid = self.network.chain_id;
+                                    let cname = self.network.name;
+
+                                    join_set.spawn(async move {
+                                        let result = process_range(db, cid, cname, lc, stats, &data, &*ts).await;
+                                        (key, data, result)
+                                    });
+                                }
+                            }
+
+                            // Collect results
+                            while let Some(Ok((key, data, result))) = join_set.join_next().await {
+                                match result {
+                                    Ok(events) => {
+                                        if events > 0 {
+                                            debug!(
+                                                "[{}] Inserted {} events for blocks {}-{}",
+                                                self.network.name, events, data.from_block, data.to_block
+                                            );
+                                        }
+                                        inserted.insert(data.from_block, data.to_block);
+                                        self.stats.total_transfers.fetch_add(events as u64, Relaxed);
+                                        retry_counts.remove(&data.from_block);
+                                        processed_any = true;
+                                    }
+                                    Err(e) => {
+                                        let from = data.from_block;
+                                        let to = data.to_block;
+                                        let attempts = retry_counts.entry(from).or_insert(0);
+                                        *attempts += 1;
+
+                                        if *attempts > 10 {
+                                            error!(
+                                                "[{}] GIVING UP on blocks {}-{} after {} attempts: {}",
+                                                self.network.name, from, to, attempts, e
+                                            );
+                                            inserted.insert(from, to);
+                                            retry_counts.remove(&from);
+                                            processed_any = true;
+                                        } else {
+                                            error!(
+                                                "[{}] Process error for blocks {}-{} (attempt {}): {}",
+                                                self.network.name, from, to, attempts, e
+                                            );
+                                            buffer.insert(from, data);
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        // Data inserted successfully — track for checkpoint advancement
-                        inserted.insert(data.from_block, data.to_block);
-                        self.stats.total_transfers.fetch_add(events as u64, Relaxed);
-                        retry_counts.remove(&data.from_block);
-                        processed_any = true;
-                        // FetchedData is dropped here — we only keep the lightweight (from, to) tracking
                     }
                     Err(e) => {
-                        let from = data.from_block;
-                        let to = data.to_block;
-                        let attempts = retry_counts.entry(from).or_insert(0);
-                        *attempts += 1;
-
-                        if *attempts > 10 {
-                            // Give up — mark as "inserted" so checkpoint can advance past it
-                            error!(
-                                "[{}] GIVING UP on blocks {}-{} after {} attempts: {}",
-                                self.network.name, from, to, attempts, e
-                            );
-                            inserted.insert(from, to);
-                            retry_counts.remove(&from);
-                            processed_any = true;
-                        } else {
-                            error!(
-                                "[{}] Process error for blocks {}-{} (attempt {}): {}",
-                                self.network.name, from, to, attempts, e
-                            );
-                            // Re-insert data for retry on next iteration
-                            buffer.insert(from, data);
-                        }
+                        warn!("[{}] Timestamp prefetch failed: {}", self.network.name, e);
+                        // Leave buffer intact for retry next iteration
                     }
                 }
             }
@@ -560,10 +973,10 @@ impl ChainPoller {
                 }
             }
 
-            // 4. Clean timestamp cache based on checkpoint frontier (safe cutoff)
+            // 4. Clean timestamp cache
             self.cleanup_timestamp_cache(checkpoint_next.saturating_sub(1));
 
-            // 5. Update buffer stat (unprocessed buffer + pending checkpoint ranges)
+            // 5. Update buffer stat
             self.stats.buffer_size.store(
                 (buffer.len() + inserted.len()) as u64,
                 Relaxed,
@@ -571,13 +984,21 @@ impl ChainPoller {
 
             // 6. If channel disconnected, process remaining and exit
             if channel_disconnected {
-                // Insert any remaining buffer entries
                 let remaining_keys: Vec<u64> = buffer.keys().cloned().collect();
-                for key in remaining_keys {
-                    if let Some(data) = buffer.remove(&key) {
-                        if let Ok(events) = self.process_fetched_data(&data).await {
-                            inserted.insert(data.from_block, data.to_block);
-                            self.stats.total_transfers.fetch_add(events as u64, Relaxed);
+                if !remaining_keys.is_empty() {
+                    let data_refs: Vec<&FetchedData> = remaining_keys.iter().filter_map(|k| buffer.get(k)).collect();
+                    if let Ok(ts) = prefetch_timestamps(&self.rpc, &self.block_timestamp_cache, &data_refs).await {
+                        let timestamps = Arc::new(ts);
+                        for key in remaining_keys {
+                            if let Some(data) = buffer.remove(&key) {
+                                if let Ok(events) = process_range(
+                                    Arc::clone(&self.db), self.network.chain_id, self.network.name,
+                                    Arc::clone(&self.live_config), Arc::clone(&self.stats), &data, &*timestamps,
+                                ).await {
+                                    inserted.insert(data.from_block, data.to_block);
+                                    self.stats.total_transfers.fetch_add(events as u64, Relaxed);
+                                }
+                            }
                         }
                     }
                 }
@@ -602,9 +1023,7 @@ impl ChainPoller {
             // 7. If nothing processed and buffer empty, blocking recv for new data
             if !processed_any && buffer.is_empty() {
                 match rx.recv().await {
-                    Some(data) => {
-                        buffer.insert(data.from_block, data);
-                    }
+                    Some(data) => { buffer.insert(data.from_block, data); }
                     None => {
                         info!(
                             "[{}] Fetcher channel closed, processor exiting",
@@ -681,501 +1100,8 @@ impl ChainPoller {
     }
 
     // =========================================================================
-    // Data Processing (DB insert + fusion processing)
+    // Timestamp Cache Management
     // =========================================================================
-
-    /// Process previously fetched data: build transfers, insert to DB,
-    /// process fusion/c2f events. Checkpoint is handled by the caller.
-    async fn process_fetched_data(
-        &mut self,
-        data: &FetchedData,
-    ) -> Result<usize, String> {
-        // =====================================================================
-        // Pre-fetch all unique block timestamps in parallel
-        // =====================================================================
-        {
-            let mut needed_blocks: HashSet<u64> = HashSet::new();
-            for log in &data.transfer_logs {
-                needed_blocks.insert(log.block_number_u64());
-            }
-            for log in &data.fusion_plus_factory_logs {
-                needed_blocks.insert(log.block_number_u64());
-            }
-            for log in &data.fusion_plus_escrow_logs {
-                needed_blocks.insert(log.block_number_u64());
-            }
-            for log in &data.fusion_logs {
-                needed_blocks.insert(log.block_number_u64());
-            }
-            for log in &data.crypto2fiat_logs {
-                needed_blocks.insert(log.block_number_u64());
-            }
-
-            // Filter out already-cached block numbers
-            let uncached: Vec<u64> = needed_blocks
-                .into_iter()
-                .filter(|b| !self.block_timestamp_cache.contains_key(b))
-                .collect();
-
-            if !uncached.is_empty() {
-                // Batch all eth_getBlockByNumber calls into a single HTTP request
-                let results = self.rpc.batch_get_blocks(&uncached).await
-                    .map_err(|e| format!("Batch getBlockByNumber failed: {}", e))?;
-
-                for (block_num, result) in uncached.iter().zip(results.into_iter()) {
-                    match result {
-                        Ok(block) => {
-                            self.block_timestamp_cache.insert(*block_num, block.timestamp_u64());
-                        }
-                        Err(e) => {
-                            return Err(format!("Failed to get block {}: {}", block_num, e));
-                        }
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // Build swap_type map from fusion/c2f logs
-        // =====================================================================
-        let mut swap_type_map: HashMap<String, &'static str> = HashMap::new();
-
-        for log in &data.fusion_plus_factory_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
-        }
-        for log in &data.fusion_plus_escrow_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion_plus");
-        }
-        for log in &data.fusion_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "fusion");
-        }
-        for log in &data.crypto2fiat_logs {
-            swap_type_map.insert(log.transaction_hash.to_lowercase(), "crypto_to_fiat");
-        }
-
-        // =====================================================================
-        // Process transfers and insert with swap_type from map
-        // =====================================================================
-        if !data.transfer_logs.is_empty() {
-            info!(
-                "[{}] Found {} Transfer events in blocks {}-{}",
-                self.network.name,
-                data.transfer_logs.len(),
-                data.from_block,
-                data.to_block
-            );
-        }
-
-        let mut transfers = Vec::with_capacity(data.transfer_logs.len());
-
-        for log in &data.transfer_logs {
-            // Validate Transfer event structure
-            if log.topics.len() < 3 {
-                continue; // Invalid Transfer event
-            }
-
-            let block_number = log.block_number_u64();
-            let timestamp = self.get_block_timestamp(block_number).await?;
-
-            // Look up swap_type from the map
-            let swap_type = swap_type_map.get(&log.transaction_hash.to_lowercase()).map(|s| s.to_string());
-
-            let transfer = Transfer {
-                chain_id: self.network.chain_id,
-                tx_hash: log.transaction_hash.clone(),
-                log_index: log.log_index_u32(),
-                token: log.address.to_lowercase(),
-                from_addr: format!("0x{}", &log.topics[1][26..]), // Remove padding
-                to_addr: format!("0x{}", &log.topics[2][26..]),   // Remove padding
-                value: log.data.clone(),
-                block_number,
-                block_timestamp: timestamp,
-                swap_type,
-            };
-
-            transfers.push(transfer);
-        }
-
-        // =====================================================================
-        // All DB operations in a single transaction for atomicity
-        // =====================================================================
-        let batch_len = transfers.len();
-        let insert_start = std::time::Instant::now();
-
-        let mut client = self.db.get_client().await
-            .map_err(|e| format!("DB error: {}", e))?;
-        let tx = client.transaction().await
-            .map_err(|e| format!("DB error: {}", e))?;
-
-        // Step 1: Insert transfers
-        let copy_threshold = self.live_config.copy_threshold.load(Relaxed) as usize;
-        let inserted = if !transfers.is_empty() {
-            Database::insert_transfers_batch_on(&tx, self.network.chain_id, &transfers, copy_threshold)
-                .await
-                .map_err(|e| format!("DB error: {}", e))?
-        } else {
-            0
-        };
-
-        let insert_ms = insert_start.elapsed().as_millis() as u64;
-        self.stats.last_insert_time_ms.store(insert_ms, Relaxed);
-        self.stats.last_batch_size.store(batch_len as u64, Relaxed);
-
-        // Step 2-4: Process fusion/c2f events (must run AFTER transfers for read-your-writes)
-        let fusion_plus_events = self.process_fusion_plus_logs(
-            &tx, &data.fusion_plus_factory_logs, &data.fusion_plus_escrow_logs
-        ).await?;
-        let fusion_events = self.process_fusion_logs(&tx, &data.fusion_logs).await?;
-        let crypto2fiat_events = self.process_crypto2fiat_logs(&tx, &data.crypto2fiat_logs).await?;
-
-        // Commit — all data becomes visible atomically
-        tx.commit().await
-            .map_err(|e| format!("DB commit error: {}", e))?;
-
-        Ok(inserted + fusion_plus_events + fusion_events + crypto2fiat_events)
-    }
-
-    // =========================================================================
-    // Log Processing Methods (process pre-fetched logs)
-    // =========================================================================
-
-    /// Process Fusion+ logs (factory and escrow events)
-    async fn process_fusion_plus_logs(
-        &mut self,
-        tx: &PgTransaction<'_>,
-        factory_logs: &[Log],
-        escrow_logs: &[Log],
-    ) -> Result<usize, String> {
-        let mut events_processed = 0;
-
-        for log in factory_logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-
-            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
-
-            if log.topics[0].to_lowercase() == SRC_ESCROW_CREATED_TOPIC {
-                if let Err(e) = self.process_src_escrow_created(tx, log, timestamp).await {
-                    warn!("[{}] Failed to process SrcEscrowCreated: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            } else if log.topics[0].to_lowercase() == DST_ESCROW_CREATED_TOPIC {
-                if let Err(e) = self.process_dst_escrow_created(tx, log, timestamp).await {
-                    warn!("[{}] Failed to process DstEscrowCreated: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            }
-        }
-
-        for log in escrow_logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-
-            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
-
-            if log.topics[0].to_lowercase() == ESCROW_WITHDRAWAL_TOPIC {
-                if let Err(e) = self.process_escrow_withdrawal(tx, log, timestamp).await {
-                    debug!("[{}] Failed to process EscrowWithdrawal: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            } else if log.topics[0].to_lowercase() == ESCROW_CANCELLED_TOPIC {
-                if let Err(e) = self.process_escrow_cancelled(tx, log, timestamp).await {
-                    debug!("[{}] Failed to process EscrowCancelled: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            }
-        }
-
-        if events_processed > 0 {
-            info!(
-                "[{}] Processed {} Fusion+ events",
-                self.network.name, events_processed
-            );
-        }
-
-        Ok(events_processed)
-    }
-
-    /// Process Fusion (single-chain) logs
-    async fn process_fusion_logs(&mut self, tx: &PgTransaction<'_>, logs: &[Log]) -> Result<usize, String> {
-        let mut events_processed = 0;
-
-        for log in logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-
-            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
-            let topic0 = log.topics[0].to_lowercase();
-
-            if topic0 == ORDER_FILLED_TOPIC {
-                if let Err(e) = self.process_order_filled(tx, log, timestamp, "filled").await {
-                    debug!("[{}] Failed to process OrderFilled: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            } else if topic0 == ORDER_CANCELLED_TOPIC {
-                if let Err(e) = self.process_order_filled(tx, log, timestamp, "cancelled").await {
-                    debug!("[{}] Failed to process OrderCancelled: {}", self.network.name, e);
-                } else {
-                    events_processed += 1;
-                }
-            }
-        }
-
-        if events_processed > 0 {
-            info!(
-                "[{}] Processed {} Fusion events",
-                self.network.name, events_processed
-            );
-        }
-
-        Ok(events_processed)
-    }
-
-    /// Process Crypto2Fiat logs
-    async fn process_crypto2fiat_logs(&mut self, tx: &PgTransaction<'_>, logs: &[Log]) -> Result<usize, String> {
-        let mut events_processed = 0;
-
-        for log in logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-
-            let timestamp = self.get_block_timestamp(log.block_number_u64()).await?;
-
-            if let Err(e) = self.process_crypto2fiat_event(tx, log, timestamp).await {
-                debug!("[{}] Failed to process Crypto2Fiat event: {}", self.network.name, e);
-            } else {
-                events_processed += 1;
-            }
-        }
-
-        if events_processed > 0 {
-            info!(
-                "[{}] Processed {} Crypto2Fiat events",
-                self.network.name, events_processed
-            );
-        }
-
-        Ok(events_processed)
-    }
-
-    /// Process SrcEscrowCreated event
-    async fn process_src_escrow_created(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
-        let data = decode_src_escrow_created(&log.data)
-            .ok_or_else(|| "Failed to decode SrcEscrowCreated data".to_string())?;
-
-        // Create new swap record
-        let swap = FusionPlusSwap::from_src_created(
-            &data,
-            self.network.chain_id,
-            &log.transaction_hash,
-            log.block_number_u64(),
-            timestamp,
-            log.log_index_u32(),
-        );
-
-        // Insert the swap into database (within transaction)
-        Database::insert_fusion_plus_swap_on(tx, &swap)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-
-        info!(
-            "[{}] Fusion+ SrcEscrow created: order_hash={} dst_chain={}",
-            self.network.name, data.order_hash, data.dst_chain_id
-        );
-
-        Ok(())
-    }
-
-    /// Process DstEscrowCreated event
-    async fn process_dst_escrow_created(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
-        let data = decode_dst_escrow_created(&log.data)
-            .ok_or_else(|| "Failed to decode DstEscrowCreated data".to_string())?;
-
-        // Update existing swap with destination data (within transaction)
-        let updated = Database::update_fusion_plus_dst_on(
-                tx,
-                &data.order_hash,
-                &data,
-                self.network.chain_id,
-                &log.transaction_hash,
-                log.block_number_u64(),
-                timestamp,
-                log.log_index_u32(),
-                Some(&log.address),
-            )
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-
-        if updated {
-            info!(
-                "[{}] Fusion+ DstEscrow created: order_hash={}",
-                self.network.name, data.order_hash
-            );
-        } else {
-            debug!(
-                "[{}] Fusion+ DstEscrow created for unknown order: {}",
-                self.network.name, data.order_hash
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Process EscrowWithdrawal event
-    async fn process_escrow_withdrawal(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
-        let secret = decode_escrow_withdrawal(&log.data)
-            .ok_or_else(|| "Failed to decode EscrowWithdrawal data".to_string())?;
-
-        // Compute hashlock from secret: hashlock = keccak256(secret)
-        let hashlock = compute_hashlock_from_secret(&secret)
-            .ok_or_else(|| "Failed to compute hashlock from secret".to_string())?;
-
-        // Look up the swap by hashlock and update its status (within transaction)
-        if let Ok(Some(swap)) = Database::get_fusion_plus_swap_by_hashlock_on(tx, &hashlock).await {
-            // Determine if this is src or dst withdrawal based on chain_id
-            let is_src = swap.src_chain_id == self.network.chain_id;
-
-            // Update the swap status with secret and tx details
-            let updated = Database::update_fusion_plus_withdrawal_by_hashlock_on(
-                    tx,
-                    &hashlock,
-                    self.network.chain_id,
-                    is_src,
-                    &secret,
-                    &log.transaction_hash,
-                    log.block_number_u64(),
-                    timestamp,
-                    log.log_index_u32(),
-                )
-                .await
-                .map_err(|e| format!("DB error: {}", e))?;
-
-            if updated {
-                let side = if is_src { "source" } else { "destination" };
-                info!(
-                    "[{}] Fusion+ {} withdrawal: order_hash={} secret={} tx={}",
-                    self.network.name, side, swap.order_hash, secret, log.transaction_hash
-                );
-            }
-        }
-
-        debug!(
-            "[{}] Fusion+ withdrawal from escrow {} with hashlock {}",
-            self.network.name, log.address, hashlock
-        );
-
-        Ok(())
-    }
-
-    /// Process EscrowCancelled event
-    async fn process_escrow_cancelled(&self, _tx: &PgTransaction<'_>, log: &Log, _timestamp: u64) -> Result<(), String> {
-        debug!(
-            "[{}] Fusion+ escrow cancelled: {}",
-            self.network.name, log.address
-        );
-
-        Ok(())
-    }
-
-    // =========================================================================
-    // Fusion (Single-Chain) Methods
-    // =========================================================================
-
-    /// Process OrderFilled or OrderCancelled event
-    async fn process_order_filled(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64, status: &str) -> Result<(), String> {
-        let data = decode_order_filled(&log.topics, &log.data)
-            .ok_or_else(|| "Failed to decode OrderFilled data".to_string())?;
-
-        // Check if remaining > 0 (partial fill)
-        let remaining_hex = data.remaining.trim_start_matches("0x");
-        let is_partial = !remaining_hex.chars().all(|c| c == '0');
-
-        // Get first and last transfers to populate maker/taker info (within transaction — reads just-inserted transfers)
-        // First transfer = maker sends maker_token (maker = from_addr of first transfer)
-        // Last transfer = taker receives taker_token (taker = to_addr of last transfer)
-        let (maker, taker, maker_token, taker_token, maker_amount, taker_amount) =
-            match Database::get_first_last_transfers_on(tx, self.network.chain_id, &log.transaction_hash).await {
-                Ok(Some((first, last))) => {
-                    (
-                        first.from_addr.clone(),         // maker = sender of first transfer
-                        Some(last.to_addr.clone()),      // taker = recipient of last transfer
-                        Some(first.token.clone()),       // maker_token = token of first transfer
-                        Some(last.token.clone()),        // taker_token = token of last transfer
-                        Some(first.value.clone()),       // maker_amount = value of first transfer
-                        Some(last.value.clone()),        // taker_amount = value of last transfer
-                    )
-                }
-                Ok(None) => {
-                    // No transfers found for this tx (shouldn't happen normally)
-                    (String::new(), None, None, None, None, None)
-                }
-                Err(e) => {
-                    warn!("[{}] Failed to get transfers for fusion swap: {}", self.network.name, e);
-                    (String::new(), None, None, None, None, None)
-                }
-            };
-
-        let swap = FusionSwap {
-            order_hash: data.order_hash.clone(),
-            chain_id: self.network.chain_id,
-            tx_hash: log.transaction_hash.clone(),
-            block_number: log.block_number_u64(),
-            block_timestamp: timestamp,
-            log_index: log.log_index_u32(),
-            maker,
-            taker,
-            maker_token,
-            taker_token,
-            maker_amount,
-            taker_amount,
-            remaining: data.remaining.clone(),
-            is_partial_fill: is_partial,
-            status: status.to_string(),
-        };
-
-        // Insert swap record (within transaction)
-        Database::insert_fusion_swap_on(tx, &swap)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-
-        info!(
-            "[{}] Fusion {} order: order_hash={} maker={} taker={:?} tx={}",
-            self.network.name, status, data.order_hash, swap.maker, swap.taker, log.transaction_hash
-        );
-
-        Ok(())
-    }
-
-    /// Get block timestamp with caching
-    async fn get_block_timestamp(&mut self, block_number: u64) -> Result<u64, String> {
-        // Check cache first
-        if let Some(&timestamp) = self.block_timestamp_cache.get(&block_number) {
-            return Ok(timestamp);
-        }
-
-        // Fetch from RPC
-        let block = self
-            .rpc
-            .get_block(block_number)
-            .await
-            .map_err(|e| format!("Failed to get block {}: {}", block_number, e))?;
-
-        let timestamp = block.timestamp_u64();
-
-        // Cache it
-        self.block_timestamp_cache.insert(block_number, timestamp);
-
-        Ok(timestamp)
-    }
 
     /// Clean up old entries from timestamp cache
     fn cleanup_timestamp_cache(&mut self, current_block: u64) {
@@ -1187,34 +1113,5 @@ impl ChainPoller {
         if self.block_timestamp_cache.len() < before {
             self.block_timestamp_cache.shrink_to_fit();
         }
-    }
-
-    // =========================================================================
-    // Crypto2Fiat Methods (KentuckyDelegate)
-    // =========================================================================
-
-    /// Process a Crypto2Fiat event
-    async fn process_crypto2fiat_event(&self, tx: &PgTransaction<'_>, log: &Log, timestamp: u64) -> Result<(), String> {
-        let mut event = decode_crypto2fiat_event(log)
-            .ok_or_else(|| "Failed to decode Crypto2Fiat event".to_string())?;
-
-        // Fill in chain/tx details
-        event.chain_id = self.network.chain_id;
-        event.tx_hash = log.transaction_hash.clone();
-        event.block_number = log.block_number_u64();
-        event.block_timestamp = timestamp;
-        event.log_index = log.log_index_u32();
-
-        // Insert the event (within transaction)
-        Database::insert_crypto2fiat_event_on(tx, &event)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-
-        info!(
-            "[{}] Crypto2Fiat: order_id={} token={} amount={} recipient={} tx={}",
-            self.network.name, event.order_id, event.token, event.amount, event.recipient, event.tx_hash
-        );
-
-        Ok(())
     }
 }

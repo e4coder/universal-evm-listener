@@ -59,6 +59,7 @@ pub enum ChainType {
     Evm,
     Bitcoin,
     Solana,
+    Tron,
 }
 
 /// Network configuration for a blockchain

@@ -90,6 +90,22 @@ pub fn load_networks() -> Vec<NetworkConfig> {
         rpc_password: None,
     });
 
+    // Tron: use TRON_RPC_URL override, or default to Alchemy
+    let tron_url = env::var("TRON_RPC_URL")
+        .unwrap_or_else(|_| alchemy_url("tron-mainnet", &api_key));
+    networks.push(NetworkConfig {
+        chain_id: 728126428,
+        name: "Tron",
+        rpc_url: tron_url,
+        chain_type: ChainType::Tron,
+        blocks_per_request: 1,
+        concurrent_fetches: 3,
+        poll_interval_ms: 3000,
+        confirmation_blocks: 20,
+        rpc_user: None,
+        rpc_password: None,
+    });
+
     networks
 }
 

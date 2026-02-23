@@ -132,7 +132,8 @@ const CHAIN_NAMES = {
   0: 'Bitcoin', 1: 'Ethereum', 8453: 'Base', 42161: 'Arbitrum One', 137: 'Polygon',
   56: 'BNB Chain', 10: 'OP Mainnet', 43114: 'Avalanche', 100: 'Gnosis',
   1868: 'Soneium', 59144: 'Linea', 130: 'Unichain', 146: 'Sonic', 57073: 'Ink',
-  900: 'Solana'
+  900: 'Solana',
+  728126428: 'Tron'
 };
 
 // =========================================================================
@@ -253,6 +254,13 @@ const ENDPOINTS = {
     { method: 'GET', path: '/sol/to/{address}', params: ['address'] },
     { method: 'GET', path: '/sol/tx/{signature}', params: ['signature'] },
     { method: 'GET', path: '/sol/token/{mint}', params: ['mint'] },
+  ],
+  'Tron': [
+    { method: 'GET', path: '/tron/address/{address}', params: ['address'] },
+    { method: 'GET', path: '/tron/from/{address}', params: ['address'] },
+    { method: 'GET', path: '/tron/to/{address}', params: ['address'] },
+    { method: 'GET', path: '/tron/tx/{txHash}', params: ['txHash'] },
+    { method: 'GET', path: '/tron/token/{tokenAddress}', params: ['tokenAddress'] },
   ],
   'ERC20': [
     { method: 'GET', path: '/erc20/from/{chainId}/{address}', params: ['chainId', 'address'] },

@@ -164,6 +164,51 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     }
 
     // =========================================================================
+    // Tron Endpoints (chain_id = 728126428, base58 T-address format)
+    // =========================================================================
+
+    // Tron address pattern: base58check, starts with T, 34 chars
+    const tronAddrPattern = /^T[1-9A-HJ-NP-Za-km-z]{33}$/;
+
+    // GET /tron/address/:address - transfers involving address (from or to)
+    if (path.match(/^\/tron\/address\/T[1-9A-HJ-NP-Za-km-z]{33}$/)) {
+      const address = path.split('/')[3];
+      if (!tronAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Tron address' });
+      const transfers = await cache.getTronTransfersByAddress(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /tron/from/:address - transfers from address
+    if (path.match(/^\/tron\/from\/T[1-9A-HJ-NP-Za-km-z]{33}$/)) {
+      const address = path.split('/')[3];
+      if (!tronAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Tron address' });
+      const transfers = await cache.getTronTransfersByFrom(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /tron/to/:address - transfers to address
+    if (path.match(/^\/tron\/to\/T[1-9A-HJ-NP-Za-km-z]{33}$/)) {
+      const address = path.split('/')[3];
+      if (!tronAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Tron address' });
+      const transfers = await cache.getTronTransfersByTo(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /tron/tx/:txHash - all transfers for a Tron transaction (64 hex chars)
+    if (path.match(/^\/tron\/tx\/[a-fA-F0-9]{64}$/)) {
+      const txHash = path.split('/')[3];
+      const transfers = await cache.getTronTransfersByTx(txHash);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /tron/token/:tokenAddress - recent transfers of a specific TRC20 token
+    if (path.match(/^\/tron\/token\/T[1-9A-HJ-NP-Za-km-z]{33}$/)) {
+      const tokenAddress = path.split('/')[3];
+      const transfers = await cache.getTronTransfersByToken(tokenAddress);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // =========================================================================
     // ERC20 Endpoints
     // =========================================================================
 
@@ -530,6 +575,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         146:   { name: 'Sonic',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
         57073: { name: 'Ink',             blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
         900:   { name: 'Solana',          blocks_per_request: 1,   concurrent_fetches: 4,  poll_interval_ms: 400,  confirmation_blocks: 32, copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
+        728126428: { name: 'Tron',       blocks_per_request: 1,   concurrent_fetches: 3,  poll_interval_ms: 3000, confirmation_blocks: 20, copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
       };
 
       // GET /admin/config — list all chains with defaults + overrides
@@ -753,6 +799,12 @@ async function startServer(): Promise<void> {
     console.log('  GET /sol/to/:address');
     console.log('  GET /sol/tx/:signature');
     console.log('  GET /sol/token/:mintAddress');
+    console.log('\n  Tron:');
+    console.log('  GET /tron/address/:address');
+    console.log('  GET /tron/from/:address');
+    console.log('  GET /tron/to/:address');
+    console.log('  GET /tron/tx/:txHash');
+    console.log('  GET /tron/token/:tokenAddress');
     console.log('\n  ERC20 Transfers:');
     console.log('  GET /erc20/from/:chainId/:address');
     console.log('  GET /erc20/to/:chainId/:address');

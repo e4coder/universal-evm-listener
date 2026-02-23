@@ -1,7 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 
 // All supported chain IDs
-const CHAIN_IDS = [1, 10, 56, 100, 130, 137, 146, 1868, 8453, 42161, 43114, 57073, 59144];
+const CHAIN_IDS = [1, 10, 56, 100, 130, 137, 146, 1868, 8453, 42161, 43114, 57073, 59144, 728126428];
 
 interface FusionPlusSwap {
   id: number;
@@ -305,6 +305,72 @@ export class PostgresCache {
        ORDER BY block_timestamp DESC
        LIMIT 500`,
       [mint]
+    );
+    return result.rows;
+  }
+
+  // Tron transfer queries (chain_id = 728126428, base58 T-address — case-sensitive, no toLowerCase)
+
+  async getTronTransfersByAddress(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 728126428 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 728126428 AND (from_addr = $1 OR to_addr = $1)
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getTronTransfersByFrom(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 728126428 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 728126428 AND from_addr = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getTronTransfersByTo(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 728126428 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 728126428 AND to_addr = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getTronTransfersByTx(txHash: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 728126428 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp", log_index as "transferIndex"
+       FROM transfers
+       WHERE chain_id = 728126428 AND tx_hash = $1
+       ORDER BY log_index ASC`,
+      [txHash.toLowerCase()]
+    );
+    return result.rows;
+  }
+
+  async getTronTransfersByToken(tokenAddress: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 728126428 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "blockNumber", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 728126428 AND token = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 500`,
+      [tokenAddress]
     );
     return result.rows;
   }

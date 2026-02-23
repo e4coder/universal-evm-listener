@@ -6,6 +6,8 @@ mod bitcoin_adapter;
 mod bitcoin_rpc;
 mod solana_adapter;
 mod solana_rpc;
+mod tron_adapter;
+mod tron_rpc;
 mod config;
 mod db;
 mod evm_adapter;
@@ -19,6 +21,8 @@ use crate::bitcoin_adapter::BitcoinAdapter;
 use crate::bitcoin_rpc::BitcoinRpcClient;
 use crate::solana_adapter::SolanaAdapter;
 use crate::solana_rpc::SolanaRpcClient;
+use crate::tron_adapter::TronAdapter;
+use crate::tron_rpc::TronRpcClient;
 use crate::config::{get_database_url, get_ttl_secs, load_networks};
 use crate::db::Database;
 use crate::evm_adapter::EvmAdapter;
@@ -176,6 +180,18 @@ async fn main() {
                     ));
                     let adapter: Arc<dyn ChainAdapter> = Arc::new(SolanaAdapter::new(
                         Arc::clone(&sol_rpc),
+                        network.chain_id,
+                        network.name,
+                    ));
+                    (Arc::clone(&adapter), adapter)
+                }
+                ChainType::Tron => {
+                    let tron_rpc = Arc::new(TronRpcClient::new(
+                        &network.rpc_url,
+                        network.name,
+                    ));
+                    let adapter: Arc<dyn ChainAdapter> = Arc::new(TronAdapter::new(
+                        Arc::clone(&tron_rpc),
                         network.chain_id,
                         network.name,
                     ));

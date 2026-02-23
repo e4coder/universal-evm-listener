@@ -391,6 +391,14 @@ pub struct ChainStats {
     pub last_batch_size: AtomicU64,
     // Fetch performance counters
     pub last_fetch_time_ms: AtomicU64,
+    // Detailed insert diagnostics
+    pub last_pool_wait_ms: AtomicU64,       // time waiting for DB pool connection
+    pub last_rows_inserted: AtomicU64,      // actual rows inserted (excl. dupes)
+    pub last_commit_ms: AtomicU64,          // transaction commit time
+    pub last_insert_method: AtomicU64,      // 0=multi-row, 1=copy, 2=bitcoin-upsert
+    pub last_copy_threshold: AtomicU64,     // current copy_threshold setting
+    pub cumulative_insert_ms: AtomicU64,    // total insert time since start
+    pub cumulative_inserts: AtomicU64,      // total insert operations since start
 }
 
 impl ChainStats {
@@ -412,6 +420,13 @@ impl ChainStats {
             last_insert_time_ms: AtomicU64::new(0),
             last_batch_size: AtomicU64::new(0),
             last_fetch_time_ms: AtomicU64::new(0),
+            last_pool_wait_ms: AtomicU64::new(0),
+            last_rows_inserted: AtomicU64::new(0),
+            last_commit_ms: AtomicU64::new(0),
+            last_insert_method: AtomicU64::new(0),
+            last_copy_threshold: AtomicU64::new(0),
+            cumulative_insert_ms: AtomicU64::new(0),
+            cumulative_inserts: AtomicU64::new(0),
         }
     }
 }
@@ -445,13 +460,13 @@ impl LiveConfig {
             default_concurrent_fetches: network.concurrent_fetches,
             default_poll_interval_ms: network.poll_interval_ms,
             default_confirmation_blocks: network.confirmation_blocks,
-            default_copy_threshold: 1,
+            default_copy_threshold: 10000,
             default_concurrent_inserts: 3,
             max_blocks_per_query: AtomicU64::new(network.blocks_per_request),
             max_concurrent_fetches: AtomicUsize::new(network.concurrent_fetches),
             poll_interval_ms: AtomicU64::new(network.poll_interval_ms),
             confirmation_blocks: AtomicU64::new(network.confirmation_blocks),
-            copy_threshold: AtomicU64::new(1),
+            copy_threshold: AtomicU64::new(10000),
             max_concurrent_inserts: AtomicUsize::new(3),
         }
     }

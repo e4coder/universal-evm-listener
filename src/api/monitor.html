@@ -213,7 +213,10 @@ function ChainCard({ chain }) {
       <div class="divider"></div>
       <div class="row"><span class="k">Insert Time</span><span class="v ${Number(chain.insert_time_ms) > 5000 ? 'err' : Number(chain.insert_time_ms) > 1000 ? 'warn' : ''}">${chain.insert_time_ms || 0}ms</span></div>
       <div class="row"><span class="k">Fetch Time</span><span class="v ${Number(chain.fetch_time_ms) > 5000 ? 'err' : Number(chain.fetch_time_ms) > 2000 ? 'warn' : ''}">${chain.fetch_time_ms || 0}ms</span></div>
-      <div class="row"><span class="k">Batch Size</span><span class="v">${Number(chain.batch_size || 0).toLocaleString()}</span></div>
+      <div class="row"><span class="k">Batch Size / Inserted</span><span class="v">${Number(chain.batch_size || 0).toLocaleString()} / ${Number(chain.rows_inserted || 0).toLocaleString()}</span></div>
+      <div class="row"><span class="k">Pool Wait / Commit</span><span class="v ${Number(chain.pool_wait_ms) > 100 ? 'warn' : ''}">${chain.pool_wait_ms || 0}ms / ${chain.commit_ms || 0}ms</span></div>
+      <div class="row"><span class="k">Method</span><span class="v">${Number(chain.insert_method) === 0 ? 'multi-row' : Number(chain.insert_method) === 1 ? 'COPY' : 'btc-upsert'}${' (threshold: ' + Number(chain.copy_threshold || 0).toLocaleString() + ')'}</span></div>
+      <div class="row"><span class="k">Avg Insert</span><span class="v">${chain.avg_insert_ms || 0}ms (${Number(chain.total_insert_ops || 0).toLocaleString()} ops)</span></div>
       <div class="row"><span class="k">Updated</span><span class="v ${age > 10 ? 'err' : ''}">${age}s ago</span></div>
     </div>
   `;
@@ -368,8 +371,12 @@ function HistoryView({ chains }) {
   const [history, setHistory] = useState([]);
   const perfChartRef = useRef(null);
   const healthChartRef = useRef(null);
+  const diagChartRef = useRef(null);
+  const throughChartRef = useRef(null);
   const perfCanvasRef = useRef(null);
   const healthCanvasRef = useRef(null);
+  const diagCanvasRef = useRef(null);
+  const throughCanvasRef = useRef(null);
 
   // Fetch history data
   const fetchHistory = useCallback(async () => {
@@ -392,6 +399,8 @@ function HistoryView({ chains }) {
   const YELLOW = '#eab308';
   const RED = '#ef4444';
   const ORANGE = '#f97316';
+  const PURPLE = '#a78bfa';
+  const CYAN = '#22d3ee';
   const GRID = '#1e1e2e';
   const TEXT = '#666';
 
@@ -414,6 +423,8 @@ function HistoryView({ chains }) {
     // Destroy existing charts
     if (perfChartRef.current) perfChartRef.current.destroy();
     if (healthChartRef.current) healthChartRef.current.destroy();
+    if (diagChartRef.current) diagChartRef.current.destroy();
+    if (throughChartRef.current) throughChartRef.current.destroy();
 
     // Insert Performance chart (dual Y-axis)
     perfChartRef.current = new Chart(perfCanvasRef.current, {
@@ -464,6 +475,92 @@ function HistoryView({ chains }) {
       },
     });
 
+    // Insert Diagnostics chart — stacked breakdown of where insert time goes
+    if (diagCanvasRef.current) {
+      diagChartRef.current = new Chart(diagCanvasRef.current, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'Pool Wait (ms)',
+              data: history.map(d => Number(d.pool_wait_ms || 0)),
+              borderColor: PURPLE,
+              backgroundColor: PURPLE + '30',
+              tension: 0.3,
+              pointRadius: 0,
+              fill: true,
+            },
+            {
+              label: 'Commit (ms)',
+              data: history.map(d => Number(d.commit_ms || 0)),
+              borderColor: CYAN,
+              backgroundColor: CYAN + '30',
+              tension: 0.3,
+              pointRadius: 0,
+              fill: true,
+            },
+            {
+              label: 'Total Insert (ms)',
+              data: history.map(d => Number(d.insert_time_ms)),
+              borderColor: BLUE,
+              tension: 0.3,
+              pointRadius: 0,
+              borderDash: [5, 3],
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: { legend: { labels: { color: TEXT, font: { size: 11 } } } },
+          scales: {
+            x: { ...darkTheme, display: true, ticks: { ...darkTheme.ticks, maxTicksLimit: 10 } },
+            y: { ...darkTheme, beginAtZero: true, title: { display: true, text: 'ms', color: TEXT } },
+          },
+        },
+      });
+    }
+
+    // Throughput chart — batch size vs rows actually inserted
+    if (throughCanvasRef.current) {
+      throughChartRef.current = new Chart(throughCanvasRef.current, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'Batch Size (attempted)',
+              data: history.map(d => Number(d.batch_size)),
+              borderColor: GREEN,
+              tension: 0.3,
+              pointRadius: 0,
+            },
+            {
+              label: 'Rows Inserted (actual)',
+              data: history.map(d => Number(d.rows_inserted || 0)),
+              borderColor: BLUE,
+              backgroundColor: BLUE + '20',
+              tension: 0.3,
+              pointRadius: 0,
+              fill: true,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: { legend: { labels: { color: TEXT, font: { size: 11 } } } },
+          scales: {
+            x: { ...darkTheme, display: true, ticks: { ...darkTheme.ticks, maxTicksLimit: 10 } },
+            y: { ...darkTheme, beginAtZero: true, title: { display: true, text: 'rows', color: TEXT } },
+          },
+        },
+      });
+    }
+
     // Health chart
     healthChartRef.current = new Chart(healthCanvasRef.current, {
       type: 'line',
@@ -504,6 +601,8 @@ function HistoryView({ chains }) {
     return () => {
       if (perfChartRef.current) perfChartRef.current.destroy();
       if (healthChartRef.current) healthChartRef.current.destroy();
+      if (diagChartRef.current) diagChartRef.current.destroy();
+      if (throughChartRef.current) throughChartRef.current.destroy();
     };
   }, [history]);
 
@@ -523,6 +622,14 @@ function HistoryView({ chains }) {
       <div class="chart-card">
         <h3>Insert Performance - ${chainName}</h3>
         <div style="height: 300px;"><canvas ref=${perfCanvasRef}></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h3>Insert Breakdown - ${chainName}</h3>
+        <div style="height: 300px;"><canvas ref=${diagCanvasRef}></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h3>Throughput - ${chainName}</h3>
+        <div style="height: 300px;"><canvas ref=${throughCanvasRef}></canvas></div>
       </div>
       <div class="chart-card">
         <h3>Chain Health - ${chainName}</h3>

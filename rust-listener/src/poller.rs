@@ -61,10 +61,14 @@ async fn insert_decoded_range(
     let insert_start = std::time::Instant::now();
     let batch_len = data.transfers.len();
 
+    // Time pool acquisition separately
+    let pool_start = std::time::Instant::now();
     let mut client = db
         .get_client()
         .await
         .map_err(|e| format!("DB error: {}", e))?;
+    let pool_wait_ms = pool_start.elapsed().as_millis() as u64;
+
     let tx = client
         .transaction()
         .await
@@ -72,26 +76,25 @@ async fn insert_decoded_range(
 
     let copy_threshold = live_config.copy_threshold.load(Relaxed) as usize;
     let mut total = 0;
+    let mut insert_method: u64 = 0; // 0=multi-row, 1=copy, 2=bitcoin-upsert
 
     // 1. Insert transfers (status-aware: Bitcoin uses upsert, EVM uses DO NOTHING)
     if !data.transfers.is_empty() {
         let has_status = data.transfers.first().map_or(false, |t| t.status.is_some());
         if has_status {
             // Bitcoin path: ON CONFLICT DO UPDATE for pending→confirmed transitions
+            insert_method = 2;
             total += Database::upsert_bitcoin_transfers_on(&tx, chain_id, &data.transfers)
                 .await
                 .map_err(|e| format!("DB error: {}", e))?;
         } else {
-            // EVM path: ON CONFLICT DO NOTHING (standard)
+            // EVM/Solana path: ON CONFLICT DO NOTHING
+            insert_method = if batch_len >= copy_threshold { 1 } else { 0 };
             total += Database::insert_transfers_batch_on(&tx, chain_id, &data.transfers, copy_threshold)
                 .await
                 .map_err(|e| format!("DB error: {}", e))?;
         }
     }
-
-    let insert_ms = insert_start.elapsed().as_millis() as u64;
-    stats.last_insert_time_ms.store(insert_ms, Relaxed);
-    stats.last_batch_size.store(batch_len as u64, Relaxed);
 
     // 2. Fusion+ actions (pattern match on enum — no protocol-specific decoding)
     let mut fp_count = 0;
@@ -223,9 +226,24 @@ async fn insert_decoded_range(
         info!("[{}] Processed {} Crypto2Fiat events", chain_name, c2f_count);
     }
 
+    let commit_start = std::time::Instant::now();
     tx.commit()
         .await
         .map_err(|e| format!("DB commit error: {}", e))?;
+    let commit_ms = commit_start.elapsed().as_millis() as u64;
+
+    let insert_ms = insert_start.elapsed().as_millis() as u64;
+
+    // Store all diagnostic stats
+    stats.last_insert_time_ms.store(insert_ms, Relaxed);
+    stats.last_batch_size.store(batch_len as u64, Relaxed);
+    stats.last_pool_wait_ms.store(pool_wait_ms, Relaxed);
+    stats.last_rows_inserted.store(total as u64, Relaxed);
+    stats.last_commit_ms.store(commit_ms, Relaxed);
+    stats.last_insert_method.store(insert_method, Relaxed);
+    stats.last_copy_threshold.store(copy_threshold as u64, Relaxed);
+    stats.cumulative_insert_ms.fetch_add(insert_ms, Relaxed);
+    stats.cumulative_inserts.fetch_add(1, Relaxed);
 
     total += fp_count + fs_count + c2f_count;
     Ok(total)

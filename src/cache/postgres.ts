@@ -359,7 +359,9 @@ export class PostgresCache {
     try {
       const cutoff = Math.floor(Date.now() / 1000) - (minutes * 60);
       const result = await this.pool.query(
-        'SELECT recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total, COALESCE(fetch_time_ms, 0) as fetch_time_ms ' +
+        'SELECT recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total, ' +
+        'COALESCE(fetch_time_ms, 0) as fetch_time_ms, COALESCE(pool_wait_ms, 0) as pool_wait_ms, ' +
+        'COALESCE(commit_ms, 0) as commit_ms, COALESCE(rows_inserted, 0) as rows_inserted ' +
         'FROM listener_metrics_history WHERE chain_id = $1 AND recorded_at >= $2 ORDER BY recorded_at ASC',
         [chainId, cutoff]
       );

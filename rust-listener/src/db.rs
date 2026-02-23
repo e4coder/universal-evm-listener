@@ -255,6 +255,14 @@ impl Database {
                 buffer_size INTEGER DEFAULT 0,
                 insert_time_ms INTEGER DEFAULT 0,
                 batch_size INTEGER DEFAULT 0,
+                fetch_time_ms INTEGER DEFAULT 0,
+                pool_wait_ms INTEGER DEFAULT 0,
+                rows_inserted INTEGER DEFAULT 0,
+                commit_ms INTEGER DEFAULT 0,
+                insert_method SMALLINT DEFAULT 0,
+                copy_threshold INTEGER DEFAULT 0,
+                avg_insert_ms INTEGER DEFAULT 0,
+                total_insert_ops BIGINT DEFAULT 0,
                 updated_at BIGINT DEFAULT 0
             )",
             &[],
@@ -271,7 +279,10 @@ impl Database {
                 buffer_size INTEGER DEFAULT 0,
                 blocks_behind BIGINT DEFAULT 0,
                 events_total BIGINT DEFAULT 0,
-                fetch_time_ms INTEGER DEFAULT 0
+                fetch_time_ms INTEGER DEFAULT 0,
+                pool_wait_ms INTEGER DEFAULT 0,
+                commit_ms INTEGER DEFAULT 0,
+                rows_inserted INTEGER DEFAULT 0
             )",
             &[],
         ).await?;
@@ -303,6 +314,13 @@ impl Database {
                     c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS insert_time_ms INTEGER DEFAULT 0", &[]).await.ok();
                     c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS batch_size INTEGER DEFAULT 0", &[]).await.ok();
                     c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS pool_wait_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS rows_inserted INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS commit_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS insert_method SMALLINT DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS copy_threshold INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS avg_insert_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS total_insert_ops BIGINT DEFAULT 0", &[]).await.ok();
                 }
             }));
         }
@@ -312,6 +330,9 @@ impl Database {
             migration_futures.push(tokio::spawn(async move {
                 if let Ok(c) = pool.get().await {
                     c.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS pool_wait_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS commit_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS rows_inserted INTEGER DEFAULT 0", &[]).await.ok();
                 }
             }));
         }
@@ -1792,6 +1813,13 @@ impl Database {
         insert_time_ms: u64,
         batch_size: u64,
         fetch_time_ms: u64,
+        pool_wait_ms: u64,
+        rows_inserted: u64,
+        commit_ms: u64,
+        insert_method: u64,
+        copy_threshold: u64,
+        avg_insert_ms: u64,
+        total_insert_ops: u64,
     ) -> Result<(), DbError> {
         let client = self.pool.get().await?;
         let now = SystemTime::now()
@@ -1805,8 +1833,11 @@ impl Database {
                 pending_ranges, last_chance_count, inflight_fetches,
                 successful_fetches, failed_fetches, timed_out_fetches,
                 blocks_processed, total_transfers, buffer_size,
-                insert_time_ms, batch_size, fetch_time_ms, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                insert_time_ms, batch_size, fetch_time_ms,
+                pool_wait_ms, rows_inserted, commit_ms,
+                insert_method, copy_threshold, avg_insert_ms, total_insert_ops,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
             ON CONFLICT (chain_id) DO UPDATE SET
                 chain_name = EXCLUDED.chain_name,
                 current_block = EXCLUDED.current_block,
@@ -1823,6 +1854,13 @@ impl Database {
                 insert_time_ms = EXCLUDED.insert_time_ms,
                 batch_size = EXCLUDED.batch_size,
                 fetch_time_ms = EXCLUDED.fetch_time_ms,
+                pool_wait_ms = EXCLUDED.pool_wait_ms,
+                rows_inserted = EXCLUDED.rows_inserted,
+                commit_ms = EXCLUDED.commit_ms,
+                insert_method = EXCLUDED.insert_method,
+                copy_threshold = EXCLUDED.copy_threshold,
+                avg_insert_ms = EXCLUDED.avg_insert_ms,
+                total_insert_ops = EXCLUDED.total_insert_ops,
                 updated_at = EXCLUDED.updated_at",
             &[
                 &(chain_id as i32),
@@ -1841,6 +1879,13 @@ impl Database {
                 &(insert_time_ms as i32),
                 &(batch_size as i32),
                 &(fetch_time_ms as i32),
+                &(pool_wait_ms as i32),
+                &(rows_inserted as i32),
+                &(commit_ms as i32),
+                &(insert_method as i16),
+                &(copy_threshold as i32),
+                &(avg_insert_ms as i32),
+                &(total_insert_ops as i64),
                 &now,
             ],
         ).await?;
@@ -1858,6 +1903,9 @@ impl Database {
         blocks_behind: u64,
         events_total: u64,
         fetch_time_ms: u64,
+        pool_wait_ms: u64,
+        commit_ms: u64,
+        rows_inserted: u64,
     ) -> Result<(), DbError> {
         let client = self.pool.get().await?;
         let now = SystemTime::now()
@@ -1867,8 +1915,8 @@ impl Database {
 
         client.execute(
             "INSERT INTO listener_metrics_history \
-             (chain_id, recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total, fetch_time_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (chain_id, recorded_at, insert_time_ms, batch_size, buffer_size, blocks_behind, events_total, fetch_time_ms, pool_wait_ms, commit_ms, rows_inserted) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &(chain_id as i32),
                 &now,
@@ -1878,6 +1926,9 @@ impl Database {
                 &(blocks_behind as i64),
                 &(events_total as i64),
                 &(fetch_time_ms as i32),
+                &(pool_wait_ms as i32),
+                &(commit_ms as i32),
+                &(rows_inserted as i32),
             ],
         ).await?;
 

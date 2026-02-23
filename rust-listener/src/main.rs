@@ -265,6 +265,14 @@ async fn main() {
                 let buf = stats.buffer_size.load(Relaxed);
                 let events = stats.total_transfers.load(Relaxed);
                 let fetch_time = stats.last_fetch_time_ms.load(Relaxed);
+                let pool_wait = stats.last_pool_wait_ms.load(Relaxed);
+                let rows_inserted = stats.last_rows_inserted.load(Relaxed);
+                let commit_ms = stats.last_commit_ms.load(Relaxed);
+                let insert_method = stats.last_insert_method.load(Relaxed);
+                let copy_threshold = stats.last_copy_threshold.load(Relaxed);
+                let cum_insert_ms = stats.cumulative_insert_ms.load(Relaxed);
+                let cum_inserts = stats.cumulative_inserts.load(Relaxed);
+                let avg_insert_ms = if cum_inserts > 0 { cum_insert_ms / cum_inserts } else { 0 };
 
                 if let Err(e) = db_stats.upsert_listener_stats(
                     stats.chain_id,
@@ -283,6 +291,13 @@ async fn main() {
                     insert_time,
                     batch,
                     fetch_time,
+                    pool_wait,
+                    rows_inserted,
+                    commit_ms,
+                    insert_method,
+                    copy_threshold,
+                    avg_insert_ms,
+                    cum_inserts,
                 ).await {
                     warn!("Failed to write stats for chain {}: {}", stats.chain_id, e);
                 }
@@ -296,6 +311,9 @@ async fn main() {
                     current.saturating_sub(checkpoint),
                     events,
                     fetch_time,
+                    pool_wait,
+                    commit_ms,
+                    rows_inserted,
                 ).await;
             }
         }

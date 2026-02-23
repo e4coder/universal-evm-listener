@@ -260,33 +260,6 @@ impl Database {
             &[],
         ).await?;
 
-        // Migration: add insert timing columns to existing deployments
-        client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS insert_time_ms INTEGER DEFAULT 0", &[]).await.ok();
-        client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS batch_size INTEGER DEFAULT 0", &[]).await.ok();
-        client.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
-        client.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
-        client.execute("ALTER TABLE config_overrides ADD COLUMN IF NOT EXISTS concurrent_inserts INTEGER", &[]).await.ok();
-
-        // Migration: add status column for Bitcoin mempool lifecycle tracking (NULL = EVM confirmed)
-        client.execute("ALTER TABLE transfers ADD COLUMN IF NOT EXISTS status VARCHAR(10)", &[]).await.ok();
-
-        // Migration: widen columns only if needed (ALTER COLUMN TYPE rewrites all partitions — skip if already correct)
-        let needs_widen: bool = client.query_opt(
-            "SELECT 1 FROM information_schema.columns
-             WHERE table_name = 'transfers' AND column_name = 'tx_hash'
-               AND character_maximum_length IS NOT NULL AND character_maximum_length < 128",
-            &[],
-        ).await.ok().flatten().is_some();
-
-        if needs_widen {
-            info!("Widening transfers columns to VARCHAR(128)...");
-            client.execute("ALTER TABLE transfers ALTER COLUMN from_addr TYPE VARCHAR(128)", &[]).await.ok();
-            client.execute("ALTER TABLE transfers ALTER COLUMN to_addr TYPE VARCHAR(128)", &[]).await.ok();
-            client.execute("ALTER TABLE transfers ALTER COLUMN token TYPE VARCHAR(128)", &[]).await.ok();
-            client.execute("ALTER TABLE transfers ALTER COLUMN tx_hash TYPE VARCHAR(128)", &[]).await.ok();
-            info!("Column widening complete");
-        }
-
         // Historical metrics table (time-series for monitoring charts)
         client.execute(
             "CREATE TABLE IF NOT EXISTS listener_metrics_history (
@@ -300,10 +273,6 @@ impl Database {
                 events_total BIGINT DEFAULT 0,
                 fetch_time_ms INTEGER DEFAULT 0
             )",
-            &[],
-        ).await?;
-        client.execute(
-            "CREATE INDEX IF NOT EXISTS idx_metrics_chain_time ON listener_metrics_history(chain_id, recorded_at DESC)",
             &[],
         ).await?;
 
@@ -321,11 +290,75 @@ impl Database {
             &[],
         ).await?;
 
-        // Drop redundant index — UNIQUE(chain_id, tx_hash, log_index) covers all (chain_id, tx_hash) queries
+        // Run all ADD COLUMN migrations + column widening check in parallel
+        // Each uses its own pool connection since they touch different tables
+        let pool_m = self.pool.clone();
+        let mut migration_futures: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // listener_stats columns
+        {
+            let pool = pool_m.clone();
+            migration_futures.push(tokio::spawn(async move {
+                if let Ok(c) = pool.get().await {
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS insert_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS batch_size INTEGER DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+                }
+            }));
+        }
+        // listener_metrics_history columns
+        {
+            let pool = pool_m.clone();
+            migration_futures.push(tokio::spawn(async move {
+                if let Ok(c) = pool.get().await {
+                    c.execute("ALTER TABLE listener_metrics_history ADD COLUMN IF NOT EXISTS fetch_time_ms INTEGER DEFAULT 0", &[]).await.ok();
+                }
+            }));
+        }
+        // config_overrides columns
+        {
+            let pool = pool_m.clone();
+            migration_futures.push(tokio::spawn(async move {
+                if let Ok(c) = pool.get().await {
+                    c.execute("ALTER TABLE config_overrides ADD COLUMN IF NOT EXISTS concurrent_inserts INTEGER", &[]).await.ok();
+                }
+            }));
+        }
+        // transfers status column + column widening
+        {
+            let pool = pool_m.clone();
+            migration_futures.push(tokio::spawn(async move {
+                if let Ok(c) = pool.get().await {
+                    c.execute("ALTER TABLE transfers ADD COLUMN IF NOT EXISTS status VARCHAR(10)", &[]).await.ok();
+                    // Widen columns only if needed (ALTER COLUMN TYPE rewrites all partitions — skip if already correct)
+                    let needs_widen: bool = c.query_opt(
+                        "SELECT 1 FROM information_schema.columns
+                         WHERE table_name = 'transfers' AND column_name = 'tx_hash'
+                           AND character_maximum_length IS NOT NULL AND character_maximum_length < 128",
+                        &[],
+                    ).await.ok().flatten().is_some();
+                    if needs_widen {
+                        info!("Widening transfers columns to VARCHAR(128)...");
+                        c.execute("ALTER TABLE transfers ALTER COLUMN from_addr TYPE VARCHAR(128)", &[]).await.ok();
+                        c.execute("ALTER TABLE transfers ALTER COLUMN to_addr TYPE VARCHAR(128)", &[]).await.ok();
+                        c.execute("ALTER TABLE transfers ALTER COLUMN token TYPE VARCHAR(128)", &[]).await.ok();
+                        c.execute("ALTER TABLE transfers ALTER COLUMN tx_hash TYPE VARCHAR(128)", &[]).await.ok();
+                        info!("Column widening complete");
+                    }
+                }
+            }));
+        }
+        // Wait for all migrations to finish
+        for f in migration_futures {
+            f.await.ok();
+        }
+
+        // Drop redundant index + create all indexes concurrently
+        // Each index creation gets its own pool connection for parallelism
         client.execute("DROP INDEX IF EXISTS idx_transfers_tx_hash", &[]).await?;
 
-        // Create indexes for transfers
-        let transfer_indexes = [
+        let all_indexes: Vec<&str> = vec![
+            // transfers indexes
             "CREATE INDEX IF NOT EXISTS idx_transfers_from ON transfers(chain_id, from_addr, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_to ON transfers(chain_id, to_addr, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_created ON transfers(created_at)",
@@ -333,14 +366,7 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_transfers_from_id ON transfers(chain_id, from_addr, id)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_to_id ON transfers(chain_id, to_addr, id)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(chain_id, status) WHERE status IS NOT NULL",
-        ];
-
-        for sql in transfer_indexes {
-            client.execute(sql, &[]).await?;
-        }
-
-        // Create indexes for fusion_plus_swaps
-        let fp_indexes = [
+            // fusion_plus_swaps indexes
             "CREATE INDEX IF NOT EXISTS idx_fp_hashlock ON fusion_plus_swaps(hashlock)",
             "CREATE INDEX IF NOT EXISTS idx_fp_src_chain ON fusion_plus_swaps(src_chain_id, src_block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_fp_dst_chain ON fusion_plus_swaps(dst_chain_id, dst_block_timestamp DESC)",
@@ -349,37 +375,34 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_fp_src_taker ON fusion_plus_swaps(src_taker)",
             "CREATE INDEX IF NOT EXISTS idx_fp_status ON fusion_plus_swaps(src_status, dst_status)",
             "CREATE INDEX IF NOT EXISTS idx_fp_created ON fusion_plus_swaps(created_at)",
-        ];
-
-        for sql in fp_indexes {
-            client.execute(sql, &[]).await?;
-        }
-
-        // Create indexes for fusion_swaps
-        let fs_indexes = [
+            // fusion_swaps indexes
             "CREATE INDEX IF NOT EXISTS idx_fs_order_hash ON fusion_swaps(order_hash)",
             "CREATE INDEX IF NOT EXISTS idx_fs_chain ON fusion_swaps(chain_id, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_fs_maker ON fusion_swaps(maker)",
             "CREATE INDEX IF NOT EXISTS idx_fs_taker ON fusion_swaps(taker)",
             "CREATE INDEX IF NOT EXISTS idx_fs_status ON fusion_swaps(status)",
             "CREATE INDEX IF NOT EXISTS idx_fs_created ON fusion_swaps(created_at)",
-        ];
-
-        for sql in fs_indexes {
-            client.execute(sql, &[]).await?;
-        }
-
-        // Create indexes for crypto2fiat_events
-        let c2f_indexes = [
+            // crypto2fiat_events indexes
             "CREATE INDEX IF NOT EXISTS idx_c2f_order_id ON crypto2fiat_events(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_c2f_token ON crypto2fiat_events(token)",
             "CREATE INDEX IF NOT EXISTS idx_c2f_recipient ON crypto2fiat_events(recipient)",
             "CREATE INDEX IF NOT EXISTS idx_c2f_chain ON crypto2fiat_events(chain_id, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_c2f_created ON crypto2fiat_events(created_at)",
+            // metrics history index
+            "CREATE INDEX IF NOT EXISTS idx_metrics_chain_time ON listener_metrics_history(chain_id, recorded_at DESC)",
         ];
 
-        for sql in c2f_indexes {
-            client.execute(sql, &[]).await?;
+        let mut index_futures = Vec::new();
+        for sql in all_indexes {
+            let pool = self.pool.clone();
+            index_futures.push(tokio::spawn(async move {
+                if let Ok(c) = pool.get().await {
+                    c.execute(sql, &[]).await.ok();
+                }
+            }));
+        }
+        for f in index_futures {
+            f.await.ok();
         }
 
         tracing::info!("PostgreSQL schema initialized");

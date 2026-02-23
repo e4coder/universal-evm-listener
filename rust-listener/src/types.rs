@@ -58,6 +58,7 @@ pub const CRYPTO2FIAT_TOPIC: &str = "0x86ac35f38cd2d17935b5bb6295c74cadb683bcfba
 pub enum ChainType {
     Evm,
     Bitcoin,
+    Solana,
 }
 
 /// Network configuration for a blockchain

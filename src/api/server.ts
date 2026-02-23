@@ -119,6 +119,51 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     }
 
     // =========================================================================
+    // Solana Endpoints (chain_id = 900, base58 address format)
+    // =========================================================================
+
+    // Solana address pattern: base58, 32-44 chars
+    const solAddrPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+    // GET /sol/address/:address - transfers involving address (from or to)
+    if (path.match(/^\/sol\/address\/[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+      const address = path.split('/')[3];
+      if (!solAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Solana address' });
+      const transfers = await cache.getSolanaTransfersByAddress(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /sol/from/:address - transfers from address
+    if (path.match(/^\/sol\/from\/[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+      const address = path.split('/')[3];
+      if (!solAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Solana address' });
+      const transfers = await cache.getSolanaTransfersByFrom(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /sol/to/:address - transfers to address
+    if (path.match(/^\/sol\/to\/[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+      const address = path.split('/')[3];
+      if (!solAddrPattern.test(address)) return sendResponse(res, 400, { success: false, error: 'Invalid Solana address' });
+      const transfers = await cache.getSolanaTransfersByTo(address);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /sol/tx/:signature - all transfers for a Solana transaction
+    if (path.match(/^\/sol\/tx\/[1-9A-HJ-NP-Za-km-z]{64,100}$/)) {
+      const signature = path.split('/')[3];
+      const transfers = await cache.getSolanaTransfersByTx(signature);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // GET /sol/token/:mintAddress - recent transfers of a specific SPL token
+    if (path.match(/^\/sol\/token\/[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+      const mint = path.split('/')[3];
+      const transfers = await cache.getSolanaTransfersByToken(mint);
+      return sendResponse(res, 200, { success: true, data: transfers });
+    }
+
+    // =========================================================================
     // ERC20 Endpoints
     // =========================================================================
 
@@ -484,6 +529,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         130:   { name: 'Unichain',        blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
         146:   { name: 'Sonic',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
         57073: { name: 'Ink',             blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 1, concurrent_inserts: 3 },
+        900:   { name: 'Solana',          blocks_per_request: 1,   concurrent_fetches: 4,  poll_interval_ms: 400,  confirmation_blocks: 32, copy_threshold: 1, concurrent_inserts: 3 },
       };
 
       // GET /admin/config — list all chains with defaults + overrides
@@ -695,6 +741,12 @@ async function startServer(): Promise<void> {
     console.log('  GET /btc/to/:address');
     console.log('  GET /btc/tx/:txHash');
     console.log('  GET /btc/pending');
+    console.log('\n  Solana:');
+    console.log('  GET /sol/address/:address');
+    console.log('  GET /sol/from/:address');
+    console.log('  GET /sol/to/:address');
+    console.log('  GET /sol/tx/:signature');
+    console.log('  GET /sol/token/:mintAddress');
     console.log('\n  ERC20 Transfers:');
     console.log('  GET /erc20/from/:chainId/:address');
     console.log('  GET /erc20/to/:chainId/:address');

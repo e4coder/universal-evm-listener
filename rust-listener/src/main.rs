@@ -4,6 +4,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod adapter;
 mod bitcoin_adapter;
 mod bitcoin_rpc;
+mod solana_adapter;
+mod solana_rpc;
 mod config;
 mod db;
 mod evm_adapter;
@@ -15,6 +17,8 @@ mod types;
 use crate::adapter::ChainAdapter;
 use crate::bitcoin_adapter::BitcoinAdapter;
 use crate::bitcoin_rpc::BitcoinRpcClient;
+use crate::solana_adapter::SolanaAdapter;
+use crate::solana_rpc::SolanaRpcClient;
 use crate::config::{get_database_url, get_ttl_secs, load_networks};
 use crate::db::Database;
 use crate::evm_adapter::EvmAdapter;
@@ -163,6 +167,18 @@ async fn main() {
                         network.name,
                     ));
                     // Bitcoin uses same adapter for both (no fast/slow distinction)
+                    (Arc::clone(&adapter), adapter)
+                }
+                ChainType::Solana => {
+                    let sol_rpc = Arc::new(SolanaRpcClient::new(
+                        &network.rpc_url,
+                        network.name,
+                    ));
+                    let adapter: Arc<dyn ChainAdapter> = Arc::new(SolanaAdapter::new(
+                        Arc::clone(&sol_rpc),
+                        network.chain_id,
+                        network.name,
+                    ));
                     (Arc::clone(&adapter), adapter)
                 }
             };

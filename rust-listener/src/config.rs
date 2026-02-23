@@ -74,6 +74,22 @@ pub fn load_networks() -> Vec<NetworkConfig> {
         rpc_password: env::var("BITCOIN_RPC_PASSWORD").ok(),
     });
 
+    // Solana: use SOLANA_RPC_URL override, or default to Alchemy
+    let sol_url = env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| alchemy_url("solana-mainnet", &api_key));
+    networks.push(NetworkConfig {
+        chain_id: 900,
+        name: "Solana",
+        rpc_url: sol_url,
+        chain_type: ChainType::Solana,
+        blocks_per_request: 1,
+        concurrent_fetches: 4,
+        poll_interval_ms: 400,
+        confirmation_blocks: 32,
+        rpc_user: None,
+        rpc_password: None,
+    });
+
     networks
 }
 

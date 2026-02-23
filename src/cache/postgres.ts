@@ -243,6 +243,72 @@ export class PostgresCache {
     return result.rows;
   }
 
+  // Solana transfer queries (chain_id = 900)
+
+  async getSolanaTransfersByAddress(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 900 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "slot", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 900 AND (from_addr = $1 OR to_addr = $1)
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getSolanaTransfersByFrom(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 900 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "slot", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 900 AND from_addr = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getSolanaTransfersByTo(address: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 900 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "slot", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 900 AND to_addr = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 1000`,
+      [address]
+    );
+    return result.rows;
+  }
+
+  async getSolanaTransfersByTx(signature: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 900 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "slot", block_timestamp as "timestamp", log_index as "transferIndex"
+       FROM transfers
+       WHERE chain_id = 900 AND tx_hash = $1
+       ORDER BY log_index ASC`,
+      [signature]
+    );
+    return result.rows;
+  }
+
+  async getSolanaTransfersByToken(mint: string): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT 900 as "chainId", tx_hash as "txHash", token, from_addr as "from", to_addr as "to",
+              value, block_number as "slot", block_timestamp as "timestamp"
+       FROM transfers
+       WHERE chain_id = 900 AND token = $1
+       ORDER BY block_timestamp DESC
+       LIMIT 500`,
+      [mint]
+    );
+    return result.rows;
+  }
+
   // Health check
 
   async isHealthy(): Promise<boolean> {

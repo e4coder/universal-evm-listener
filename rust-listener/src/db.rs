@@ -94,7 +94,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS transfers (
                 id BIGSERIAL,
                 chain_id INTEGER NOT NULL,
-                tx_hash VARCHAR(66) NOT NULL,
+                tx_hash VARCHAR(128) NOT NULL,
                 log_index INTEGER NOT NULL,
                 token VARCHAR(128) NOT NULL,
                 from_addr VARCHAR(128) NOT NULL,
@@ -252,6 +252,8 @@ impl Database {
         client.execute("ALTER TABLE transfers ALTER COLUMN from_addr TYPE VARCHAR(128)", &[]).await.ok();
         client.execute("ALTER TABLE transfers ALTER COLUMN to_addr TYPE VARCHAR(128)", &[]).await.ok();
         client.execute("ALTER TABLE transfers ALTER COLUMN token TYPE VARCHAR(128)", &[]).await.ok();
+        // Migration: widen tx_hash for Solana signatures (~88 chars base58)
+        client.execute("ALTER TABLE transfers ALTER COLUMN tx_hash TYPE VARCHAR(128)", &[]).await.ok();
 
         // Historical metrics table (time-series for monitoring charts)
         client.execute(

@@ -34,6 +34,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monos
 .chain-card.healthy { border-left: 3px solid #22c55e; }
 .chain-card.warning { border-left: 3px solid #eab308; }
 .chain-card.stale { border-left: 3px solid #ef4444; }
+.chain-card.disabled { border-left: 3px solid #666; opacity: 0.6; }
+.disabled-badge { background: #ef4444; color: #fff; font-size: 9px; padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-weight: 600; letter-spacing: 0.3px; }
+.toggle-switch { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-slider { position: absolute; cursor: pointer; inset: 0; background: #444; border-radius: 20px; transition: 0.3s; }
+.toggle-slider:before { content: ''; position: absolute; height: 14px; width: 14px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: 0.3s; }
+.toggle-switch input:checked + .toggle-slider { background: #22c55e; }
+.toggle-switch input:checked + .toggle-slider:before { transform: translateX(16px); }
 .chain-card .name { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 8px; display: flex; justify-content: space-between; }
 .chain-card .name .chain-id { font-size: 11px; color: #666; font-weight: 400; }
 .chain-card .row { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
@@ -192,12 +200,13 @@ function SummaryBar({ chains }) {
 function ChainCard({ chain }) {
   const now = Math.floor(Date.now() / 1000);
   const age = now - Number(chain.updated_at || 0);
-  const status = age > 10 ? 'stale' : (Number(chain.pending_ranges) > 0 || Number(chain.last_chance_count) > 0) ? 'warning' : 'healthy';
+  const isDisabled = chain.enabled === false || chain.enabled === 'false';
+  const status = isDisabled ? 'disabled' : age > 10 ? 'stale' : (Number(chain.pending_ranges) > 0 || Number(chain.last_chance_count) > 0) ? 'warning' : 'healthy';
   const behind = Number(chain.current_block || 0) - Number(chain.checkpoint_block || 0);
 
   return html`
     <div class="chain-card ${status}">
-      <div class="name">${chain.chain_name || CHAIN_NAMES[chain.chain_id] || 'Chain ' + chain.chain_id} <span class="chain-id">#${chain.chain_id}</span></div>
+      <div class="name">${chain.chain_name || CHAIN_NAMES[chain.chain_id] || 'Chain ' + chain.chain_id}${isDisabled ? html` <span class="disabled-badge">DISABLED</span>` : ''} <span class="chain-id">#${chain.chain_id}</span></div>
       <div class="row"><span class="k">Current Block</span><span class="v">${Number(chain.current_block).toLocaleString()}</span></div>
       <div class="row"><span class="k">Checkpoint</span><span class="v">${Number(chain.checkpoint_block).toLocaleString()}</span></div>
       <div class="row"><span class="k">Blocks Behind</span><span class="v ${behind > 100 ? 'err' : behind > 20 ? 'warn' : ''}">${behind}</span></div>
@@ -731,6 +740,25 @@ function AdminPanel() {
     }
   };
 
+  const toggleChain = async (chainId, enabled) => {
+    try {
+      const res = await fetch('/admin/config/' + chainId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body: JSON.stringify({ enabled }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        showToast((enabled ? 'Enabled' : 'Disabled') + ' ' + (CHAIN_NAMES[chainId] || chainId));
+        fetchConfigs();
+      } else {
+        showToast(json.error || 'Toggle failed', 'error');
+      }
+    } catch (e) {
+      showToast('Network error', 'error');
+    }
+  };
+
   const CONFIG_FIELDS = [
     { key: 'blocks_per_request', label: 'Blocks/Request', min: 1, max: 1000 },
     { key: 'concurrent_fetches', label: 'Concurrency', min: 1, max: 50 },
@@ -759,7 +787,15 @@ function AdminPanel() {
               <div class="admin-chain-card" key=${cfg.chain_id}>
                 <div class="card-header">
                   <h3>${cfg.name}</h3>
-                  <span class="chain-id-badge">${cfg.chain_id} ${hasOverrides ? html` <span class="override-badge">overridden</span>` : ''}</span>
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <label class="toggle-switch">
+                      <input type="checkbox" checked=${cfg.effective.enabled !== false}
+                        onChange=${(e) => toggleChain(cfg.chain_id, e.target.checked)} />
+                      <span class="toggle-slider"></span>
+                    </label>
+                    <span style="font-size:11px;color:${cfg.effective.enabled !== false ? '#22c55e' : '#ef4444'}">${cfg.effective.enabled !== false ? 'Enabled' : 'Disabled'}</span>
+                    <span class="chain-id-badge">${cfg.chain_id} ${hasOverrides ? html` <span class="override-badge">overridden</span>` : ''}</span>
+                  </div>
                 </div>
                 ${CONFIG_FIELDS.map(f => {
                   const effectiveVal = cfg.effective[f.key];

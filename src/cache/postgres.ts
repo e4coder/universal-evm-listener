@@ -402,11 +402,12 @@ export class PostgresCache {
     confirmation_blocks?: number | null,
     copy_threshold?: number | null,
     concurrent_inserts?: number | null,
+    enabled?: boolean | null,
   }): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
     await this.pool.query(
-      `INSERT INTO config_overrides (chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, concurrent_inserts, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO config_overrides (chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, concurrent_inserts, enabled, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (chain_id) DO UPDATE SET
          blocks_per_request = COALESCE($2, config_overrides.blocks_per_request),
          concurrent_fetches = COALESCE($3, config_overrides.concurrent_fetches),
@@ -414,10 +415,12 @@ export class PostgresCache {
          confirmation_blocks = COALESCE($5, config_overrides.confirmation_blocks),
          copy_threshold = COALESCE($6, config_overrides.copy_threshold),
          concurrent_inserts = COALESCE($7, config_overrides.concurrent_inserts),
-         updated_at = $8`,
+         enabled = COALESCE($8, config_overrides.enabled),
+         updated_at = $9`,
       [chainId, config.blocks_per_request ?? null, config.concurrent_fetches ?? null,
        config.poll_interval_ms ?? null, config.confirmation_blocks ?? null,
-       config.copy_threshold ?? null, config.concurrent_inserts ?? null, now]
+       config.copy_threshold ?? null, config.concurrent_inserts ?? null,
+       config.enabled ?? null, now]
     );
   }
 

@@ -275,6 +275,12 @@ async fn fetcher_loop(
     info!("[{}] Fetcher started (live config)", chain_name);
 
     loop {
+        // Pause when disabled (preserves all state, resumes from same position)
+        if !live_config.enabled.load(Relaxed) {
+            sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
         // Read live config values at the start of each cycle
         let step = live_config.max_blocks_per_query.load(Relaxed);
         let confirmation_blocks = live_config.confirmation_blocks.load(Relaxed);
@@ -502,6 +508,12 @@ async fn mempool_loop(
     info!("[{}] Mempool loop started", chain_name);
 
     loop {
+        // Pause when disabled
+        if !live_config.enabled.load(Relaxed) {
+            sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
         let poll_interval = Duration::from_millis(live_config.poll_interval_ms.load(Relaxed));
 
         match adapter.poll_mempool(&known_txids).await {
@@ -700,6 +712,12 @@ impl ChainPoller {
         );
 
         loop {
+            // Pause when disabled
+            if !self.live_config.enabled.load(Relaxed) {
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
             // 1. Drain all immediately available items from channel into buffer
             let mut channel_disconnected = false;
             loop {

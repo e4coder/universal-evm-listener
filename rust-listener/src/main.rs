@@ -236,6 +236,11 @@ async fn main() {
                             } else {
                                 live_config.max_concurrent_inserts.store(live_config.default_concurrent_inserts, Relaxed);
                             }
+                            if let Some(v) = ov.enabled {
+                                live_config.enabled.store(v, Relaxed);
+                            } else {
+                                live_config.enabled.store(true, Relaxed);
+                            }
                         } else {
                             // No override for this chain — reset to defaults
                             live_config.max_blocks_per_query.store(live_config.default_blocks_per_query, Relaxed);
@@ -244,6 +249,7 @@ async fn main() {
                             live_config.confirmation_blocks.store(live_config.default_confirmation_blocks, Relaxed);
                             live_config.copy_threshold.store(live_config.default_copy_threshold, Relaxed);
                             live_config.max_concurrent_inserts.store(live_config.default_concurrent_inserts, Relaxed);
+                            live_config.enabled.store(true, Relaxed);
                         }
                     }
                 }
@@ -255,6 +261,8 @@ async fn main() {
     // Spawn stats writer task (every 1 second, writes all chain stats to DB + metrics history)
     // Uses a SINGLE pool connection per iteration to avoid pool contention with chain inserters
     let db_stats = Arc::clone(&db);
+    let live_configs_for_stats: HashMap<u32, Arc<LiveConfig>> =
+        all_live_configs.iter().map(|(id, lc)| (*id, Arc::clone(lc))).collect();
     let stats_handle = tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(1)).await;
@@ -284,6 +292,10 @@ async fn main() {
                 let cum_insert_ms = stats.cumulative_insert_ms.load(Relaxed);
                 let cum_inserts = stats.cumulative_inserts.load(Relaxed);
                 let avg_insert_ms = if cum_inserts > 0 { cum_insert_ms / cum_inserts } else { 0 };
+                let enabled = live_configs_for_stats
+                    .get(&stats.chain_id)
+                    .map(|lc| lc.enabled.load(Relaxed))
+                    .unwrap_or(true);
 
                 if let Err(e) = Database::upsert_listener_stats_on(
                     &client,
@@ -310,6 +322,7 @@ async fn main() {
                     copy_threshold,
                     avg_insert_ms,
                     cum_inserts,
+                    enabled,
                 ).await {
                     warn!("Failed to write stats for chain {}: {}", stats.chain_id, e);
                 }

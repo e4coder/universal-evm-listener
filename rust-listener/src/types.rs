@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 /// ERC20 Transfer event topic (keccak256 of "Transfer(address,address,uint256)")
 pub const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -451,6 +451,7 @@ pub struct LiveConfig {
     pub confirmation_blocks: AtomicU64,
     pub copy_threshold: AtomicU64,
     pub max_concurrent_inserts: AtomicUsize,
+    pub enabled: AtomicBool,
 }
 
 impl LiveConfig {
@@ -468,6 +469,7 @@ impl LiveConfig {
             confirmation_blocks: AtomicU64::new(network.confirmation_blocks),
             copy_threshold: AtomicU64::new(10000),
             max_concurrent_inserts: AtomicUsize::new(3),
+            enabled: AtomicBool::new(true),
         }
     }
 }

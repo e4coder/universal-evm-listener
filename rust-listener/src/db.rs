@@ -263,6 +263,7 @@ impl Database {
                 copy_threshold INTEGER DEFAULT 0,
                 avg_insert_ms INTEGER DEFAULT 0,
                 total_insert_ops BIGINT DEFAULT 0,
+                enabled BOOLEAN DEFAULT true,
                 updated_at BIGINT DEFAULT 0
             )",
             &[],
@@ -321,6 +322,7 @@ impl Database {
                     c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS copy_threshold INTEGER DEFAULT 0", &[]).await.ok();
                     c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS avg_insert_ms INTEGER DEFAULT 0", &[]).await.ok();
                     c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS total_insert_ops BIGINT DEFAULT 0", &[]).await.ok();
+                    c.execute("ALTER TABLE listener_stats ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT true", &[]).await.ok();
                 }
             }));
         }
@@ -342,6 +344,7 @@ impl Database {
             migration_futures.push(tokio::spawn(async move {
                 if let Ok(c) = pool.get().await {
                     c.execute("ALTER TABLE config_overrides ADD COLUMN IF NOT EXISTS concurrent_inserts INTEGER", &[]).await.ok();
+                    c.execute("ALTER TABLE config_overrides ADD COLUMN IF NOT EXISTS enabled BOOLEAN", &[]).await.ok();
                 }
             }));
         }
@@ -1820,6 +1823,7 @@ impl Database {
         copy_threshold: u64,
         avg_insert_ms: u64,
         total_insert_ops: u64,
+        enabled: bool,
     ) -> Result<(), DbError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1835,8 +1839,8 @@ impl Database {
                 insert_time_ms, batch_size, fetch_time_ms,
                 pool_wait_ms, rows_inserted, commit_ms,
                 insert_method, copy_threshold, avg_insert_ms, total_insert_ops,
-                updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                enabled, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
             ON CONFLICT (chain_id) DO UPDATE SET
                 chain_name = EXCLUDED.chain_name,
                 current_block = EXCLUDED.current_block,
@@ -1860,6 +1864,7 @@ impl Database {
                 copy_threshold = EXCLUDED.copy_threshold,
                 avg_insert_ms = EXCLUDED.avg_insert_ms,
                 total_insert_ops = EXCLUDED.total_insert_ops,
+                enabled = EXCLUDED.enabled,
                 updated_at = EXCLUDED.updated_at",
             &[
                 &(chain_id as i32),
@@ -1885,6 +1890,7 @@ impl Database {
                 &(copy_threshold as i32),
                 &(avg_insert_ms as i32),
                 &(total_insert_ops as i64),
+                &enabled,
                 &now,
             ],
         ).await?;
@@ -1946,7 +1952,7 @@ impl Database {
     pub async fn get_all_config_overrides(&self) -> Result<Vec<ConfigOverrideRow>, DbError> {
         let client = self.pool.get().await?;
         let rows = client.query(
-            "SELECT chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, concurrent_inserts FROM config_overrides",
+            "SELECT chain_id, blocks_per_request, concurrent_fetches, poll_interval_ms, confirmation_blocks, copy_threshold, concurrent_inserts, enabled FROM config_overrides",
             &[],
         ).await?;
 
@@ -1958,6 +1964,7 @@ impl Database {
             confirmation_blocks: row.get(4),
             copy_threshold: row.get(5),
             concurrent_inserts: row.get(6),
+            enabled: row.get(7),
         }).collect())
     }
 
@@ -2144,4 +2151,5 @@ pub struct ConfigOverrideRow {
     pub confirmation_blocks: Option<i32>,
     pub copy_threshold: Option<i32>,
     pub concurrent_inserts: Option<i32>,
+    pub enabled: Option<bool>,
 }

@@ -903,7 +903,7 @@ impl Database {
             - ttl_secs as i64;
 
         let deleted = client.execute(
-            "DELETE FROM transfers WHERE created_at < $1",
+            "DELETE FROM transfers WHERE created_at < $1 AND (status IS NULL OR status != 'pending')",
             &[&cutoff],
         ).await?;
 

@@ -7,6 +7,17 @@ use bytes::{BytesMut, BufMut};
 use futures::SinkExt;
 use tracing::info;
 
+/// Normalize address/hash: lowercase only for EVM hex strings (0x-prefixed).
+/// Bitcoin/Solana base58 addresses are case-sensitive and must not be lowercased.
+#[inline]
+fn normalize(s: &str) -> String {
+    if s.starts_with("0x") || s.starts_with("0X") {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("PostgreSQL error: {0}")]
@@ -111,15 +122,25 @@ impl Database {
             &[],
         ).await?;
 
-        // Create a partition for each configured chain
+        // Create partitions concurrently (non-blocking — each is IF NOT EXISTS)
+        let mut partition_futures = Vec::new();
         for &chain_id in chain_ids {
-            client.execute(
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS transfers_{} PARTITION OF transfers FOR VALUES IN ({})",
-                    chain_id, chain_id
-                ),
-                &[],
-            ).await?;
+            let pool = self.pool.clone();
+            partition_futures.push(tokio::spawn(async move {
+                if let Ok(c) = pool.get().await {
+                    c.execute(
+                        &format!(
+                            "CREATE TABLE IF NOT EXISTS transfers_{} PARTITION OF transfers FOR VALUES IN ({})",
+                            chain_id, chain_id
+                        ),
+                        &[],
+                    ).await.ok();
+                }
+            }));
+        }
+        // Wait for all partitions (they run in parallel)
+        for f in partition_futures {
+            f.await.ok();
         }
 
         // Checkpoints table (one row per chain)
@@ -248,12 +269,23 @@ impl Database {
 
         // Migration: add status column for Bitcoin mempool lifecycle tracking (NULL = EVM confirmed)
         client.execute("ALTER TABLE transfers ADD COLUMN IF NOT EXISTS status VARCHAR(10)", &[]).await.ok();
-        // Migration: widen address columns for Bitcoin (Bech32/Taproot up to 62 chars) and future chains
-        client.execute("ALTER TABLE transfers ALTER COLUMN from_addr TYPE VARCHAR(128)", &[]).await.ok();
-        client.execute("ALTER TABLE transfers ALTER COLUMN to_addr TYPE VARCHAR(128)", &[]).await.ok();
-        client.execute("ALTER TABLE transfers ALTER COLUMN token TYPE VARCHAR(128)", &[]).await.ok();
-        // Migration: widen tx_hash for Solana signatures (~88 chars base58)
-        client.execute("ALTER TABLE transfers ALTER COLUMN tx_hash TYPE VARCHAR(128)", &[]).await.ok();
+
+        // Migration: widen columns only if needed (ALTER COLUMN TYPE rewrites all partitions — skip if already correct)
+        let needs_widen: bool = client.query_opt(
+            "SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'transfers' AND column_name = 'tx_hash'
+               AND character_maximum_length IS NOT NULL AND character_maximum_length < 128",
+            &[],
+        ).await.ok().flatten().is_some();
+
+        if needs_widen {
+            info!("Widening transfers columns to VARCHAR(128)...");
+            client.execute("ALTER TABLE transfers ALTER COLUMN from_addr TYPE VARCHAR(128)", &[]).await.ok();
+            client.execute("ALTER TABLE transfers ALTER COLUMN to_addr TYPE VARCHAR(128)", &[]).await.ok();
+            client.execute("ALTER TABLE transfers ALTER COLUMN token TYPE VARCHAR(128)", &[]).await.ok();
+            client.execute("ALTER TABLE transfers ALTER COLUMN tx_hash TYPE VARCHAR(128)", &[]).await.ok();
+            info!("Column widening complete");
+        }
 
         // Historical metrics table (time-series for monitoring charts)
         client.execute(
@@ -580,11 +612,11 @@ impl Database {
             let rows: Vec<(i32, String, i32, String, String, String, String, i64, i64, Option<String>, Option<String>, i64)> =
                 chunk.iter().map(|t| (
                     chain_id_i32,
-                    t.tx_hash.to_lowercase(),
+                    normalize(&t.tx_hash),
                     t.log_index as i32,
-                    t.token.to_lowercase(),
-                    t.from_addr.to_lowercase(),
-                    t.to_addr.to_lowercase(),
+                    normalize(&t.token),
+                    normalize(&t.from_addr),
+                    normalize(&t.to_addr),
                     t.value.clone(),
                     t.block_number as i64,
                     t.block_timestamp as i64,
@@ -666,15 +698,15 @@ impl Database {
             for t in chunk {
                 buf.extend_from_slice(chain_id_i32.to_string().as_bytes());
                 buf.put_u8(b'\t');
-                buf.extend_from_slice(t.tx_hash.to_lowercase().as_bytes());
+                buf.extend_from_slice(normalize(&t.tx_hash).as_bytes());
                 buf.put_u8(b'\t');
                 buf.extend_from_slice((t.log_index as i32).to_string().as_bytes());
                 buf.put_u8(b'\t');
-                buf.extend_from_slice(t.token.to_lowercase().as_bytes());
+                buf.extend_from_slice(normalize(&t.token).as_bytes());
                 buf.put_u8(b'\t');
-                buf.extend_from_slice(t.from_addr.to_lowercase().as_bytes());
+                buf.extend_from_slice(normalize(&t.from_addr).as_bytes());
                 buf.put_u8(b'\t');
-                buf.extend_from_slice(t.to_addr.to_lowercase().as_bytes());
+                buf.extend_from_slice(normalize(&t.to_addr).as_bytes());
                 buf.put_u8(b'\t');
                 buf.extend_from_slice(t.value.as_bytes());
                 buf.put_u8(b'\t');

@@ -54,9 +54,9 @@ impl Database {
         cfg.dbname = config.get_dbname().map(|s| s.to_string());
 
         // Limit pool size to prevent unbounded connection growth
-        // 13 chains × 3 concurrent inserts = 39 + cleanup + stats + config watcher + headroom ≈ 50
+        // 15 chains × 3 concurrent inserts = 45 + stats writer + cleanup + config watcher + headroom
         cfg.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: 50,
+            max_size: 60,
             ..Default::default()
         });
 
@@ -1794,9 +1794,9 @@ impl Database {
     // Listener Stats Methods (Monitoring)
     // =========================================================================
 
-    /// Upsert listener stats for a single chain
-    pub async fn upsert_listener_stats(
-        &self,
+    /// Upsert listener stats for a single chain, using a shared client
+    pub async fn upsert_listener_stats_on(
+        client: &PoolClient,
         chain_id: u32,
         chain_name: &str,
         current_block: u64,
@@ -1821,7 +1821,6 @@ impl Database {
         avg_insert_ms: u64,
         total_insert_ops: u64,
     ) -> Result<(), DbError> {
-        let client = self.pool.get().await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1893,9 +1892,9 @@ impl Database {
         Ok(())
     }
 
-    /// Insert a historical metrics snapshot for a chain
-    pub async fn insert_metrics_snapshot(
-        &self,
+    /// Insert a historical metrics snapshot for a chain, using a shared client
+    pub async fn insert_metrics_snapshot_on(
+        client: &PoolClient,
         chain_id: u32,
         insert_time_ms: u64,
         batch_size: u64,
@@ -1907,7 +1906,6 @@ impl Database {
         commit_ms: u64,
         rows_inserted: u64,
     ) -> Result<(), DbError> {
-        let client = self.pool.get().await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

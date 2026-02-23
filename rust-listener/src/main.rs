@@ -253,10 +253,21 @@ async fn main() {
     });
 
     // Spawn stats writer task (every 1 second, writes all chain stats to DB + metrics history)
+    // Uses a SINGLE pool connection per iteration to avoid pool contention with chain inserters
     let db_stats = Arc::clone(&db);
     let stats_handle = tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(1)).await;
+
+            // Acquire one connection for the entire iteration
+            let client = match db_stats.get_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Stats writer: failed to get DB client: {}", e);
+                    continue;
+                }
+            };
+
             for stats in &all_stats {
                 let current = stats.current_block.load(Relaxed);
                 let checkpoint = stats.checkpoint_block.load(Relaxed);
@@ -274,7 +285,8 @@ async fn main() {
                 let cum_inserts = stats.cumulative_inserts.load(Relaxed);
                 let avg_insert_ms = if cum_inserts > 0 { cum_insert_ms / cum_inserts } else { 0 };
 
-                if let Err(e) = db_stats.upsert_listener_stats(
+                if let Err(e) = Database::upsert_listener_stats_on(
+                    &client,
                     stats.chain_id,
                     stats.chain_name,
                     current,
@@ -303,7 +315,8 @@ async fn main() {
                 }
 
                 // Record metrics history for charts
-                let _ = db_stats.insert_metrics_snapshot(
+                let _ = Database::insert_metrics_snapshot_on(
+                    &client,
                     stats.chain_id,
                     insert_time,
                     batch,

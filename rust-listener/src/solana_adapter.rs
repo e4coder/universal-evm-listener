@@ -2,9 +2,17 @@ use crate::adapter::ChainAdapter;
 use crate::solana_rpc::{SolanaBlock, SolanaRpcClient, SolanaTransactionEntry, SolanaTransactionMeta, TokenBalance};
 use crate::types::{DecodedBlockRange, Transfer};
 use async_trait::async_trait;
+use futures::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
+
+/// Solana Vote program — skip vote transactions (validator consensus, not real transfers)
+const VOTE_PROGRAM: &str = "Vote111111111111111111111111111111111111111";
+
+/// Minimum lamport delta to count as a SOL transfer (filters fee dust)
+/// 10,000 lamports = 0.00001 SOL
+const MIN_SOL_LAMPORTS: i128 = 10_000;
 
 pub struct SolanaAdapter {
     rpc: Arc<SolanaRpcClient>,
@@ -33,10 +41,19 @@ impl ChainAdapter for SolanaAdapter {
         from_block: u64,
         to_block: u64,
     ) -> Result<DecodedBlockRange, String> {
+        // Fetch all slots concurrently for maximum throughput
+        let futures: Vec<_> = (from_block..=to_block)
+            .map(|slot| {
+                let rpc = Arc::clone(&self.rpc);
+                async move { (slot, rpc.get_block(slot).await) }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
         let mut all_transfers = Vec::new();
 
-        for slot in from_block..=to_block {
-            match self.rpc.get_block(slot).await? {
+        for (slot, result) in results {
+            match result? {
                 None => {
                     // Skipped slot — no block produced. Normal on Solana.
                     continue;
@@ -102,6 +119,11 @@ fn decode_solana_block(
 
         // Build full account keys list (static + loaded for versioned txs)
         let account_keys = build_account_keys(tx_entry, meta);
+
+        // Skip vote transactions (validator consensus, not real transfers)
+        if account_keys.iter().any(|k| k == VOTE_PROGRAM) {
+            continue;
+        }
 
         // 1. Detect native SOL transfers via preBalances/postBalances diff
         let sol_transfers = detect_sol_transfers(
@@ -200,6 +222,9 @@ fn detect_sol_transfers(
 
     let mut log_index: u32 = 0;
     for (idx, delta) in &receivers {
+        if *delta < MIN_SOL_LAMPORTS {
+            continue; // Skip fee dust
+        }
         transfers.push(Transfer {
             chain_id,
             tx_hash: signature.to_string(),

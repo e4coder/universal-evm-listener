@@ -82,7 +82,7 @@ pub fn load_networks() -> Vec<NetworkConfig> {
         name: "Solana",
         rpc_url: sol_url,
         chain_type: ChainType::Solana,
-        blocks_per_request: 1,
+        blocks_per_request: 5,
         concurrent_fetches: 4,
         poll_interval_ms: 400,
         confirmation_blocks: 32,

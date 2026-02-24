@@ -574,7 +574,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         130:   { name: 'Unichain',        blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
         146:   { name: 'Sonic',           blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
         57073: { name: 'Ink',             blocks_per_request: 200, concurrent_fetches: 3,  poll_interval_ms: 1000, confirmation_blocks: 1,  copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
-        900:   { name: 'Solana',          blocks_per_request: 1,   concurrent_fetches: 4,  poll_interval_ms: 400,  confirmation_blocks: 32, copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
+        900:   { name: 'Solana',          blocks_per_request: 5,   concurrent_fetches: 4,  poll_interval_ms: 400,  confirmation_blocks: 32, copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
         728126428: { name: 'Tron',       blocks_per_request: 1,   concurrent_fetches: 3,  poll_interval_ms: 3000, confirmation_blocks: 20, copy_threshold: 10000, concurrent_inserts: 3, enabled: true },
       };
 

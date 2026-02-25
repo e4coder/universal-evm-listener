@@ -377,19 +377,26 @@ impl Database {
             f.await.ok();
         }
 
-        // Drop redundant index + create all indexes concurrently
-        // Each index creation gets its own pool connection for parallelism
-        client.execute("DROP INDEX IF EXISTS idx_transfers_tx_hash", &[]).await?;
+        // Drop redundant/unused indexes to reduce write amplification
+        // (9 indexes per partition → 5: saves ~4.8 GB, 44% fewer B-tree updates per INSERT)
+        let drop_indexes: Vec<&str> = vec![
+            "DROP INDEX IF EXISTS idx_transfers_tx_hash",
+            "DROP INDEX IF EXISTS idx_transfers_from_id",
+            "DROP INDEX IF EXISTS idx_transfers_to_id",
+            "DROP INDEX IF EXISTS idx_transfers_swap_type",
+            "DROP INDEX IF EXISTS idx_transfers_status",
+        ];
+        for sql in drop_indexes {
+            client.execute(sql, &[]).await.ok();
+        }
 
+        // Create remaining indexes concurrently
+        // Each index creation gets its own pool connection for parallelism
         let all_indexes: Vec<&str> = vec![
-            // transfers indexes
+            // transfers indexes (3 essential: from_addr, to_addr, created_at for TTL)
             "CREATE INDEX IF NOT EXISTS idx_transfers_from ON transfers(chain_id, from_addr, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_to ON transfers(chain_id, to_addr, block_timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_transfers_created ON transfers(created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_transfers_swap_type ON transfers(chain_id, swap_type, block_timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_transfers_from_id ON transfers(chain_id, from_addr, id)",
-            "CREATE INDEX IF NOT EXISTS idx_transfers_to_id ON transfers(chain_id, to_addr, id)",
-            "CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(chain_id, status) WHERE status IS NOT NULL",
             // fusion_plus_swaps indexes
             "CREATE INDEX IF NOT EXISTS idx_fp_hashlock ON fusion_plus_swaps(hashlock)",
             "CREATE INDEX IF NOT EXISTS idx_fp_src_chain ON fusion_plus_swaps(src_chain_id, src_block_timestamp DESC)",
